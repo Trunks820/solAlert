@@ -8,7 +8,7 @@ import socks
 import re
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient, events
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 import logging
 
 from .base import BaseCollector
@@ -159,6 +159,9 @@ class PumpListener(BaseCollector):
         self.client = None
         self.parser = GMGNPumpParser()
         self.token_repo = TokenRepository()
+        self._event_builder = None
+        self._poll_task = None
+        self.latest_msg_id: Optional[int] = None
     
     async def start(self):
         """启动实时监听"""
@@ -182,11 +185,19 @@ class PumpListener(BaseCollector):
             chat_title = getattr(entity, 'title', 'Unknown')
             self.log_info(f"开始监听频道: {chat_title} (ID: {self.gmgn_channel_id})")
             
-            # 注册新消息处理器
-            @self.client.on(events.NewMessage(chats=entity))
-            async def handle_new_message(event):
-                await self._handle_message(event)
+            # 重置最新消息游标
+            self.latest_msg_id = None
             
+            # 🆕 启动时先采集当天的历史消息
+            await self._collect_today_history(entity)
+            
+            # 注册实时事件处理器并启动补偿轮询
+            self._event_builder = events.NewMessage(chats=[self.gmgn_channel_id])
+            self.client.add_event_handler(self._handle_new_message, self._event_builder)
+
+            if self._poll_task is None or self._poll_task.done():
+                self._poll_task = asyncio.create_task(self._poll_new_messages(entity))
+
             self.log_success("实时监听已启动，等待新的 Pump 消息...")
             
             # 保持运行
@@ -199,44 +210,142 @@ class PumpListener(BaseCollector):
         finally:
             await self.stop()
     
-    async def _handle_message(self, event):
-        """处理新消息"""
+    async def _collect_today_history(self, entity):
+        """采集当天的历史消息"""
         try:
-            if not event.message.message:
-                return
-            
-            # 解析pump消息
-            pump_data = self.parser.parse_pump_message(event.message.message)
-            
+            self.log_info("📚 开始采集当天历史消息...")
+
+            from datetime import datetime
+            today_start = datetime.now(BEIJING_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+
+            total_count = 0
+            pump_count = 0
+            saved_count = 0
+
+            async for message in self.client.iter_messages(entity, limit=100):
+                msg_time = message.date.astimezone(BEIJING_TZ)
+                if msg_time < today_start:
+                    break
+
+                total_count += 1
+
+                pump_found, saved = await self._process_pump_message(
+                    message_id=message.id,
+                    message_text=message.message or "",
+                    message_date=message.date,
+                    source="历史补偿"
+                )
+
+                if pump_found:
+                    pump_count += 1
+                    if saved:
+                        saved_count += 1
+
+            self.log_success(f"历史消息采集完成: 检查{total_count}条，发现{pump_count}个Pump，新入库{saved_count}条")
+
+        except Exception as e:
+            self.log_error("采集历史消息失败", e)
+
+    async def _poll_new_messages(self, entity):
+        """补偿轮询，避免漏掉消息"""
+        await asyncio.sleep(5)  # 避免与实时回调抢占资源
+
+        while self.is_running and self.client:
+            try:
+                baseline_id = self.latest_msg_id or 0
+                pending = []
+
+                async for message in self.client.iter_messages(entity, min_id=baseline_id, limit=50):
+                    if message.id <= baseline_id:
+                        continue
+                    pending.append(message)
+
+                if pending:
+                    pending.reverse()  # 按时间顺序处理
+                    for message in pending:
+                        await self._process_pump_message(
+                            message_id=message.id,
+                            message_text=message.message or "",
+                            message_date=message.date,
+                            source="补偿轮询"
+                        )
+
+            except Exception as e:
+                self.log_warning(f"补偿轮询失败: {e}")
+                await asyncio.sleep(5)
+
+            await asyncio.sleep(30)
+
+    
+    async def _handle_new_message(self, event):
+        """Telegram 实时事件回调"""
+        if not event or not getattr(event, "message", None):
+            return
+
+        message = event.message
+        await self._process_pump_message(
+            message_id=message.id,
+            message_text=message.message or "",
+            message_date=message.date,
+            source="实时"
+        )
+
+    async def _process_pump_message(
+        self,
+        *,
+        message_id: int,
+        message_text: str,
+        message_date: datetime,
+        source: str,
+    ) -> Tuple[bool, bool]:
+        """解析并入库 Pump 消息"""
+        try:
+            self.latest_msg_id = max(self.latest_msg_id or 0, message_id)
+            self.log_info(f"📨 [{source}] 收到消息 ID: {message_id}")
+
+            if not message_text:
+                if source == "实时":
+                    self.log_warning(f"[{source}] 消息内容为空，跳过")
+                return False, False
+
+            pump_data = self.parser.parse_pump_message(message_text)
+
             if pump_data:
-                self.log_info(f"🎯 发现新 Pump 消息:")
+                self.log_info("🎯 发现新 Pump 消息:")
                 self.log_info(f"   Token: {pump_data['token_name']} ({pump_data['token_symbol']})")
                 self.log_info(f"   CA: {pump_data['ca']}")
-                
-                # 转换时间为北京时间
-                push_time_beijing = event.message.date.astimezone(BEIJING_TZ)
+
+                push_time_beijing = message_date.astimezone(BEIJING_TZ)
                 time_str = push_time_beijing.strftime('%Y-%m-%d %H:%M:%S')
                 self.log_info(f"   时间: {time_str} (北京时间)")
-                
-                # 入库
+
                 success = self.token_repo.insert_pump_token(
                     ca=pump_data['ca'],
                     token_name=pump_data['token_name'],
                     token_symbol=pump_data['token_symbol'],
                     twitter_url=pump_data.get('twitter_url'),
                     launch_time=push_time_beijing,
-                    tg_msg_id=str(event.message.id)
+                    tg_msg_id=str(message_id)
                 )
-                
+
                 if success:
                     self.log_success("已保存到数据库")
-                else:
-                    self.log_warning("数据库保存失败或重复")
-                    
+                    return True, True
+
+                self.log_warning("数据库保存失败或重复")
+                return True, False
+
+            if source == "实时":
+                self.log_info(f"⏭️ [{source}] 非Pump消息，跳过: {message_text[:50]}...")
+            return False, False
+
         except Exception as e:
-            self.log_error("处理新消息失败", e)
-    
+            self.log_error(f"{source} 消息处理失败", e)
+            return False, False
+
+
     async def collect_history(self):
+
         """采集历史消息"""
         self.log_info("🚀 开始采集 GMGN 历史消息")
         
@@ -313,7 +422,29 @@ class PumpListener(BaseCollector):
     async def stop(self):
         """停止监听"""
         self.is_running = False
+
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._poll_task = None
+
+        if self.client and self._event_builder:
+            try:
+                self.client.remove_event_handler(self._handle_new_message, self._event_builder)
+            except Exception:
+                pass
+            finally:
+                self._event_builder = None
+
         if self.client:
-            await self.client.disconnect()
+            try:
+                await self.client.disconnect()
+            except Exception as e:
+                self.log_warning(f"断开 Telegram 连接异常: {e}")
+
         self.log_info("监听已停止")
 
