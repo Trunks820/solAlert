@@ -1,8 +1,9 @@
 """
 Token 数据仓库
-处理 token_launch_history 表的数据访问
+处理 token_launch_history 表和 twitter_account_manage 表的数据访问
 """
 import logging
+import re
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -170,4 +171,105 @@ class TokenRepository:
         except Exception as e:
             logger.error(f"更新市值失败: {e}")
             return False
+    
+    def insert_twitter_account(self, twitter_url: str, twitter_type: str = None) -> bool:
+        """
+        插入或更新Twitter账号管理表（自动识别URL类型）
+        
+        Args:
+            twitter_url: Twitter链接
+            twitter_type: Twitter类型 (profile/tweet/community)，为None时自动识别
+            
+        Returns:
+            是否成功
+        """
+        if not twitter_url:
+            return False
+        
+        try:
+            # 自动识别Twitter URL类型
+            if twitter_type is None:
+                twitter_type = self._detect_twitter_type(twitter_url)
+            
+            # 提取Twitter用户名
+            username = self._extract_twitter_username(twitter_url)
+            
+            sql = """
+            INSERT INTO twitter_account_manage 
+            (twitter_url, twitter_username, twitter_type, related_token_count, create_time)
+            VALUES (%s, %s, %s, 1, %s)
+            ON DUPLICATE KEY UPDATE
+                related_token_count = related_token_count + 1,
+                update_time = VALUES(create_time)
+            """
+            
+            params = (
+                twitter_url,
+                username,
+                twitter_type,
+                datetime.now()
+            )
+            
+            rowcount = self.db.execute_update(sql, params)
+            
+            if rowcount > 0:
+                type_emoji = {"profile": "👤", "tweet": "💬", "community": "👥"}.get(twitter_type, "🔗")
+                if rowcount == 1:
+                    logger.debug(f"✅ 新Twitter账号已入库: {type_emoji} {twitter_type} | {username or twitter_url}")
+                elif rowcount == 2:
+                    logger.debug(f"🔄 Twitter账号关联数+1: {type_emoji} {twitter_type} | {username or twitter_url}")
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ 插入Twitter账号失败: {e} | URL: {twitter_url}")
+            return False
+    
+    def _detect_twitter_type(self, twitter_url: str) -> str:
+        """
+        自动检测Twitter URL类型
+        
+        Args:
+            twitter_url: Twitter链接
+            
+        Returns:
+            类型: profile / tweet / community
+        """
+        url_lower = twitter_url.lower()
+        
+        # 检测推文链接: https://twitter.com/username/status/123456
+        if '/status/' in url_lower:
+            return 'tweet'
+        
+        # 检测社区链接: https://twitter.com/i/communities/123456
+        if '/communities/' in url_lower or '/i/communities' in url_lower:
+            return 'community'
+        
+        # 默认为个人主页
+        return 'profile'
+    
+    def _extract_twitter_username(self, twitter_url: str) -> Optional[str]:
+        """
+        从Twitter URL提取用户名
+        
+        Args:
+            twitter_url: Twitter链接
+            
+        Returns:
+            用户名（带@）或None
+        """
+        try:
+            # 匹配 twitter.com/username 或 x.com/username
+            # 支持格式：https://twitter.com/username, https://x.com/username
+            match = re.search(r'(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)', twitter_url)
+            if match:
+                username = match.group(1)
+                # 过滤掉特殊路径（如 intent, i, search等）
+                if username.lower() not in ['intent', 'i', 'search', 'home', 'explore', 'notifications', 'messages']:
+                    return f"@{username}"
+            return None
+        except Exception as e:
+            logger.warning(f"提取Twitter用户名失败: {e} | URL: {twitter_url}")
+            return None
 

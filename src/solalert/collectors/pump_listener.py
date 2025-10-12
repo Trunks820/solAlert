@@ -319,7 +319,8 @@ class PumpListener(BaseCollector):
                 time_str = push_time_beijing.strftime('%Y-%m-%d %H:%M:%S')
                 self.log_info(f"   时间: {time_str} (北京时间)")
 
-                success = self.token_repo.insert_pump_token(
+                # 保存Token数据
+                token_saved = self.token_repo.insert_pump_token(
                     ca=pump_data['ca'],
                     token_name=pump_data['token_name'],
                     token_symbol=pump_data['token_symbol'],
@@ -328,7 +329,12 @@ class PumpListener(BaseCollector):
                     tg_msg_id=str(message_id)
                 )
 
-                if success:
+                # 如果有Twitter链接，同时保存到Twitter账号管理表（自动识别类型）
+                twitter_url = pump_data.get('twitter_url')
+                if twitter_url:
+                    self.token_repo.insert_twitter_account(twitter_url)
+
+                if token_saved:
                     self.log_success("已保存到数据库")
                     return True, True
 
@@ -396,15 +402,22 @@ class PumpListener(BaseCollector):
                         # 转换时间
                         push_time_beijing = message.date.astimezone(BEIJING_TZ)
                         
-                        # 入库
-                        if self.token_repo.insert_pump_token(
+                        # 入库Token数据
+                        token_saved = self.token_repo.insert_pump_token(
                             ca=pump_data['ca'],
                             token_name=pump_data['token_name'],
                             token_symbol=pump_data['token_symbol'],
                             twitter_url=pump_data.get('twitter_url'),
                             launch_time=push_time_beijing,
                             tg_msg_id=str(message.id)
-                        ):
+                        )
+                        
+                        # 同时保存Twitter账号（自动识别类型）
+                        twitter_url = pump_data.get('twitter_url')
+                        if twitter_url:
+                            self.token_repo.insert_twitter_account(twitter_url)
+                        
+                        if token_saved:
                             saved_count += 1
                 
                 # 每处理100条显示进度

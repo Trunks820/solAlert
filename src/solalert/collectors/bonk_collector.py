@@ -344,8 +344,8 @@ class BonkCollector(BaseCollector):
             是否成功
         """
         try:
-            # 先检查是否已存在
-            check_sql = "SELECT ca FROM token_launch_history WHERE ca = %s LIMIT 1"
+            # 先检查是否已存在（根据ca+source唯一索引）
+            check_sql = "SELECT ca FROM token_launch_history WHERE ca = %s AND source = 'bonk' LIMIT 1"
             existing = self.token_repo.db.execute_query(check_sql, (ca,), fetch_one=True)
             
             if existing:
@@ -373,6 +373,10 @@ class BonkCollector(BaseCollector):
             )
             
             rowcount = self.token_repo.db.execute_update(sql, params)
+            
+            # 如果Token插入成功，同时保存Twitter账号（自动识别类型）
+            if rowcount > 0 and twitter_url:
+                self.token_repo.insert_twitter_account(twitter_url)
             
             # 输出日志
             twitter_info = f" [Twitter: {twitter_url}]" if twitter_url else ""
