@@ -357,21 +357,39 @@ class FourMemeCollector(BaseCollector):
                 timeout=30
             )
 
+            # 记录HTTP状态码
+            self.log_info(f"API响应状态码: {response.status_code}")
+            
             response.raise_for_status()
+
+            # 记录响应内容的前200个字符用于调试
+            content_preview = response.text[:200] if response.text else "空响应"
+            self.log_info(f"API响应预览: {content_preview}...")
 
             result = response.json()
 
             if result.get('code') == 0:
                 return result
             else:
-                self.log_error(f"API返回失败: {result}")
+                self.log_error(f"API返回错误码: {result}")
                 return None
 
-        except requests.exceptions.RequestException as e:
-            self.log_error(f"API请求失败: {e}", e)
+        except requests.exceptions.Timeout as e:
+            self.log_error(f"API请求超时: {e}")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            self.log_error(f"API连接失败: {e}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            self.log_error(f"API HTTP错误: {e} | 响应内容: {response.text[:200]}")
+            return None
+        except ValueError as e:
+            # JSON解析失败
+            self.log_error(f"JSON解析失败: {e}")
+            self.log_error(f"响应内容: {response.text[:500]}")
             return None
         except Exception as e:
-            self.log_error(f"解析API响应失败: {e}", e)
+            self.log_error(f"API请求未知错误: {e}", e)
             return None
 
     async def _process_tokens(self, tokens: List[Dict[str, Any]], listed_pancake: str) -> int:
