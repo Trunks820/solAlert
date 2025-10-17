@@ -1,23 +1,24 @@
-# solAlert - Solana Token 监控预警系统
+# solAlert - 多链Token监控预警系统
 
-Solana链上Token监控和提醒系统，支持GMGN Pump和BONK平台的新币发射监控。
+多链Token监控和提醒系统，支持 Solana 和 BSC 链的新币发射监控。
 
 ## 📋 功能特性
 
 ### 已实现功能 ✅
-- ✅ **GMGN Pump监听器** - 实时监听Telegram频道的新币发射消息
-- ✅ **BONK数据采集器** - 从Raydium API采集已毕业的Token数据
+- ✅ **GMGN Pump监听器** (Solana) - 实时监听Telegram频道的新币发射消息
+- ✅ **BONK数据采集器** (Solana) - 从Raydium API采集已毕业的Token数据
+- ✅ **Four.meme采集器** (BSC) - 采集BSC链Four.meme平台的内盘和外盘Token
 - ✅ **Twitter推送同步** - 自动同步Twitter账号推送配置（查缺补漏机制）
 - ✅ **Token监控引擎** - 基于Jupiter API的实时价格/持币人/交易量监控
 - ✅ **数据库存储** - MySQL持久化存储Token发射历史和监控配置
 - ✅ **配置管理** - 基于环境变量的配置系统
 - ✅ **日志系统** - 完整的日志记录和错误追踪
 - ✅ **多模块架构** - 模块化设计，易于扩展
+- ✅ **多链支持** - 支持Solana和BSC两条链
 
 ### 开发中功能 🚧
-- 🚧 **API服务** - RESTful API接口
-- 🚧 **Web前端** - 数据展示和配置管理界面
 - 🚧 **更多监控维度** - K线、大额交易、链上数据监控
+- 🚧 **更多链支持** - ETH、Base、Polygon等其他EVM链
 
 ## 🚀 快速开始
 
@@ -62,6 +63,9 @@ python scripts/test_connection.py
 
 # 测试BONK采集器
 python scripts/test_bonk.py
+
+# 测试Four.meme采集器
+python scripts/test_fourmeme.py
 ```
 
 ### 4. 运行采集器
@@ -78,6 +82,12 @@ python main.py --module bonk_collector
 
 # 运行BONK采集器（自定义轮询间隔30秒）
 python main.py --module bonk_collector --interval 30
+
+# 运行Four.meme采集器（默认60秒轮询）
+python main.py --module fourmeme_collector
+
+# 运行Four.meme采集器（自定义轮询间隔120秒）
+python main.py --module fourmeme_collector --interval 120
 
 # 运行Twitter推送同步任务（默认10分钟间隔）
 python main.py --module twitter_push_sync
@@ -114,8 +124,9 @@ solAlert/
 │   │   └── token_repo.py      # Token数据仓库
 │   ├── collectors/            # 数据采集器
 │   │   ├── base.py            # 采集器基类
-│   │   ├── pump_listener.py   # Pump监听器
-│   │   └── bonk_collector.py  # BONK采集器
+│   │   ├── pump_listener.py   # Pump监听器 (Solana)
+│   │   ├── bonk_collector.py  # BONK采集器 (Solana)
+│   │   └── fourmeme_collector.py  # Four.meme采集器 (BSC)
 │   ├── monitor/               # 监控引擎
 │   │   ├── jupiter_api.py     # Jupiter API封装
 │   │   ├── trigger_logic.py   # 触发逻辑判断
@@ -153,6 +164,17 @@ solAlert/
 - 自动采集历史数据（默认5页，约500条）
 - 定时轮询新Token（默认60秒）
 - 自动去重，只保存新Token
+
+### Four.meme采集器 (fourmeme_collector.py)
+- 从Four.meme API采集BSC链上的Meme Token
+- **同时采集内盘和外盘Token**：
+  - 内盘：未上Pancakeswap的Token（筹款阶段）
+  - 外盘：已毕业到Pancakeswap交易的Token
+- **智能全量采集**：首次运行时持续采集所有历史数据（直到遇到重复或无数据）
+- 定时轮询新Token（默认60秒）
+- 自动提取Twitter链接和市值信息
+- 自动去重，只保存新Token
+- 连续3页无新数据自动停止采集
 
 ### Twitter推送同步 (twitter_push_sync.py)
 - 定时扫描数据库中的推送配置变化
