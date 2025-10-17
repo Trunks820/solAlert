@@ -2,7 +2,6 @@
 通知服务
 支持Telegram和微信通知
 """
-import aiohttp
 import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
