@@ -7,17 +7,17 @@ Solana链上Token监控和提醒系统，支持GMGN Pump和BONK平台的新币�
 ### 已实现功能 ✅
 - ✅ **GMGN Pump监听器** - 实时监听Telegram频道的新币发射消息
 - ✅ **BONK数据采集器** - 从Raydium API采集已毕业的Token数据
-- ✅ **数据库存储** - MySQL持久化存储Token发射历史
+- ✅ **Twitter推送同步** - 自动同步Twitter账号推送配置（查缺补漏机制）
+- ✅ **Token监控引擎** - 基于Jupiter API的实时价格/持币人/交易量监控
+- ✅ **数据库存储** - MySQL持久化存储Token发射历史和监控配置
 - ✅ **配置管理** - 基于环境变量的配置系统
 - ✅ **日志系统** - 完整的日志记录和错误追踪
 - ✅ **多模块架构** - 模块化设计，易于扩展
 
 ### 开发中功能 🚧
-- 🚧 **行情数据采集** - 定时采集Token实时行情
-- 🚧 **监控引擎** - 市值、价格、持仓等多维度监控
-- 🚧 **多渠道通知** - Telegram、微信、Web推送
 - 🚧 **API服务** - RESTful API接口
 - 🚧 **Web前端** - 数据展示和配置管理界面
+- 🚧 **更多监控维度** - K线、大额交易、链上数据监控
 
 ## 🚀 快速开始
 
@@ -79,6 +79,21 @@ python main.py --module bonk_collector
 # 运行BONK采集器（自定义轮询间隔30秒）
 python main.py --module bonk_collector --interval 30
 
+# 运行Twitter推送同步任务（默认10分钟间隔）
+python main.py --module twitter_push_sync
+
+# 运行Twitter推送同步任务（自定义5分钟间隔）
+python main.py --module twitter_push_sync --interval 300
+
+# 运行Token监控引擎（默认1分钟间隔）
+python main.py --module token_monitor
+
+# 运行Token监控引擎（只执行一次）
+python main.py --module token_monitor --once
+
+# 运行Token监控引擎（自定义5分钟间隔）
+python main.py --module token_monitor --interval 5
+
 # 同时运行所有采集器
 python main.py --module all
 ```
@@ -101,6 +116,13 @@ solAlert/
 │   │   ├── base.py            # 采集器基类
 │   │   ├── pump_listener.py   # Pump监听器
 │   │   └── bonk_collector.py  # BONK采集器
+│   ├── monitor/               # 监控引擎
+│   │   ├── jupiter_api.py     # Jupiter API封装
+│   │   ├── trigger_logic.py   # 触发逻辑判断
+│   │   ├── notifiers.py       # 通知服务
+│   │   └── token_monitor.py   # 核心监控引擎
+│   ├── tasks/                 # 定时任务
+│   │   └── twitter_push_sync.py # Twitter推送同步
 │   └── notifiers/             # 通知服务
 │       ├── base.py            # 通知基类
 │       ├── telegram.py        # Telegram通知
@@ -132,6 +154,25 @@ solAlert/
 - 定时轮询新Token（默认60秒）
 - 自动去重，只保存新Token
 
+### Twitter推送同步 (twitter_push_sync.py)
+- 定时扫描数据库中的推送配置变化
+- 自动调用Twitter API同步推送设置
+- 查缺补漏机制（默认10分钟间隔）
+- 智能重试，避免重复调用
+
+### Token监控引擎 (token_monitor.py)
+- **实时监控**：基于Jupiter API获取Token 5分钟统计数据
+- **多维度监控**：
+  - 📈 价格涨跌幅（支持上涨/下跌双向阈值）
+  - 👥 持币人数变化（支持增加/减少双向阈值）
+  - 💰 交易量变化（支持增加/减少双向阈值）
+- **灵活触发逻辑**：
+  - `any`：任一条件满足即触发
+  - `all`：所有条件同时满足才触发
+- **智能防重复**：Redis冷却机制，30分钟内不重复通知
+- **通知方式**：Telegram Bot / 企业微信
+- **完整日志**：记录触发历史、通知状态到数据库
+
 ### 数据仓库 (token_repo.py)
 - 封装所有数据库操作
 - 支持Pump和BONK数据的插入和更新
@@ -158,6 +199,34 @@ solAlert/
 - created_at: 创建时间
 ```
 
+### token_monitor_config (Token监控配置)
+```sql
+- id: 主键
+- ca: Token合约地址
+- token_name: Token名称
+- token_symbol: Token符号
+- alert_mode: 监控模式（event）
+- events_config: 事件配置JSON（涨跌幅/持币人数/交易量）
+- trigger_logic: 触发逻辑（any/all）
+- notify_methods: 通知方式（telegram,wechat）
+- timer_interval: 监控间隔（分钟）
+- status: 启用状态（0停用/1启用）
+- last_notification_time: 上次通知时间
+- notification_count: 累计通知次数
+```
+
+### token_monitor_alert_log (监控触发日志)
+```sql
+- id: 主键
+- config_id: 关联监控配置ID
+- ca: Token合约地址
+- trigger_time: 触发时间
+- trigger_events: 触发事件详情（JSON）
+- stats_data: Jupiter API统计数据（JSON）
+- notify_methods: 通知方式
+- notify_status: 通知状态（success/failed/partial）
+```
+
 ## 🎯 使用场景
 
 ### 场景1：实时监控新币发射
@@ -181,6 +250,39 @@ python main.py --module bonk_collector
 python main.py --module bonk_collector --interval 30
 ```
 
+### 场景4：Token价格监控
+```bash
+# 启动监控引擎（默认1分钟检查一次）
+python main.py --module token_monitor
+
+# 自定义检查间隔（5分钟）
+python main.py --module token_monitor --interval 5
+
+# 只执行一次（测试用）
+python main.py --module token_monitor --once
+```
+
+**监控配置示例（在数据库中配置）：**
+```json
+{
+  "priceChange": {
+    "enabled": true,
+    "risePercent": 10,    // 价格上涨 ≥10% 触发
+    "fallPercent": 10     // 价格下跌 ≥10% 触发
+  },
+  "holders": {
+    "enabled": true,
+    "increasePercent": 30,  // 持币人数增加 ≥30% 触发
+    "decreasePercent": 20   // 持币人数减少 ≥20% 触发
+  },
+  "volume": {
+    "enabled": false,
+    "increasePercent": null,
+    "decreasePercent": null
+  }
+}
+```
+
 ## 📝 命令行参数
 
 ### main.py 参数说明
@@ -188,14 +290,20 @@ python main.py --module bonk_collector --interval 30
 --module       选择运行模块
                - pump_listener: Pump监听器
                - bonk_collector: BONK采集器
-               - monitor: 监控引擎（开发中）
+               - twitter_push_sync: Twitter推送同步（查缺补漏）
+               - token_monitor: Token监控引擎
                - all: 所有服务
 
 --mode         Pump监听器模式
                - listen: 实时监听（默认）
                - history: 历史采集
 
---interval     BONK采集器轮询间隔（秒，默认60）
+--interval     采集器/任务轮询间隔
+               - BONK采集器: 秒（默认60）
+               - Twitter推送同步: 秒（默认600=10分钟）
+               - Token监控: 分钟（默认1）
+
+--once         只执行一次（适用于twitter_push_sync和token_monitor）
 
 --no-check     跳过启动时的依赖检查
 ```
@@ -238,9 +346,14 @@ tail -f logs/solalert.log
 ## ⚠️ 注意事项
 
 1. **Telegram代理设置**：如果在国内环境使用Pump监听器，需要配置代理
-2. **API限流**：BONK采集器建议轮询间隔不低于30秒，避免触发API限流
+2. **API限流**：
+   - BONK采集器建议轮询间隔不低于30秒
+   - Jupiter API单个查询，建议间隔≥0.1秒
+   - Token监控默认1分钟间隔，可根据实际情况调整
 3. **数据库连接**：确保数据库服务器允许远程连接
 4. **时区问题**：所有时间戳都会转换为UTC时间存储
+5. **Redis依赖**：Token监控引擎需要Redis支持防重复功能
+6. **监控配置**：需要在数据库中配置监控规则（通过前端或直接SQL）
 
 ## 📞 问题反馈
 
@@ -251,6 +364,16 @@ tail -f logs/solalert.log
 
 ## 📅 更新日志
 
+### v0.2.0 (2025-10-16) 🎉
+- ✅ **新增Token监控引擎**
+  - 基于Jupiter API实时监控
+  - 支持价格、持币人数、交易量三维监控
+  - any/all灵活触发逻辑
+  - Redis防重复机制
+  - Telegram自动通知
+- ✅ 完成Twitter推送同步任务
+- ✅ 优化数据库架构
+
 ### v0.1.0 (2025-10-01)
 - ✅ 完成Pump监听器
 - ✅ 完成BONK采集器
@@ -260,11 +383,11 @@ tail -f logs/solalert.log
 
 ## 🚀 下一步计划
 
-1. 实现行情数据采集器
-2. 实现监控引擎（市值、价格监控）
-3. 完善通知功能（自动推送）
-4. 开发Web API接口
-5. 开发前端界面
+1. ✅ ~~实现监控引擎（价格、持币人数监控）~~ **已完成**
+2. 完善监控引擎（增加更多监控维度）
+3. 开发Web API接口
+4. 开发前端界面
+5. 增加更多数据源集成
 
 ---
 

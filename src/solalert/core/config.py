@@ -66,6 +66,25 @@ WECHAT_CONFIG = {
 }
 
 
+# ==================== Twitter API配置 ====================
+TWITTER_API_CONFIG = {
+    'base_url': os.getenv('TWITTER_API_BASE_URL', 'https://alpha.apidance.pro'),
+    'authorization': os.getenv('TWITTER_API_TOKEN', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJXYWxsZXRBZGRyZXNzIjoiMHhCRWIwOTVjQWVGNjQ0QzcxMGQ2RmYxOThiNmU1NEQ2RGQxMmVCRGFiIiwiUmVhZE9ubHkiOmZhbHNlLCJNYXhGb2xsb3ciOjAsIk1heFdvcmRzIjowLCJNYXhFeHBvcnQiOjAsImV4cCI6NzgwODQwNjU5NSwiaWF0IjoxNzYwNDA2NTk1fQ.5GPPwTr2pQe7HjR6TLvq_7Ii1KuC3UkdAS7GP4pShS4'),
+    'timeout': int(os.getenv('TWITTER_API_TIMEOUT', 10)),
+    'max_retries': int(os.getenv('TWITTER_API_MAX_RETRIES', 3)),
+    'retry_delay': float(os.getenv('TWITTER_API_RETRY_DELAY', 0.5)),  # API调用间隔（秒）
+    
+    # API端点配置 (使用PUT方法)
+    'endpoints': {
+        'follow': '/api/v1/user/follow/push',      # 关注推送
+        'tweet': '/api/v1/user/tweet/push',        # 推文推送
+        'retweet': '/api/v1/user/retweet/push',    # 转发推送
+        'reply': '/api/v1/user/reply/push',        # 回复推送
+        'avatar': '/api/v1/user/avatar/push',      # 头像推送
+    }
+}
+
+
 # ==================== 日志配置 ====================
 LOG_CONFIG = {
     'level': os.getenv('LOG_LEVEL', 'INFO'),
@@ -149,6 +168,10 @@ def get_config_summary() -> Dict[str, Any]:
         "wechat": {
             "enabled": WECHAT_CONFIG['enabled'],
             "api_url": WECHAT_CONFIG['api_url']
+        },
+        "twitter_api": {
+            "base_url": TWITTER_API_CONFIG['base_url'],
+            "timeout": TWITTER_API_CONFIG['timeout']
         },
         "logging": {
             "level": LOG_CONFIG['level'],

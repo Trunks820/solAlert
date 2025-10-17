@@ -16,6 +16,8 @@ from solalert.core.config import get_config_summary
 from solalert.core.database import test_database_connection
 from solalert.collectors.pump_listener import PumpListener
 from solalert.collectors.bonk_collector import BonkCollector
+from solalert.tasks.twitter_push_sync import TwitterPushSyncService
+from solalert.monitor.token_monitor import TokenMonitorEngine
 
 # 设置日志
 logger = setup_logger()
@@ -111,6 +113,42 @@ async def run_bonk_collector(poll_interval: int = 60):
         await collector.stop()
 
 
+def run_twitter_push_sync(interval: int = 600, once: bool = False):
+    """
+    运行Twitter推送同步任务
+    
+    Args:
+        interval: 执行间隔（秒），默认600秒（10分钟）
+        once: 是否只执行一次
+    """
+    service = TwitterPushSyncService()
+    
+    if once:
+        logger.info(f"🚀 执行 Twitter推送同步任务（一次）")
+        service.run_sync_once()
+    else:
+        logger.info(f"🚀 启动 Twitter推送同步任务 (间隔: {interval}秒 = {interval//60}分钟)")
+        service.run_schedule(interval_seconds=interval)
+
+
+async def run_token_monitor(interval: int = 1, once: bool = False):
+    """
+    运行Token监控任务
+    
+    Args:
+        interval: 执行间隔（分钟），默认1分钟
+        once: 是否只执行一次
+    """
+    engine = TokenMonitorEngine()
+    
+    if once:
+        logger.info(f"🚀 执行 Token监控任务（一次）")
+        await engine.run_monitor_once()
+    else:
+        logger.info(f"🚀 启动 Token监控任务 (间隔: {interval}分钟)")
+        await engine.run_monitor_schedule(interval_minutes=interval)
+
+
 async def run_all_services():
     """运行所有服务"""
     logger.info("🚀 启动所有服务...")
@@ -145,7 +183,7 @@ def main():
     parser = argparse.ArgumentParser(description="solAlert - Solana Token 监控预警系统")
     parser.add_argument(
         "--module",
-        choices=["pump_listener", "bonk_collector", "monitor", "all"],
+        choices=["pump_listener", "bonk_collector", "twitter_push_sync", "token_monitor", "all"],
         default="pump_listener",
         help="要启动的模块 (默认: pump_listener)"
     )
@@ -159,7 +197,12 @@ def main():
         "--interval",
         type=int,
         default=60,
-        help="BONK采集器轮询间隔(秒，默认60)"
+        help="采集器/任务轮询间隔(秒): BONK默认60, Twitter推送同步默认600"
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Twitter推送同步：只执行一次，不循环"
     )
     parser.add_argument(
         "--no-check",
@@ -184,8 +227,14 @@ def main():
             asyncio.run(run_pump_listener(args.mode))
         elif args.module == "bonk_collector":
             asyncio.run(run_bonk_collector(args.interval))
-        elif args.module == "monitor":
-            logger.error("❌ 监控引擎尚未实现")
+        elif args.module == "twitter_push_sync":
+            # Twitter推送同步任务，默认600秒（10分钟）
+            interval = args.interval if args.interval != 60 else 600
+            run_twitter_push_sync(interval, once=args.once)
+        elif args.module == "token_monitor":
+            # Token监控任务，默认1分钟间隔
+            interval = args.interval if args.interval != 60 else 1
+            asyncio.run(run_token_monitor(interval, once=args.once))
         elif args.module == "all":
             asyncio.run(run_all_services())
     except KeyboardInterrupt:
