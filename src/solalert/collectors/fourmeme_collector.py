@@ -144,7 +144,7 @@ class FourMemeCollector(BaseCollector):
 
     async def _collect_all_pages(self, listed_pancake: str) -> tuple:
         """
-        采集指定类型的所有Token（持续采集直到遇到重复或无数据）
+        采集指定类型的所有Token（持续采集直到API返回的数据不再变化）
 
         Args:
             listed_pancake: 'true'=外盘, 'false'=内盘
@@ -155,7 +155,8 @@ class FourMemeCollector(BaseCollector):
         total_collected = 0
         total_saved = 0
         page = 1
-        consecutive_zero_saves = 0  # 连续0条新入库的页数
+        last_page_last_ca = None  # 记录上一页最后一个CA
+        same_last_ca_count = 0    # 连续相同最后CA的次数
 
         while True:
             try:
@@ -175,6 +176,9 @@ class FourMemeCollector(BaseCollector):
                     self.log_info(f"   第{page}页无数据，采集完成")
                     break
 
+                # 获取当前页最后一个Token的CA
+                current_last_ca = tokens[-1]['address'] if tokens else None
+
                 # 处理数据
                 saved_count = await self._process_tokens(tokens, listed_pancake)
                 total_collected += len(tokens)
@@ -182,24 +186,25 @@ class FourMemeCollector(BaseCollector):
 
                 self.log_info(f"   第{page}页: 获取{len(tokens)}条，入库{saved_count}条")
 
-                # 记录最后一个ID
-                if tokens:
-                    last_id = tokens[0]['id']
+                # 记录第一个ID（用于轮询时判断新数据）
+                if tokens and page == 1:
+                    first_id = tokens[0]['id']
                     if listed_pancake == 'true':
-                        self.last_seen_outer_id = last_id
+                        self.last_seen_outer_id = first_id
                     else:
-                        self.last_seen_inner_id = last_id
+                        self.last_seen_inner_id = first_id
 
-                # 如果这一页没有任何新数据入库，计数+1
-                if saved_count == 0:
-                    consecutive_zero_saves += 1
-                    # 连续3页都没有新数据，说明已经采集完了
-                    if consecutive_zero_saves >= 3:
-                        self.log_info(f"   连续{consecutive_zero_saves}页无新数据，采集完成")
+                # 判断是否已经到达数据末尾
+                # 如果连续3页的最后一个CA都相同，说明API已经没有更多历史数据了
+                if current_last_ca == last_page_last_ca:
+                    same_last_ca_count += 1
+                    if same_last_ca_count >= 2:  # 连续3页（当前+之前2页）最后CA相同
+                        self.log_info(f"   检测到API返回数据不再变化，已采集完所有历史数据")
                         break
                 else:
-                    # 有新数据，重置计数
-                    consecutive_zero_saves = 0
+                    same_last_ca_count = 0
+                
+                last_page_last_ca = current_last_ca
 
                 # 下一页
                 page += 1
@@ -496,18 +501,9 @@ class FourMemeCollector(BaseCollector):
             是否成功
         """
         try:
-            # 先检查是否已存在（根据ca+source唯一索引）
-            check_sql = "SELECT ca FROM token_launch_history WHERE ca = %s AND source = 'fourmeme' LIMIT 1"
-            existing = self.token_repo.db.execute_query(check_sql, (ca,), fetch_one=True)
-
-            if existing:
-                # 已存在，直接跳过
-                logger.debug(f"⏭️  跳过重复数据: {token_name} ({ca[:10]}...)")
-                return False
-
-            # 不存在，插入新数据
+            # 使用 INSERT IGNORE 避免重复，性能更好（不需要先查询）
             sql = """
-            INSERT INTO token_launch_history
+            INSERT IGNORE INTO token_launch_history
             (ca, token_name, token_symbol, twitter_url, source, launch_time, tg_msg_id, highest_market_cap, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
@@ -520,7 +516,7 @@ class FourMemeCollector(BaseCollector):
                 'fourmeme',  # 设置source为fourmeme
                 launch_time,
                 tg_msg_id,
-                market_cap,  # 使用API返回的当前市值作为初始值
+                int(market_cap),  # 转换为整数（因为数据库字段是BIGINT）
                 datetime.now()
             )
 
