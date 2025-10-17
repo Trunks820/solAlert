@@ -350,22 +350,20 @@ class FourMemeCollector(BaseCollector):
             API响应，失败返回None
         """
         try:
+            # 移除 Accept-Encoding 头，让 requests 自动处理压缩
+            headers = self.HEADERS.copy()
+            headers.pop('Accept-Encoding', None)
+            
             response = self.session.get(
                 self.API_BASE_URL,
                 params=params,
-                headers=self.HEADERS,
+                headers=headers,
                 timeout=30
             )
-
-            # 记录HTTP状态码
-            self.log_info(f"API响应状态码: {response.status_code}")
             
             response.raise_for_status()
 
-            # 记录响应内容的前200个字符用于调试
-            content_preview = response.text[:200] if response.text else "空响应"
-            self.log_info(f"API响应预览: {content_preview}...")
-
+            # 使用 response.json() 会自动处理解压和 JSON 解析
             result = response.json()
 
             if result.get('code') == 0:
@@ -381,12 +379,11 @@ class FourMemeCollector(BaseCollector):
             self.log_error(f"API连接失败: {e}")
             return None
         except requests.exceptions.HTTPError as e:
-            self.log_error(f"API HTTP错误: {e} | 响应内容: {response.text[:200]}")
+            self.log_error(f"API HTTP错误: {e}")
             return None
         except ValueError as e:
             # JSON解析失败
             self.log_error(f"JSON解析失败: {e}")
-            self.log_error(f"响应内容: {response.text[:500]}")
             return None
         except Exception as e:
             self.log_error(f"API请求未知错误: {e}", e)
