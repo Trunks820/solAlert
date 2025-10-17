@@ -178,12 +178,14 @@ async def run_all_services():
     # 创建采集器实例
     pump_listener = PumpListener()
     bonk_collector = BonkCollector(poll_interval=60)
+    fourmeme_collector = FourMemeCollector(poll_interval=60)
     
     # 并发运行所有采集器
     try:
         await asyncio.gather(
             pump_listener.start(),
             bonk_collector.start(),
+            fourmeme_collector.start(),
             return_exceptions=True
         )
     except KeyboardInterrupt:
@@ -195,6 +197,7 @@ async def run_all_services():
         await asyncio.gather(
             pump_listener.stop(),
             bonk_collector.stop(),
+            fourmeme_collector.stop(),
             return_exceptions=True
         )
 
