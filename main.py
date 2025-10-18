@@ -16,7 +16,7 @@ from solalert.core.config import get_config_summary
 from solalert.core.database import test_database_connection
 from solalert.collectors.pump_listener import PumpListener
 from solalert.collectors.bonk_collector import BonkCollector
-from solalert.collectors.fourmeme_collector import FourMemeCollector
+from solalert.collectors.fourmeme_listener import FourMemeListener
 from solalert.tasks.twitter_push_sync import TwitterPushSyncService
 from solalert.monitor.token_monitor import TokenMonitorEngine
 
@@ -114,25 +114,30 @@ async def run_bonk_collector(poll_interval: int = 60):
         await collector.stop()
 
 
-async def run_fourmeme_collector(poll_interval: int = 60):
+async def run_fourmeme_listener(mode: str = "listen", days: int = None, limit: int = None):
     """
-    运行Four.meme采集器（BSC链）
+    运行Four.meme Telegram监听器
     
     Args:
-        poll_interval: 轮询间隔（秒），默认60秒
+        mode: 运行模式 (listen=实时监听, history=历史采集)
+        days: 历史采集天数 (None=全部历史)
+        limit: 历史采集最大消息数 (None=不限制)
     """
-    logger.info(f"🚀 启动 Four.meme 采集器 (轮询间隔: {poll_interval}秒)")
-    
-    collector = FourMemeCollector(poll_interval=poll_interval)
+    listener = FourMemeListener()
     
     try:
-        await collector.start()
+        if mode == "history":
+            logger.info(f"🚀 启动 Four.meme Telegram 历史采集器")
+            await listener.collect_history(days=days, limit=limit)
+        else:
+            logger.info(f"🚀 启动 Four.meme Telegram 实时监听器")
+            await listener.start()
     except KeyboardInterrupt:
         logger.info("⏹️  用户停止服务")
     except Exception as e:
         logger.error(f"❌ 服务运行失败: {e}", exc_info=True)
     finally:
-        await collector.stop()
+        await listener.stop()
 
 
 def run_twitter_push_sync(interval: int = 600, once: bool = False):
@@ -172,20 +177,22 @@ async def run_token_monitor(interval: int = 1, once: bool = False):
 
 
 async def run_all_services():
-    """运行所有服务"""
+    """运行所有服务（数据采集器 + Token监控）"""
     logger.info("🚀 启动所有服务...")
     
-    # 创建采集器实例
+    # 创建采集器和监控实例
     pump_listener = PumpListener()
     bonk_collector = BonkCollector(poll_interval=60)
-    fourmeme_collector = FourMemeCollector(poll_interval=60)
+    fourmeme_listener = FourMemeListener()
+    token_monitor = TokenMonitorEngine()
     
-    # 并发运行所有采集器
+    # 并发运行所有采集器和监控任务
     try:
         await asyncio.gather(
             pump_listener.start(),
             bonk_collector.start(),
-            fourmeme_collector.start(),
+            fourmeme_listener.start(),
+            token_monitor.run_monitor_schedule(interval_minutes=1),  # 1分钟间隔监控
             return_exceptions=True
         )
     except KeyboardInterrupt:
@@ -197,7 +204,7 @@ async def run_all_services():
         await asyncio.gather(
             pump_listener.stop(),
             bonk_collector.stop(),
-            fourmeme_collector.stop(),
+            fourmeme_listener.stop(),
             return_exceptions=True
         )
 
@@ -208,7 +215,7 @@ def main():
     parser = argparse.ArgumentParser(description="solAlert - Solana Token 监控预警系统")
     parser.add_argument(
         "--module",
-        choices=["pump_listener", "bonk_collector", "fourmeme_collector", "twitter_push_sync", "token_monitor", "all"],
+        choices=["pump_listener", "bonk_collector", "fourmeme_listener", "twitter_push_sync", "token_monitor", "all"],
         default="pump_listener",
         help="要启动的模块 (默认: pump_listener)"
     )
@@ -216,7 +223,7 @@ def main():
         "--mode",
         choices=["listen", "history"],
         default="listen",
-        help="Pump监听器模式: listen(实时) 或 history(历史采集)"
+        help="监听器模式: listen(实时) 或 history(历史采集)"
     )
     parser.add_argument(
         "--interval",
@@ -252,8 +259,8 @@ def main():
             asyncio.run(run_pump_listener(args.mode))
         elif args.module == "bonk_collector":
             asyncio.run(run_bonk_collector(args.interval))
-        elif args.module == "fourmeme_collector":
-            asyncio.run(run_fourmeme_collector(args.interval))
+        elif args.module == "fourmeme_listener":
+            asyncio.run(run_fourmeme_listener(args.mode))
         elif args.module == "twitter_push_sync":
             # Twitter推送同步任务，默认600秒（10分钟）
             interval = args.interval if args.interval != 60 else 600
