@@ -108,12 +108,16 @@ class FourMemeListener(BaseCollector):
         self.api_hash = TELEGRAM_CONFIG['api_hash']
         self.channel_id = 2178358910  # @fourmemedeployers
         
-        # 代理配置 - 强制启用代理 1081
-        self.proxy = (
-            socks.SOCKS5,
-            '127.0.0.1',
-            1081
-        )
+        # 代理配置 - 从配置文件读取
+        proxy_config = TELEGRAM_CONFIG.get('proxy', {})
+        if proxy_config.get('enabled'):
+            self.proxy = (
+                socks.SOCKS5,
+                proxy_config.get('host', '127.0.0.1'),
+                proxy_config.get('port', 1081)
+            )
+        else:
+            self.proxy = None
         
         self.client = None
         self.parser = FourMemeParser()
