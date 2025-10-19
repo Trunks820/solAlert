@@ -210,7 +210,12 @@ class GmgnAPI:
                 logger.error(f"❌ GMGN API 返回空响应 (chain={chain}, addresses={addresses})")
                 return None
             
+            # 打印前4字节用于调试
+            first_bytes = response.content[:4]
+            logger.debug(f"响应前4字节: {first_bytes.hex()} ({first_bytes})")
+            
             # 检查是否是 gzip 压缩（检查 magic number）
+            # gzip: 1f8b, deflate/zlib: 78xx
             if response.content[:2] == b'\x1f\x8b':
                 logger.debug("检测到 gzip 压缩响应，尝试手动解压...")
                 import gzip
@@ -221,8 +226,24 @@ class GmgnAPI:
                 except Exception as decompress_error:
                     logger.error(f"❌ 手动解压 gzip 失败: {decompress_error}")
                     logger.error(f"   原始内容长度: {len(response.content)} bytes")
-                    logger.error(f"   前20字节: {response.content[:20].hex()}")
                     return None
+            elif response.content[0:1] == b'\x78':  # deflate/zlib 压缩
+                logger.debug("检测到 deflate/zlib 压缩响应，尝试手动解压...")
+                import zlib
+                try:
+                    decompressed = zlib.decompress(response.content)
+                    data = json.loads(decompressed.decode('utf-8'))
+                    logger.debug("✅ 手动解压 zlib 成功")
+                except Exception as decompress_error:
+                    logger.error(f"❌ 手动解压 zlib 失败: {decompress_error}")
+                    logger.error(f"   尝试 zlib 负窗口...")
+                    try:
+                        decompressed = zlib.decompress(response.content, -zlib.MAX_WBITS)
+                        data = json.loads(decompressed.decode('utf-8'))
+                        logger.debug("✅ 手动解压 zlib (负窗口) 成功")
+                    except Exception as e2:
+                        logger.error(f"❌ 所有解压方式都失败: {e2}")
+                        return None
             else:
                 # 正常解析 JSON
                 try:
@@ -231,7 +252,9 @@ class GmgnAPI:
                     logger.error(f"❌ GMGN API JSON 解析失败 (chain={chain})")
                     logger.error(f"   响应状态码: {response.status_code}")
                     logger.error(f"   Content-Type: {response.headers.get('Content-Type')}")
-                    logger.error(f"   响应前200字符: {response.text[:200]}")
+                    logger.error(f"   Content-Encoding: {response.headers.get('Content-Encoding', 'none')}")
+                    logger.error(f"   前4字节hex: {first_bytes.hex()}")
+                    logger.error(f"   响应前100字符: {response.text[:100]}")
                     return None
             
             if data.get('code') == 0 and 'data' in data:
