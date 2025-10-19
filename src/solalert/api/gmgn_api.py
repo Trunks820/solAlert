@@ -205,20 +205,34 @@ class GmgnAPI:
             
             response.raise_for_status()
             
-            # 打印响应内容用于调试
-            response_text = response.text
-            if not response_text:
+            # 检查响应内容
+            if not response.content:
                 logger.error(f"❌ GMGN API 返回空响应 (chain={chain}, addresses={addresses})")
                 return None
             
-            # 尝试解析 JSON
-            try:
-                data = response.json()
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ GMGN API JSON 解析失败 (chain={chain})")
-                logger.error(f"   响应状态码: {response.status_code}")
-                logger.error(f"   响应前200字符: {response_text[:200]}")
-                return None
+            # 检查是否是 gzip 压缩（检查 magic number）
+            if response.content[:2] == b'\x1f\x8b':
+                logger.debug("检测到 gzip 压缩响应，尝试手动解压...")
+                import gzip
+                try:
+                    decompressed = gzip.decompress(response.content)
+                    data = json.loads(decompressed.decode('utf-8'))
+                    logger.debug("✅ 手动解压 gzip 成功")
+                except Exception as decompress_error:
+                    logger.error(f"❌ 手动解压 gzip 失败: {decompress_error}")
+                    logger.error(f"   原始内容长度: {len(response.content)} bytes")
+                    logger.error(f"   前20字节: {response.content[:20].hex()}")
+                    return None
+            else:
+                # 正常解析 JSON
+                try:
+                    data = response.json()
+                except json.JSONDecodeError as e:
+                    logger.error(f"❌ GMGN API JSON 解析失败 (chain={chain})")
+                    logger.error(f"   响应状态码: {response.status_code}")
+                    logger.error(f"   Content-Type: {response.headers.get('Content-Type')}")
+                    logger.error(f"   响应前200字符: {response.text[:200]}")
+                    return None
             
             if data.get('code') == 0 and 'data' in data:
                 token_count = len(data['data']) if data['data'] else 0
