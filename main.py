@@ -160,20 +160,20 @@ def run_twitter_push_sync(interval: int = 600, once: bool = False):
 
 async def run_token_monitor(interval: int = 1, once: bool = False):
     """
-    运行Token监控任务
+    运行Token监控任务（支持 Jupiter API 和 GMGN API）
     
     Args:
         interval: 执行间隔（分钟），默认1分钟
         once: 是否只执行一次
     """
-    engine = TokenMonitorEngine()
+    monitor = TokenMonitorEngine()
     
     if once:
         logger.info(f"🚀 执行 Token监控任务（一次）")
-        await engine.run_monitor_once()
+        await monitor.run_monitor_once()
     else:
         logger.info(f"🚀 启动 Token监控任务 (间隔: {interval}分钟)")
-        await engine.run_monitor_schedule(interval_minutes=interval)
+        await monitor.run_monitor_schedule(interval_minutes=interval)
 
 
 async def run_all_services():
