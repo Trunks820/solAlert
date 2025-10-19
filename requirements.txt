@@ -15,6 +15,7 @@ PySocks==1.7.1
 # HTTP Client
 requests==2.31.0
 httpx[socks]==0.25.2
+brotli==1.1.0  # 用于解压 Brotli 压缩的响应
 
 # Async support
 # asyncio is built-in Python 3.4+
