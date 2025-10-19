@@ -133,9 +133,9 @@ class FourMemeListener(BaseCollector):
         self.log_info("🚀 启动 Four.meme Telegram 实时监听器")
         
         try:
-            # 初始化Telegram客户端
+            # 初始化Telegram客户端（使用独立的session文件）
             self.client = TelegramClient(
-                'gmgn_listener_session',
+                'fourmeme_listener_session',  # 使用独立的session文件名
                 self.api_id,
                 self.api_hash,
                 proxy=self.proxy
@@ -370,9 +370,9 @@ class FourMemeListener(BaseCollector):
             self.log_info(f"🔍 开始采集历史消息（最多{limit}条）...")
         
         try:
-            # 初始化客户端
+            # 初始化客户端（使用独立的session文件）
             self.client = TelegramClient(
-                'gmgn_listener_session',
+                'fourmeme_listener_session',  # 使用独立的session文件名
                 self.api_id,
                 self.api_hash,
                 proxy=self.proxy
