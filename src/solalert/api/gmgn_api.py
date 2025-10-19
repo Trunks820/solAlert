@@ -5,6 +5,8 @@ GMGN API 客户端
 import requests
 import json
 import logging
+import time
+import random
 from typing import List, Dict, Optional, Any
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -57,6 +59,43 @@ class GmgnAPI:
         
         return session
     
+    def _generate_dynamic_cookie(self, chain: str) -> str:
+        """
+        生成动态 Cookie（使用当前时间戳）
+        
+        Args:
+            chain: 链名称
+            
+        Returns:
+            Cookie 字符串
+        """
+        current_timestamp = int(time.time())
+        
+        # 生成随机的 cf_clearance（模拟真实的格式）
+        cf_clearance_base = "WyR5pgnBwWTZYCs7x0PlUDolJdFSD1_vESoBtJpM86Q"
+        cf_clearance = f"{cf_clearance_base}-{current_timestamp}-1.2.1.1-CtiQQRQkGjQKPDo.ToiJ4YRQTQxG42Su9DFFGm_ZICG6o7za2kPFT33t45wCvYjBRBtHzAEpVRBnNj4f3G..FnTFxUZq4c1sJadh4sQnP.sdTqzCsqoNB9hJLGoVgouwr4SrON61tBhOa4ZZXUqrsQoT55VQiYSEVPizK0BFpidCYD2dwOi3A5dIVVyEfRTScd1yGBjT6Ls4Jp3ylpPbuyIPlfGAkeNR_bz7jS1ZJ9I"
+        
+        # 生成随机的 __cf_bm（格式：随机字符串-时间戳-版本信息）
+        random_str = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-', k=43))
+        cf_bm = f"{random_str}-{current_timestamp}-1.0.1.1-{random_str[:80]}"
+        
+        # 生成 _ga_UGLVBMV4Z0 和 _ga_0XM0LYXGC8
+        ga_timestamp_ms = current_timestamp * 1000
+        ga_uglvbmv4z0 = f"GS1.2.{ga_timestamp_ms}.{random.randint(100000000, 999999999)}.1HeDju0RMx9thEVSmQnBRA%3D%3D.X5%2FnIa8F8is8SxbIC881HQ%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.kw17uCNO31i4Bot0D7YriA%3D%3D"
+        
+        # sid 保持固定（会话ID通常较稳定）
+        sid = "gmgn%7Cb03bdd6b7520e3bd4fca97456bec170d"
+        
+        if chain.lower() == 'sol':
+            ga_0xm0lyxgc8 = f"GS2.1.s{current_timestamp}$o{random.randint(100, 999)}$g1$t{current_timestamp + random.randint(100, 1000)}$j{random.randint(1, 99)}$l0$h0"
+        else:
+            ga_0xm0lyxgc8 = f"GS2.1.s{current_timestamp}$o{random.randint(100, 999)}$g0$t{current_timestamp}$j{random.randint(1, 99)}$l0$h0"
+        
+        # 组合 Cookie
+        cookie = f"_ga=GA1.1.1917780211.1737870293; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; GMGN_CHAIN=sol; cf_clearance={cf_clearance}; sid={sid}; _ga_UGLVBMV4Z0={ga_uglvbmv4z0}; __cf_bm={cf_bm}; _ga_0XM0LYXGC8={ga_0xm0lyxgc8}"
+        
+        return cookie
+    
     def _get_headers(self, chain: str, first_address: str = "") -> Dict[str, str]:
         """
         根据链类型生成对应的请求头
@@ -68,6 +107,10 @@ class GmgnAPI:
         Returns:
             请求头字典
         """
+        # 生成随机的 trace ID 和 baggage
+        trace_id = ''.join(random.choices('0123456789abcdef', k=32))
+        span_id = ''.join(random.choices('0123456789abcdef', k=16))
+        
         # 基础请求头（两个链通用）
         headers = {
             'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
@@ -80,8 +123,8 @@ class GmgnAPI:
             'sec-ch-ua-bitness': '"64"',
             'sec-ch-ua-model': '""',
             'sec-ch-ua-mobile': "?0",
-            'baggage': "sentry-environment=production,sentry-release=20251017-5539-a45bd6a,sentry-public_key=93c25bab7246077dc3eb85b59d6e7d40,sentry-trace_id=d95288eaa1cf4f4dafce7621ba8b4264,sentry-sample_rate=0.01,sentry-sampled=false",
-            'sentry-trace': "d95288eaa1cf4f4dafce7621ba8b4264-98f77d807e0baa09-0",
+            'baggage': f"sentry-environment=production,sentry-release=20251017-5539-a45bd6a,sentry-public_key=93c25bab7246077dc3eb85b59d6e7d40,sentry-trace_id={trace_id},sentry-sample_rate=0.01,sentry-sampled=false",
+            'sentry-trace': f"{trace_id}-{span_id}-0",
             'sec-ch-ua-arch': '"x86"',
             'sec-ch-ua-full-version': '"141.0.7390.67"',
             'sec-ch-ua-platform-version': '"19.0.0"',
@@ -93,31 +136,22 @@ class GmgnAPI:
             'priority': "u=1, i",
         }
         
-        # 根据链设置不同的 referer 和 Cookie
+        # 根据链设置不同的 referer 和动态 Cookie
         if chain.lower() == 'sol':
-            # SOL 链的配置
             if first_address:
                 headers['referer'] = f"https://gmgn.ai/sol/token/{first_address}"
             else:
                 headers['referer'] = "https://gmgn.ai/sol/token/"
-            
-            # SOL 链的 Cookie（注意 GMGN_CHAIN=sol）
-            headers['Cookie'] = "_ga=GA1.1.1917780211.1737870293; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; GMGN_CHAIN=sol; cf_clearance=WyR5pgnBwWTZYCs7x0PlUDolJdFSD1_vESoBtJpM86Q-1759673110-1.2.1.1-CtiQQRQkGjQKPDo.ToiJ4YRQTQxG42Su9DFFGm_ZICG6o7za2kPFT33t45wCvYjBRBtHzAEpVRBnNj4f3G..FnTFxUZq4c1sJadh4sQnP.sdTqzCsqoNB9hJLGoVgouwr4SrON61tBhOa4ZZXUqrsQoT55VQiYSEVPizK0BFpidCYD2dwOi3A5dIVVyEfRTScd1yGBjT6Ls4Jp3ylpPbuyIPlfGAkeNR_bz7jS1ZJ9I; sid=gmgn%7Cb03bdd6b7520e3bd4fca97456bec170d; _ga_UGLVBMV4Z0=GS1.2.1760772226676993.245e6720757dcf65dbf07509eaa78e45.1HeDju0RMx9thEVSmQnBRA%3D%3D.X5%2FnIa8F8is8SxbIC881HQ%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.kw17uCNO31i4Bot0D7YriA%3D%3D; __cf_bm=FZzfBjoRjvWn_QLy9ALsJlPxGQ74mdaOT3Hr8Lk8EDQ-1760772855-1.0.1.1-ESoMe2bZV9y_ljBotX4X11s7IeQkUtS1eIt8IvWDxnWFmvLeNYbD_y.FXxbpM3InbHMRA8UWPT.fdHsIlo_vdaYGbbNUat9TA3L8cuD5Wm8; _ga_0XM0LYXGC8=GS2.1.s1760772234$o226$g1$t1760773388$j5$l0$h0"
-        
         elif chain.lower() == 'bsc':
-            # BSC 链的配置
             if first_address:
                 headers['referer'] = f"https://gmgn.ai/bsc/token/{first_address}"
             else:
                 headers['referer'] = "https://gmgn.ai/bsc/token/"
-            
-            # BSC 链的 Cookie（注意 GMGN_CHAIN 可能不同，但通常还是 sol，因为用户可能从 sol 切换过来）
-            headers['Cookie'] = "_ga=GA1.1.1917780211.1737870293; _ga_0XM0LYXGC8=deleted; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; GMGN_CHAIN=sol; cf_clearance=WyR5pgnBwWTZYCs7x0PlUDolJdFSD1_vESoBtJpM86Q-1759673110-1.2.1.1-CtiQQRQkGjQKPDo.ToiJ4YRQTQxG42Su9DFFGm_ZICG6o7za2kPFT33t45wCvYjBRBtHzAEpVRBnNj4f3G..FnTFxUZq4c1sJadh4sQnP.sdTqzCsqoNB9hJLGoVgouwr4SrON61tBhOa4ZZXUqrsQoT55VQiYSEVPizK0BFpidCYD2dwOi3A5dIVVyEfRTScd1yGBjT6Ls4Jp3ylpPbuyIPlfGAkeNR_bz7jS1ZJ9I; __cf_bm=z1GT01NqlekRZiyvWNhyvy3fKYqZ91i9pP3h8IH.x60-1760771944-1.0.1.1-d3iN09_wcI599HycMRn8ipAs7I06p7t6HTPEZ_MYZPnE2PVUXIjLBmgsOugTyFJCcecFXtuumRE32cq6F2Siqm3OSHC1qZkniWI_M4ShdEo; sid=gmgn%7Cb03bdd6b7520e3bd4fca97456bec170d; _ga_UGLVBMV4Z0=GS1.2.1760772226676993.245e6720757dcf65dbf07509eaa78e45.1HeDju0RMx9thEVSmQnBRA%3D%3D.X5%2FnIa8F8is8SxbIC881HQ%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.kw17uCNO31i4Bot0D7YriA%3D%3D; _ga_0XM0LYXGC8=GS2.1.s1760772234$o226$g0$t1760772234$j60$l0$h0"
-        
         else:
-            # 默认配置
             headers['referer'] = "https://gmgn.ai/"
-            headers['Cookie'] = "_ga=GA1.1.1917780211.1737870293; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; GMGN_CHAIN=sol"
+        
+        # 使用动态生成的 Cookie
+        headers['Cookie'] = self._generate_dynamic_cookie(chain)
         
         return headers
     
@@ -148,6 +182,9 @@ class GmgnAPI:
         if chain.lower() == 'bsc':
             addresses = [addr.lower() for addr in addresses]
         
+        # 记录请求信息
+        logger.debug(f"📤 GMGN API 请求: chain={chain}, 地址数={len(addresses)}")
+        
         try:
             payload = {
                 "chain": chain,
@@ -167,7 +204,21 @@ class GmgnAPI:
             )
             
             response.raise_for_status()
-            data = response.json()
+            
+            # 打印响应内容用于调试
+            response_text = response.text
+            if not response_text:
+                logger.error(f"❌ GMGN API 返回空响应 (chain={chain}, addresses={addresses})")
+                return None
+            
+            # 尝试解析 JSON
+            try:
+                data = response.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ GMGN API JSON 解析失败 (chain={chain})")
+                logger.error(f"   响应状态码: {response.status_code}")
+                logger.error(f"   响应前200字符: {response_text[:200]}")
+                return None
             
             if data.get('code') == 0 and 'data' in data:
                 token_count = len(data['data']) if data['data'] else 0
@@ -178,19 +229,19 @@ class GmgnAPI:
                 return None
                 
         except requests.exceptions.Timeout:
-            logger.error(f"GMGN API 请求超时 (chain={chain}, addresses={len(addresses)})")
+            logger.error(f"❌ GMGN API 请求超时 (chain={chain}, addresses={len(addresses)})")
             return None
         except requests.exceptions.ConnectionError as e:
-            logger.error(f"GMGN API 连接错误: {e}")
+            logger.error(f"❌ GMGN API 连接错误: {e}")
             return None
         except requests.exceptions.HTTPError as e:
-            logger.error(f"GMGN API HTTP 错误: {e}")
-            return None
-        except ValueError as e:
-            logger.error(f"GMGN API 返回数据解析失败: {e}")
+            logger.error(f"❌ GMGN API HTTP 错误 (status={e.response.status_code}): {e}")
+            logger.error(f"   响应内容: {e.response.text[:200]}")
             return None
         except Exception as e:
-            logger.error(f"GMGN API 请求异常: {e}")
+            logger.error(f"❌ GMGN API 请求异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     def parse_token_data(self, token_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
