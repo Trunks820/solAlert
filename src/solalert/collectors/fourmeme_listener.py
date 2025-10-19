@@ -106,7 +106,7 @@ class FourMemeListener(BaseCollector):
         # Telegram配置
         self.api_id = TELEGRAM_CONFIG['api_id']
         self.api_hash = TELEGRAM_CONFIG['api_hash']
-        self.channel_id = 2178358910  # @fourmemedeployers
+        self.channel_id = -1002178358910  # @fourmemedeployers
         
         # 代理配置 - 从配置文件读取
         proxy_config = TELEGRAM_CONFIG.get('proxy', {})

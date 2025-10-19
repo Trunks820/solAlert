@@ -94,11 +94,17 @@ class TokenMonitorEngine:
                 old_holder = int(holder_5m_ago)
                 if old_holder > 0:
                     holder_5m_change = current_holder - old_holder
+                    logger.info(f"   📊 持有人5分钟前: {old_holder} → 当前: {current_holder} (变化: {holder_5m_change:+d})")
+            else:
+                logger.info(f"   📊 持有人5分钟前: 无缓存 → 当前: {current_holder}")
             
             if holder_1h_ago:
                 old_holder = int(holder_1h_ago)
                 if old_holder > 0:
                     holder_1h_change = current_holder - old_holder
+                    logger.info(f"   📊 持有人1小时前: {old_holder} → 当前: {current_holder} (变化: {holder_1h_change:+d})")
+            else:
+                logger.info(f"   📊 持有人1小时前: 无缓存 → 当前: {current_holder}")
             
             # 计算交易量变化
             volume_5m_change = 0
@@ -107,11 +113,17 @@ class TokenMonitorEngine:
                 old_volume = float(volume_5m_ago)
                 if old_volume > 0:
                     volume_5m_change = ((current_volume_5m - old_volume) / old_volume) * 100
+                    logger.info(f"   📊 交易量5分钟前: ${old_volume:,.2f} → 当前: ${current_volume_5m:,.2f} (变化: {volume_5m_change:+.2f}%)")
+            else:
+                logger.info(f"   📊 交易量5分钟前: 无缓存 → 当前: ${current_volume_5m:,.2f}")
             
             if volume_1h_ago:
                 old_volume = float(volume_1h_ago)
                 if old_volume > 0:
                     volume_1h_change = ((current_volume_1h - old_volume) / old_volume) * 100
+                    logger.info(f"   📊 交易量1小时前: ${old_volume:,.2f} → 当前: ${current_volume_1h:,.2f} (变化: {volume_1h_change:+.2f}%)")
+            else:
+                logger.info(f"   📊 交易量1小时前: 无缓存 → 当前: ${current_volume_1h:,.2f}")
             
             # 保存当前数据到 Redis（5分钟过期）
             await self.redis_client.setex(f"holder:5m:{ca}", 300, str(current_holder))
@@ -333,15 +345,10 @@ class TokenMonitorEngine:
             price = float(stats.get('price', 0))
             price_5m_change = float(stats.get('price_5m_change_percent', 0))
             price_1h_change = float(stats.get('price_1h_change_percent', 0))
-            volume_5m = float(stats.get('volume_5m', 0))
-            volume_1h = float(stats.get('volume_1h', 0))
-            holder_5m_change = int(stats.get('holder_5m_change', 0))
-            holder_1h_change = int(stats.get('holder_1h_change', 0))
             
             logger.info(f"   💰 当前价格: ${price:.8f}")
-            logger.info(f"   📈 涨跌幅: 5分钟 {price_5m_change:+.2f}% | 1小时 {price_1h_change:+.2f}%")
-            logger.info(f"   📊 交易量: 5分钟 ${volume_5m:,.2f} | 1小时 ${volume_1h:,.2f}")
-            logger.info(f"   👥 持有人变化: 5分钟 {holder_5m_change:+d} | 1小时 {holder_1h_change:+d}")
+            logger.info(f"   📈 价格变化: 5分钟 {price_5m_change:+.2f}% | 1小时 {price_1h_change:+.2f}%")
+            # 交易量和持有人的详细变化已经在 convert_gmgn_to_stats5m 中打印了
         except Exception as e:
             logger.debug(f"   ⚠️  打印实时数据失败: {e}")
         
