@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from solalert.core.logger import setup_logger
-from solalert.core.config import get_config_summary
+from solalert.core.config import get_config_summary, BSC_MONITOR_CONFIG
 from solalert.core.database import test_database_connection
 from solalert.collectors.pump_listener import PumpListener
 from solalert.collectors.bonk_collector import BonkCollector
@@ -182,8 +182,6 @@ async def run_bsc_monitor():
     """
     运行BSC链监控任务（实时区块监控 + 三层过滤）
     """
-    from solalert.core.config import BSC_MONITOR_CONFIG
-    
     logger.info("🚀 启动 BSC 链监控任务")
     
     monitor = BSCMonitor(config=BSC_MONITOR_CONFIG)
@@ -199,7 +197,7 @@ async def run_bsc_monitor():
 
 
 async def run_all_services():
-    """运行所有服务（数据采集器 + Token监控）"""
+    """运行所有服务（数据采集器 + Token监控 + BSC监控）"""
     logger.info("🚀 启动所有服务...")
     
     # 创建采集器和监控实例
@@ -207,6 +205,7 @@ async def run_all_services():
     bonk_collector = BonkCollector(poll_interval=60)
     fourmeme_listener = FourMemeListener()
     token_monitor = TokenMonitorEngine()
+    bsc_monitor = BSCMonitor(BSC_MONITOR_CONFIG)
     
     # 并发运行所有采集器和监控任务
     try:
@@ -215,6 +214,7 @@ async def run_all_services():
             bonk_collector.start(),
             fourmeme_listener.start(),
             token_monitor.run_monitor_schedule(interval_minutes=1),  # 1分钟间隔监控
+            bsc_monitor.start(),  # BSC 链实时监控
             return_exceptions=True
         )
     except KeyboardInterrupt:
@@ -227,6 +227,7 @@ async def run_all_services():
             pump_listener.stop(),
             bonk_collector.stop(),
             fourmeme_listener.stop(),
+            bsc_monitor.stop(),
             return_exceptions=True
         )
 

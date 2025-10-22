@@ -278,6 +278,74 @@ class AlertRecorder:
             "realtime_success": realtime_result
         }
     
+    async def write_sol_alert(
+        self,
+        config_id: int,
+        ca: str,
+        token_name: str,
+        token_symbol: str,
+        alert_reasons: List[str],
+        price: float = 0.0,
+        price_change: float = 0.0,
+        market_cap: float = 0.0,
+        volume_24h: float = 0.0,
+        holders: int = 0,
+        logo: str = "",
+        notify_methods: str = "telegram"
+    ) -> bool:
+        """
+        写入 SOL 链监控预警（数据库 + WebSocket）
+        
+        Args:
+            config_id: 监控配置ID
+            ca: 合约地址
+            token_name: Token名称
+            token_symbol: Token符号
+            alert_reasons: 触发原因列表
+            price: 当前价格
+            price_change: 价格变化百分比
+            market_cap: 市值
+            volume_24h: 24小时交易量
+            holders: 持有人数
+            logo: Token图标URL
+            notify_methods: 通知方式
+        
+        Returns:
+            bool: 是否写入成功
+        """
+        # 构建触发事件列表
+        trigger_events = []
+        for reason in alert_reasons:
+            trigger_events.append({
+                "type": "指标触发",
+                "description": reason
+            })
+        
+        # 构建统计数据
+        stats_data = {
+            "price": price,
+            "priceChange": price_change,
+            "marketCap": market_cap,
+            "volume24h": volume_24h,
+            "holders": holders,
+            "logo": logo,
+            "chain": "sol",  # SOL 链
+            "dex": "Jupiter"
+        }
+        
+        # 使用完整的预警通知（数据库 + WebSocket）
+        result = self.send_alert_notification(
+            config_id=config_id,
+            ca=ca,
+            token_name=token_name,
+            token_symbol=token_symbol,
+            trigger_events=trigger_events,
+            stats_data=stats_data,
+            notify_methods=notify_methods
+        )
+        
+        return result['db_success']
+    
     def write_bsc_alert(
         self,
         ca: str,

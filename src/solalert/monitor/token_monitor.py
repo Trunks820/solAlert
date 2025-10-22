@@ -14,6 +14,7 @@ from ..core.database import get_db
 from ..core.logger import get_logger
 from ..core.config import REDIS_CONFIG
 from ..api.gmgn_api import get_gmgn_api
+from ..notifiers.alert_recorder import AlertRecorder
 import redis.asyncio as aioredis
 
 logger = get_logger(__name__)
@@ -32,6 +33,7 @@ class TokenMonitorEngine:
             telegram_chat_id=-1002926135363,
             wechat_enabled=False
         )
+        self.alert_recorder = AlertRecorder()  # 用于数据库和WebSocket推送
         self.redis_client: Optional[aioredis.Redis] = None
     
     async def init_redis(self):
@@ -218,6 +220,61 @@ class TokenMonitorEngine:
         
         await self.redis_client.setex(key, cooldown_seconds, "1")
         logger.debug(f"🔒 设置冷却期: {key} ({cooldown_seconds}秒)")
+    
+    async def _send_sol_alert(
+        self,
+        config_id: int,
+        ca: str,
+        token_name: str,
+        token_symbol: str,
+        triggered_events: List[TriggerEvent],
+        stats_data: Dict[str, Any],
+        notify_methods: str
+    ):
+        """
+        发送 SOL 链预警（数据库 + WebSocket）
+        
+        Args:
+            config_id: 监控配置ID
+            ca: Token合约地址
+            token_name: Token名称
+            token_symbol: Token符号
+            triggered_events: 触发的事件列表
+            stats_data: stats5m 数据
+            notify_methods: 通知方式
+        """
+        try:
+            # 获取价格、涨幅等信息
+            price = stats_data.get('price', 0)
+            price_change = stats_data.get('price_5m_change_percent', 0)
+            volume_24h = stats_data.get('volume', 0)
+            holders = stats_data.get('holder', 0)
+            market_cap = stats_data.get('market_cap', 0)
+            
+            # 如果没有市值，用流动性代替
+            if not market_cap:
+                market_cap = stats_data.get('liquidity', 0)
+            
+            # 调用 alert_recorder 写入数据库和推送 WebSocket
+            await self.alert_recorder.write_sol_alert(
+                config_id=config_id,
+                ca=ca,
+                token_name=token_name,
+                token_symbol=token_symbol,
+                alert_reasons=[event.description for event in triggered_events],
+                price=price,
+                price_change=price_change,
+                market_cap=market_cap,
+                volume_24h=volume_24h,
+                holders=holders,
+                logo=stats_data.get('logo', ''),
+                notify_methods=notify_methods
+            )
+            
+            logger.info(f"   ✅ 已写入数据库并推送到 WebSocket")
+            
+        except Exception as e:
+            logger.error(f"   ❌ 发送SOL预警失败: {e}", exc_info=True)
     
     def save_alert_log(
         self,
@@ -411,7 +468,13 @@ class TokenMonitorEngine:
         # 设置冷却期
         await self.set_cooldown(ca, events_config_str, cooldown_seconds=1800)
         
-        # 保存日志
+        # 保存日志到数据库并推送到WebSocket
+        await self._send_sol_alert(
+            config_id, ca, token_name, token_symbol,
+            triggered_events, stats, notify_methods
+        )
+        
+        # 保存日志（仅用于统计）
         self.save_alert_log(
             config_id, ca, token_name, token_symbol,
             triggered_events, stats, config['notify_methods'], notify_results
