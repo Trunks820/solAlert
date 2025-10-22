@@ -30,7 +30,7 @@ class TokenMonitorEngine:
         self.gmgn_api = get_gmgn_api()  # 添加 GMGN API
         self.notification_service = NotificationService(
             telegram_enabled=True,
-            telegram_chat_id=-1002926135363,
+            telegram_chat_id=-1002569554228,
             wechat_enabled=False
         )
         self.alert_recorder = AlertRecorder()  # 用于数据库和WebSocket推送

@@ -53,7 +53,8 @@ class TelegramNotifier(BaseNotifier):
                     proxy_port = proxy_config.get('port', 1081)
                     proxy_url = f"{proxy_type}://{proxy_host}:{proxy_port}"
                     
-                    logger.info(f"使用代理: {proxy_url}")
+                    logger.info(f"✅ Telegram 使用代理: {proxy_url}")
+                    logger.info(f"   代理配置: type={proxy_type}, host={proxy_host}, port={proxy_port}")
                     
                     # 创建带代理的 HTTPXRequest（增大连接池，禁用SSL验证）
                     import httpx
@@ -120,9 +121,13 @@ class TelegramNotifier(BaseNotifier):
         for attempt in range(max_retries):
             try:
                 if topic_id:
-                    logger.info(f"正在发送Telegram消息到论坛主题 {target}:{topic_id}, 尝试 {attempt + 1}/{max_retries}")
+                    logger.info(f"📤 正在发送Telegram消息到论坛主题 {target}:{topic_id}, 尝试 {attempt + 1}/{max_retries}")
                 else:
-                    logger.info(f"正在发送Telegram消息到 {target}, 尝试 {attempt + 1}/{max_retries}")
+                    logger.info(f"📤 正在发送Telegram消息到 {target}, 尝试 {attempt + 1}/{max_retries}")
+                
+                logger.debug(f"   消息长度: {len(message)} 字符")
+                logger.debug(f"   解析模式: {parse_mode}")
+                logger.debug(f"   是否有按钮: {reply_markup is not None}")
                 
                 send_kwargs = {
                     'chat_id': target,
@@ -135,7 +140,9 @@ class TelegramNotifier(BaseNotifier):
                 if topic_id:
                     send_kwargs['message_thread_id'] = topic_id
                 
+                logger.debug(f"   开始调用 bot.send_message()...")
                 result = await self.bot.send_message(**send_kwargs)
+                logger.debug(f"   bot.send_message() 调用成功")
                 
                 self.log_success(target, message[:100])
                 logger.info(f"消息ID: {result.message_id}")
@@ -174,14 +181,16 @@ class TelegramNotifier(BaseNotifier):
             except (TimedOut, NetworkError) as e:
                 if attempt < max_retries - 1:
                     wait_time = base_retry_delay * (2 ** attempt)
-                    logger.warning(f"网络错误，{wait_time}秒后重试: {e}")
+                    logger.warning(f"⚠️ 网络错误 [{type(e).__name__}]，{wait_time}秒后重试: {e}")
                     await asyncio.sleep(wait_time)
                 else:
-                    self.log_failure(target, e)
+                    logger.error(f"❌ [TelegramNotifier] 网络超时 -> {target}: {type(e).__name__} - {e}")
                     return False
                     
             except Exception as e:
-                self.log_failure(target, e)
+                import traceback
+                logger.error(f"❌ [TelegramNotifier] 未知错误 -> {target}: {type(e).__name__} - {e}")
+                logger.error(f"   详细错误: {traceback.format_exc()}")
                 return False
         
         return False
