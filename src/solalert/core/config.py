@@ -86,7 +86,7 @@ WECHAT_CONFIG = {
 # ==================== WebSocket 推送配置 ====================
 WEBSOCKET_PUSH_CONFIG = {
     'enabled': os.getenv('WS_PUSH_ENABLE', 'True').lower() == 'true',
-    'backend_url': os.getenv('WS_BACKEND_URL', 'http://localhost:8080/api/notification/push'),
+    'backend_url': os.getenv('WS_BACKEND_URL', 'http://kakarot8.fun:8080/api/notification/push'),
     'secret_token': os.getenv('WS_SECRET_TOKEN', 'Wy1997@Kakarot'),
     'timeout': int(os.getenv('WS_PUSH_TIMEOUT', 3)),
 }
