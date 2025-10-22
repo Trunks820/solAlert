@@ -258,8 +258,13 @@ class AlertRecorder:
         descriptions = [event.get('description', '') for event in trigger_events if event.get('description')]
         description = '; '.join(descriptions) if descriptions else '触发监控条件'
         
-        # 从stats_data中获取链类型，默认为sol
-        chain = stats_data.get('chain', 'sol').lower()
+        # 从stats_data中获取链类型（必须明确指定，否则报错）
+        chain = stats_data.get('chain')
+        if not chain:
+            logger.warning(f"⚠️ stats_data 中缺少 'chain' 字段，跳过实时推送")
+            return {"db_success": db_result, "realtime_success": False}
+        
+        chain = chain.lower()
         realtime_result = self.send_realtime_notification(
             token_symbol=token_symbol,
             ca=ca,

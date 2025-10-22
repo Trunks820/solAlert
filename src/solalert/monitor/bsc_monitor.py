@@ -465,7 +465,12 @@ class BSCMonitor:
             if not last_alert_data:
                 return True  # 首次推送
             
-            last_alert = json.loads(last_alert_data)
+            # 如果已经是字典，直接使用；否则解析 JSON
+            if isinstance(last_alert_data, dict):
+                last_alert = last_alert_data
+            else:
+                last_alert = json.loads(last_alert_data)
+            
             last_timestamp = last_alert.get('timestamp', 0)
             now_timestamp = int(time.time())
             
@@ -495,7 +500,11 @@ class BSCMonitor:
             alert_count = 1
             
             if last_alert_data:
-                last_alert = json.loads(last_alert_data)
+                # 如果已经是字典，直接使用；否则解析 JSON
+                if isinstance(last_alert_data, dict):
+                    last_alert = last_alert_data
+                else:
+                    last_alert = json.loads(last_alert_data)
                 alert_count = last_alert.get('alert_count', 0) + 1
             
             # 更新记录
