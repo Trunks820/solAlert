@@ -17,8 +17,10 @@ from solalert.core.database import test_database_connection
 from solalert.collectors.pump_listener import PumpListener
 from solalert.collectors.bonk_collector import BonkCollector
 from solalert.collectors.fourmeme_listener import FourMemeListener
+from solalert.collectors.bsc_collector import BSCBlockCollector
 from solalert.tasks.twitter_push_sync import TwitterPushSyncService
 from solalert.monitor.token_monitor import TokenMonitorEngine
+from solalert.monitor.bsc_monitor import BSCMonitor
 
 # 设置日志
 logger = setup_logger()
@@ -176,6 +178,26 @@ async def run_token_monitor(interval: int = 1, once: bool = False):
         await monitor.run_monitor_schedule(interval_minutes=interval)
 
 
+async def run_bsc_monitor():
+    """
+    运行BSC链监控任务（实时区块监控 + 三层过滤）
+    """
+    from solalert.core.config import BSC_MONITOR_CONFIG
+    
+    logger.info("🚀 启动 BSC 链监控任务")
+    
+    monitor = BSCMonitor(config=BSC_MONITOR_CONFIG)
+    
+    try:
+        await monitor.start()
+    except KeyboardInterrupt:
+        logger.info("⏹️  用户停止服务")
+    except Exception as e:
+        logger.error(f"❌ BSC监控运行失败: {e}", exc_info=True)
+    finally:
+        await monitor.stop()
+
+
 async def run_all_services():
     """运行所有服务（数据采集器 + Token监控）"""
     logger.info("🚀 启动所有服务...")
@@ -215,7 +237,7 @@ def main():
     parser = argparse.ArgumentParser(description="solAlert - Solana Token 监控预警系统")
     parser.add_argument(
         "--module",
-        choices=["pump_listener", "bonk_collector", "fourmeme_listener", "twitter_push_sync", "token_monitor", "all"],
+        choices=["pump_listener", "bonk_collector", "fourmeme_listener", "twitter_push_sync", "token_monitor", "bsc_monitor", "all"],
         default="pump_listener",
         help="要启动的模块 (默认: pump_listener)"
     )
@@ -269,6 +291,9 @@ def main():
             # Token监控任务，默认1分钟间隔
             interval = args.interval if args.interval != 60 else 1
             asyncio.run(run_token_monitor(interval, once=args.once))
+        elif args.module == "bsc_monitor":
+            # BSC链监控任务（实时区块监控）
+            asyncio.run(run_bsc_monitor())
         elif args.module == "all":
             asyncio.run(run_all_services())
     except KeyboardInterrupt:

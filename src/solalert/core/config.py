@@ -39,6 +39,23 @@ REDIS_CONFIG = {
 }
 
 
+# ==================== HTTP 代理配置 ====================
+# 服务器默认关闭代理，开发环境需要时设置 HTTP_PROXY_ENABLED=true
+HTTP_PROXY_CONFIG = {
+    'enabled': os.getenv('HTTP_PROXY_ENABLED', 'false').lower() == 'true',
+    'http_proxy': os.getenv('HTTP_PROXY', 'socks5://127.0.0.1:1081'),
+    'https_proxy': os.getenv('HTTPS_PROXY', 'socks5://127.0.0.1:1081'),
+}
+
+
+
+# ==================== GMGN Cookie 配置 ====================
+GMGN_COOKIE_CONFIG = {
+    'sol': os.getenv('GMGN_COOKIE_SOL', '_ga=GA1.1.777785332.1712628586; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; _ga_0XM0LYXGC8=deleted; GMGN_CHAIN=sol; cf_clearance=kGk1fviudvjYoycoB8p0lDvQlLZ.NVwppcBClXoCyuU-1758871878-1.2.1.1-8bKzlJQgrLdW2FYpzTOc3GV0uVLtag97R7TmcvV3czBzp4X9eJ5GKKDNcDR1ieB_sdid5hjhvjzRZLBBZA79HnkWXp4eePChJZ2M5OtlmZg0COt806bwv3vVUGWwefahHy7B6SNQq8wyhiKWvWZviAPNTcqSXgVRycDXlSypZZNz8aRYSS.kP8aZQb.TGcQyhcVoMHLOyaak2QZz4LElXrSrPP_Iu9QiXpO4Gp5oXg0; sid=gmgn%7Cdd0338480e80cb62fd084a997f5ba619; _ga_UGLVBMV4Z0=GS1.2.1761122267756211.245e6720757dcf65dbf07509eaa78e45.TqKHb9RERMXgyylHkzVEdw%3D%3D.cUVssZurif44ulffusd0jg%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.vROC4NpoXjbF3TCihM4z2w%3D%3D; __cf_bm=yz2XKoOxZ00nQmhdqdOh0VfMQFELYPmT4KD7I_kEnlU-1761123382-1.0.1.1-phndFEJydfCR22kUhC4tgVdqdFwEpq30cCvpcrE7dCI_7ujjWu231tKZEdfKtQRrusEtfzvngHc5rbMjJZMXb3XDEsSGCshmMmGyNML3xhg; _ga_0XM0LYXGC8=GS2.1.s1761118331$o625$g1$t1761123866$j48$l0$h0'),
+    'bsc': os.getenv('GMGN_COOKIE_BSC', '_ga=GA1.1.777785332.1712628586; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; _ga_0XM0LYXGC8=deleted; GMGN_CHAIN=sol; cf_clearance=kGk1fviudvjYoycoB8p0lDvQlLZ.NVwppcBClXoCyuU-1758871878-1.2.1.1-8bKzlJQgrLdW2FYpzTOc3GV0uVLtag97R7TmcvV3czBzp4X9eJ5GKKDNcDR1ieB_sdid5hjhvjzRZLBBZA79HnkWXp4eePChJZ2M5OtlmZg0COt806bwv3vVUGWwefahHy7B6SNQq8wyhiKWvWZviAPNTcqSXgVRycDXlSypZZNz8aRYSS.kP8aZQb.TGcQyhcVoMHLOyaak2QZz4LElXrSrPP_Iu9QiXpO4Gp5oXg0; sid=gmgn%7Cdd0338480e80cb62fd084a997f5ba619; _ga_UGLVBMV4Z0=GS1.2.1761122267756211.245e6720757dcf65dbf07509eaa78e45.TqKHb9RERMXgyylHkzVEdw%3D%3D.cUVssZurif44ulffusd0jg%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.vROC4NpoXjbF3TCihM4z2w%3D%3D; __cf_bm=yz2XKoOxZ00nQmhdqdOh0VfMQFELYPmT4KD7I_kEnlU-1761123382-1.0.1.1-phndFEJydfCR22kUhC4tgVdqdFwEpq30cCvpcrE7dCI_7ujjWu231tKZEdfKtQRrusEtfzvngHc5rbMjJZMXb3XDEsSGCshmMmGyNML3xhg; _ga_0XM0LYXGC8=GS2.1.s1761118331$o625$g1$t1761123866$j48$l0$h0'),
+}
+
+
 # ==================== Telegram配置 ====================
 TELEGRAM_CONFIG = {
     'api_id': int(os.getenv('TG_API_ID', 21047003)),
@@ -47,9 +64,9 @@ TELEGRAM_CONFIG = {
     'forum_group_id': int(os.getenv('TG_FORUM_GROUP', -1003073529793)),
     'target_channel_id': int(os.getenv('TG_TARGET_CHANNEL', -1002569647443)),
     'gmgn_channel_id': int(os.getenv('TG_GMGN_CHANNEL', -1002115686230)),  # GMGN频道ID
-    # 代理配置（已禁用，上传服务器时不需要代理）
+    # 代理配置（服务器默认关闭，开发环境需要时设置 TG_PROXY_ENABLED=true）
     'proxy': {
-        'enabled': False,  # os.getenv('PROXY_ENABLED', 'True').lower() == 'true',
+        'enabled': os.getenv('TG_PROXY_ENABLED', 'false').lower() == 'true',
         'host': os.getenv('PROXY_HOST', '127.0.0.1'),
         'port': int(os.getenv('PROXY_PORT', 1081)),
         'type': os.getenv('PROXY_TYPE', 'socks5'),
@@ -63,6 +80,15 @@ WECHAT_CONFIG = {
     'api_url': os.getenv('WX_API_URL', 'http://47.106.217.116:1238'),
     'api_key': os.getenv('WX_API_KEY', '1ff5a3a6-bb71-4717-83ef-00511d68e260'),
     'default_target': os.getenv('WX_DEFAULT_TARGET', '47411718824@chatroom'),
+}
+
+
+# ==================== WebSocket 推送配置 ====================
+WEBSOCKET_PUSH_CONFIG = {
+    'enabled': os.getenv('WS_PUSH_ENABLE', 'True').lower() == 'true',
+    'backend_url': os.getenv('WS_BACKEND_URL', 'http://localhost:8080/api/notification/push'),
+    'secret_token': os.getenv('WS_SECRET_TOKEN', 'Wy1997@Kakarot'),
+    'timeout': int(os.getenv('WS_PUSH_TIMEOUT', 3)),
 }
 
 
@@ -104,7 +130,7 @@ MONITOR_CONFIG = {
 }
 
 
-# ==================== 配置验证 ====================
+# ===== 配置验证 ====================
 def validate_config() -> bool:
     """验证关键配置项"""
     errors = []
@@ -182,6 +208,31 @@ def get_config_summary() -> Dict[str, Any]:
             "notification_min_interval": MONITOR_CONFIG['notification_min_interval']
         }
     }
+
+
+# ==================== BSC 监控配置 ====================
+BSC_MONITOR_CONFIG = {
+    'rpc_endpoints': [
+        "https://bsc-dataseed.binance.org",
+        "https://bsc-dataseed1.binance.org",
+        "https://bsc-dataseed2.binance.org",
+        "https://bsc-dataseed3.binance.org",
+        "https://bsc-dataseed4.binance.org",
+        "https://bsc-dataseed1.defibit.io",
+        "https://bsc-dataseed1.ninicoin.io",
+        "https://rpc.ankr.com/bsc",
+        "https://bscrpc.com",
+    ],
+    'confirmations': 12,
+    'poll_interval': 0.8,
+    'pancake_v2_factory': '0xca143ce32fe78f1f7019d7d551a6402fc5350c73',
+    'topic_pair_created': '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9',
+    'topic_swap': '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822',
+    'usdt_address': '0x55d398326f99059ff775485246999027b3197955',
+    'wbnb_address': '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
+    'usdt_wbnb_pair': '0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae',
+    'reserve_fresh_seconds': 15,
+}
 
 
 # 在模块加载时自动验证配置

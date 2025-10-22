@@ -2,14 +2,17 @@
 GMGN API 客户端
 用于获取 Token 的实时价格、交易量、持有人数等数据
 """
-import requests
 import json
 import logging
-import time
 import random
-from typing import List, Dict, Optional, Any
+import re
+from typing import Any, Dict, List, Optional
+
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from ..core.config import GMGN_COOKIE_CONFIG, HTTP_PROXY_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -20,17 +23,33 @@ class GmgnAPI:
     def __init__(self):
         self.base_url = "https://gmgn.ai/api/v1/mutil_window_token_info"
         
-        # 查询参数
-        self.params = {
-            'device_id': 'f83050a4-8e63-49b0-a823-f98958116c7c',
-            'fp_did': 'd4189f054aa9246951683e1c86679ac9',
-            'client_id': 'gmgn_web_20251017-5539-a45bd6a',
+        # 查询参数 - BSC 和 SOL 使用不同的版本
+        self.params_bsc = {
+            'device_id': 'b3bec9fb-aaba-4839-a375-214428819024',
+            'fp_did': '3e6d1c9f9c4df6f1c8be8da1865b8ea1',
+            'client_id': 'gmgn_web_20251022-5727-c8b740e',
             'from_app': 'gmgn',
-            'app_ver': '20251017-5539-a45bd6a',
+            'app_ver': '20251022-5727-c8b740e',
             'tz_name': 'Asia/Shanghai',
             'tz_offset': '28800',
             'app_lang': 'zh-CN',
             'os': 'web'
+        }
+        
+        self.params_sol = {
+            'device_id': 'b3bec9fb-aaba-4839-a375-214428819024',
+            'fp_did': '3e6d1c9f9c4df6f1c8be8da1865b8ea1',
+            'client_id': 'gmgn_web_20251022-5727-c8b740e',
+            'from_app': 'gmgn',
+            'app_ver': '20251022-5727-c8b740e',
+            'tz_name': 'Asia/Shanghai',
+            'tz_offset': '28800',
+            'app_lang': 'zh-CN',
+            'os': 'web'
+        }
+        self.cookies = {
+            'sol': (GMGN_COOKIE_CONFIG.get('sol') or '').strip(),
+            'bsc': (GMGN_COOKIE_CONFIG.get('bsc') or '').strip(),
         }
         
         self.session = self._create_session()
@@ -46,6 +65,23 @@ class GmgnAPI:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
+        # 配置代理（如果启用）
+        logger.info(f"🔍 HTTP_PROXY_CONFIG enabled: {HTTP_PROXY_CONFIG.get('enabled')}")
+        if HTTP_PROXY_CONFIG.get('enabled'):
+            http_proxy = (HTTP_PROXY_CONFIG.get('http_proxy') or '').strip()
+            https_proxy = (HTTP_PROXY_CONFIG.get('https_proxy') or '').strip() or http_proxy
+            logger.info(f"🔍 http_proxy: {http_proxy}, https_proxy: {https_proxy}")
+            proxies = {}
+            if http_proxy:
+                proxies['http'] = http_proxy
+            if https_proxy:
+                proxies['https'] = https_proxy
+            if proxies:
+                session.proxies = proxies
+                logger.info(f"✅ GMGN API 使用代理: {proxies}")
+        else:
+            logger.warning("⚠️ GMGN API 代理未启用！")
+        
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
@@ -59,41 +95,19 @@ class GmgnAPI:
         
         return session
     
-    def _generate_dynamic_cookie(self, chain: str) -> str:
+    def _prepare_cookie(self, chain: str) -> Optional[str]:
         """
-        生成动态 Cookie（使用当前时间戳）
-        
-        Args:
-            chain: 链名称
-            
-        Returns:
-            Cookie 字符串
+        根据链类型返回配置中的真实 Cookie，并确保 GMGN_CHAIN 值匹配。
         """
-        current_timestamp = int(time.time())
-        
-        # 生成随机的 cf_clearance（模拟真实的格式）
-        cf_clearance_base = "WyR5pgnBwWTZYCs7x0PlUDolJdFSD1_vESoBtJpM86Q"
-        cf_clearance = f"{cf_clearance_base}-{current_timestamp}-1.2.1.1-CtiQQRQkGjQKPDo.ToiJ4YRQTQxG42Su9DFFGm_ZICG6o7za2kPFT33t45wCvYjBRBtHzAEpVRBnNj4f3G..FnTFxUZq4c1sJadh4sQnP.sdTqzCsqoNB9hJLGoVgouwr4SrON61tBhOa4ZZXUqrsQoT55VQiYSEVPizK0BFpidCYD2dwOi3A5dIVVyEfRTScd1yGBjT6Ls4Jp3ylpPbuyIPlfGAkeNR_bz7jS1ZJ9I"
-        
-        # 生成随机的 __cf_bm（格式：随机字符串-时间戳-版本信息）
-        random_str = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-', k=43))
-        cf_bm = f"{random_str}-{current_timestamp}-1.0.1.1-{random_str[:80]}"
-        
-        # 生成 _ga_UGLVBMV4Z0 和 _ga_0XM0LYXGC8
-        ga_timestamp_ms = current_timestamp * 1000
-        ga_uglvbmv4z0 = f"GS1.2.{ga_timestamp_ms}.{random.randint(100000000, 999999999)}.1HeDju0RMx9thEVSmQnBRA%3D%3D.X5%2FnIa8F8is8SxbIC881HQ%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.kw17uCNO31i4Bot0D7YriA%3D%3D"
-        
-        # sid 保持固定（会话ID通常较稳定）
-        sid = "gmgn%7Cb03bdd6b7520e3bd4fca97456bec170d"
-        
-        if chain.lower() == 'sol':
-            ga_0xm0lyxgc8 = f"GS2.1.s{current_timestamp}$o{random.randint(100, 999)}$g1$t{current_timestamp + random.randint(100, 1000)}$j{random.randint(1, 99)}$l0$h0"
+        chain_key = (chain or '').lower()
+        cookie = self.cookies.get(chain_key)
+        if not cookie:
+            return None
+        if 'GMGN_CHAIN=' in cookie:
+            cookie = re.sub(r'(GMGN_CHAIN=)([^;]+)', rf'\1{chain_key}', cookie)
         else:
-            ga_0xm0lyxgc8 = f"GS2.1.s{current_timestamp}$o{random.randint(100, 999)}$g0$t{current_timestamp}$j{random.randint(1, 99)}$l0$h0"
-        
-        # 组合 Cookie
-        cookie = f"_ga=GA1.1.1917780211.1737870293; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; GMGN_CHAIN=sol; cf_clearance={cf_clearance}; sid={sid}; _ga_UGLVBMV4Z0={ga_uglvbmv4z0}; __cf_bm={cf_bm}; _ga_0XM0LYXGC8={ga_0xm0lyxgc8}"
-        
+            suffix = '' if cookie.endswith(';') else ';'
+            cookie = f"{cookie}{suffix} GMGN_CHAIN={chain_key}"
         return cookie
     
     def _get_headers(self, chain: str, first_address: str = "") -> Dict[str, str]:
@@ -107,27 +121,31 @@ class GmgnAPI:
         Returns:
             请求头字典
         """
-        # 生成随机的 trace ID 和 baggage
-        trace_id = ''.join(random.choices('0123456789abcdef', k=32))
-        span_id = ''.join(random.choices('0123456789abcdef', k=16))
+        # 根据链类型使用不同的 baggage 和 sentry-trace
+        if chain.lower() == 'bsc':
+            baggage = "sentry-environment=production,sentry-release=20251022-5727-c8b740e,sentry-public_key=93c25bab7246077dc3eb85b59d6e7d40,sentry-trace_id=ca3fb5a2af01470c9e3a76c9905971c8,sentry-sample_rate=0.01,sentry-sampled=false"
+            sentry_trace = "d1a9e31a722d41198c18f57e58a5aede-9deb391aa9de5bd7-0"
+        else:  # sol
+            baggage = "sentry-environment=production,sentry-release=20250807-2092-28237ac,sentry-public_key=93c25bab7246077dc3eb85b59d6e7d40,sentry-trace_id=76e65ba658f7474db1728af8e6be117c,sentry-sample_rate=0.01,sentry-sampled=false"
+            sentry_trace = "76e65ba658f7474db1728af8e6be117c-bab9640fa6a86171-0"
         
-        # 基础请求头（两个链通用）
+        # 基础请求头（完全按照用户提供的样例）
         headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             'Accept': "application/json, text/plain, */*",
             'Accept-Encoding': "gzip, deflate, br, zstd",
             'Content-Type': "application/json",
-            'sec-ch-ua-full-version-list': '"Google Chrome";v="141.0.7390.67", "Not?A_Brand";v="8.0.0.0", "Chromium";v="141.0.7390.67"',
+            'sec-ch-ua-full-version-list': '"Not)A;Brand";v="8.0.0.0", "Chromium";v="138.0.7204.169", "Google Chrome";v="138.0.7204.169"',
             'sec-ch-ua-platform': '"Windows"',
-            'sec-ch-ua': '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+            'sec-ch-ua': '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
             'sec-ch-ua-bitness': '"64"',
             'sec-ch-ua-model': '""',
             'sec-ch-ua-mobile': "?0",
-            'baggage': f"sentry-environment=production,sentry-release=20251017-5539-a45bd6a,sentry-public_key=93c25bab7246077dc3eb85b59d6e7d40,sentry-trace_id={trace_id},sentry-sample_rate=0.01,sentry-sampled=false",
-            'sentry-trace': f"{trace_id}-{span_id}-0",
+            'baggage': baggage,
+            'sentry-trace': sentry_trace,
             'sec-ch-ua-arch': '"x86"',
-            'sec-ch-ua-full-version': '"141.0.7390.67"',
-            'sec-ch-ua-platform-version': '"19.0.0"',
+            'sec-ch-ua-full-version': '"138.0.7204.169"',
+            'sec-ch-ua-platform-version': '"15.0.0"',
             'origin': "https://gmgn.ai",
             'sec-fetch-site': "same-origin",
             'sec-fetch-mode': "cors",
@@ -150,8 +168,11 @@ class GmgnAPI:
         else:
             headers['referer'] = "https://gmgn.ai/"
         
-        # 使用动态生成的 Cookie
-        headers['Cookie'] = self._generate_dynamic_cookie(chain)
+        cookie = self._prepare_cookie(chain)
+        if cookie:
+            headers['Cookie'] = cookie
+        else:
+            logger.error(f"❌ 缺少 GMGN Cookie 配置 (chain={chain})，请设置环境变量 GMGN_COOKIE_{chain.upper()}")
         
         return headers
     
@@ -183,7 +204,26 @@ class GmgnAPI:
             addresses = [addr.lower() for addr in addresses]
         
         # 记录请求信息
-        logger.debug(f"📤 GMGN API 请求: chain={chain}, 地址数={len(addresses)}")
+        logger.info(f"📤 GMGN API 请求: chain={chain}, 地址数={len(addresses)}")
+        
+        # 动态更新代理配置（确保使用最新的环境变量）
+        from ..core.config import HTTP_PROXY_CONFIG
+        if HTTP_PROXY_CONFIG.get('enabled'):
+            http_proxy = (HTTP_PROXY_CONFIG.get('http_proxy') or '').strip()
+            https_proxy = (HTTP_PROXY_CONFIG.get('https_proxy') or '').strip() or http_proxy
+            if http_proxy or https_proxy:
+                self.session.proxies = {}
+                if http_proxy:
+                    self.session.proxies['http'] = http_proxy
+                if https_proxy:
+                    self.session.proxies['https'] = https_proxy
+                logger.info(f"✅ 动态启用代理: {self.session.proxies}")
+        
+        # 检查并记录代理状态
+        if self.session.proxies:
+            logger.info(f"✅ 使用代理: {self.session.proxies}")
+        else:
+            logger.warning(f"⚠️ 未使用代理！HTTP_PROXY_CONFIG: {HTTP_PROXY_CONFIG}")
         
         try:
             payload = {
@@ -191,13 +231,14 @@ class GmgnAPI:
                 "addresses": addresses
             }
             
-            # 根据链类型生成对应的请求头
+            # 根据链类型选择对应的 params 和 headers
+            params = self.params_bsc if chain.lower() == 'bsc' else self.params_sol
             headers = self._get_headers(chain, addresses[0] if addresses else "")
             
             # 使用 data=json.dumps() 而不是 json=payload，完全模拟浏览器行为
             response = self.session.post(
                 self.base_url,
-                params=self.params,
+                params=params,
                 headers=headers,
                 data=json.dumps(payload),
                 timeout=30
@@ -253,6 +294,9 @@ class GmgnAPI:
             return None
         except requests.exceptions.ConnectionError as e:
             logger.error(f"❌ GMGN API 连接错误: {e}")
+            if self.session.proxies:
+                logger.error(f"   代理配置: {self.session.proxies}")
+                logger.error(f"   提示: 请确保代理服务器 (127.0.0.1:1081) 正在运行！")
             return None
         except requests.exceptions.HTTPError as e:
             logger.error(f"❌ GMGN API HTTP 错误 (status={e.response.status_code}): {e}")
@@ -277,16 +321,52 @@ class GmgnAPI:
         try:
             price_info = token_data.get('price', {})
             
+            # 获取市值和供应量信息（确保转换为 float）
+            def safe_float(val):
+                """安全转换为 float"""
+                if val is None or val == '' or val == 0:
+                    return 0
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return 0
+            
+            market_cap = safe_float(token_data.get('market_cap', 0))
+            circulating_supply = safe_float(token_data.get('circulating_supply', 0))
+            total_supply = safe_float(token_data.get('total_supply', 0))
+            max_supply = safe_float(token_data.get('max_supply', 0))
+            
+            # 如果 API 没有直接返回 market_cap，按优先级计算：
+            # 1. 价格 × 流通供应量 (最标准)
+            # 2. 价格 × 总供应量
+            # 3. 价格 × 最大供应量
+            price = float(price_info.get('price', 0))
+            if not market_cap and price:
+                if circulating_supply:
+                    market_cap = price * circulating_supply
+                elif total_supply:
+                    market_cap = price * total_supply
+                elif max_supply:
+                    market_cap = price * max_supply
+            
             return {
                 # 基础信息
                 'address': token_data.get('address'),
                 'symbol': token_data.get('symbol'),
                 'name': token_data.get('name'),
+                'logo': token_data.get('logo', ''),  # Token Logo
                 'holder_count': token_data.get('holder_count', 0),
+                'holders': token_data.get('holder_count', 0),  # 别名
                 'liquidity': float(token_data.get('liquidity', 0)),
                 
+                # 市值和供应量
+                'market_cap': float(market_cap) if market_cap else 0,
+                'circulating_supply': float(circulating_supply) if circulating_supply else 0,
+                'total_supply': float(total_supply) if total_supply else 0,
+                'max_supply': float(max_supply) if max_supply else 0,
+                
                 # 价格信息
-                'price': float(price_info.get('price', 0)),
+                'price': price,
                 'price_1m': float(price_info.get('price_1m', 0)),
                 'price_5m': float(price_info.get('price_5m', 0)),
                 'price_1h': float(price_info.get('price_1h', 0)),

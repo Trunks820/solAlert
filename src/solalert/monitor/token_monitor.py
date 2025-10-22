@@ -87,22 +87,27 @@ class TokenMonitorEngine:
             volume_5m_ago = await self.redis_client.get(f"volume:5m:{ca}")
             volume_1h_ago = await self.redis_client.get(f"volume:1h:{ca}")
             
-            # 计算持有人变化
+            # 计算持有人变化（转换为百分比）
             holder_5m_change = 0
             holder_1h_change = 0
+            holder_5m_absolute = 0  # 绝对值，用于日志
+            holder_1h_absolute = 0
+            
             if holder_5m_ago:
                 old_holder = int(holder_5m_ago)
                 if old_holder > 0:
-                    holder_5m_change = current_holder - old_holder
-                    logger.info(f"   📊 持有人5分钟前: {old_holder} → 当前: {current_holder} (变化: {holder_5m_change:+d})")
+                    holder_5m_absolute = current_holder - old_holder
+                    holder_5m_change = ((current_holder - old_holder) / old_holder) * 100  # 百分比
+                    logger.info(f"   📊 持有人5分钟前: {old_holder} → 当前: {current_holder} (变化: {holder_5m_absolute:+d}, {holder_5m_change:+.2f}%)")
             else:
                 logger.info(f"   📊 持有人5分钟前: 无缓存 → 当前: {current_holder}")
             
             if holder_1h_ago:
                 old_holder = int(holder_1h_ago)
                 if old_holder > 0:
-                    holder_1h_change = current_holder - old_holder
-                    logger.info(f"   📊 持有人1小时前: {old_holder} → 当前: {current_holder} (变化: {holder_1h_change:+d})")
+                    holder_1h_absolute = current_holder - old_holder
+                    holder_1h_change = ((current_holder - old_holder) / old_holder) * 100  # 百分比
+                    logger.info(f"   📊 持有人1小时前: {old_holder} → 当前: {current_holder} (变化: {holder_1h_absolute:+d}, {holder_1h_change:+.2f}%)")
             else:
                 logger.info(f"   📊 持有人1小时前: 无缓存 → 当前: {current_holder}")
             
@@ -126,20 +131,22 @@ class TokenMonitorEngine:
                 logger.info(f"   📊 交易量1小时前: 无缓存 → 当前: ${current_volume_1h:,.2f}")
             
             # 保存当前数据到 Redis（5分钟过期）
-            await self.redis_client.setex(f"holder:5m:{ca}", 300, str(current_holder))
-            await self.redis_client.setex(f"holder:1h:{ca}", 3600, str(current_holder))
-            await self.redis_client.setex(f"volume:5m:{ca}", 300, str(current_volume_5m))
-            await self.redis_client.setex(f"volume:1h:{ca}", 3600, str(current_volume_1h))
+            await self.redis_client.set(f"holder:5m:{ca}", str(current_holder), ex=300)
+            await self.redis_client.set(f"holder:1h:{ca}", str(current_holder), ex=3600)
+            await self.redis_client.set(f"volume:5m:{ca}", str(current_volume_5m), ex=300)
+            await self.redis_client.set(f"volume:1h:{ca}", str(current_volume_1h), ex=3600)
             
-            # 构造 stats5m 格式
+            # 构造 stats5m 格式（字段名需要与 TriggerLogic 保持一致）
             stats5m = {
                 'price': price,
                 'price_5m_change_percent': price_5m_change,
                 'price_1h_change_percent': price_1h_change,
+                'priceChange': price_5m_change,  # TriggerLogic 使用这个字段
                 'volume_5m': current_volume_5m,
                 'volume_1h': current_volume_1h,
                 'volume_5m_change_percent': volume_5m_change,
                 'volume_1h_change_percent': volume_1h_change,
+                'volumeChange': volume_5m_change,  # TriggerLogic 使用这个字段
                 'buys_5m': gmgn_data['buys_5m'],
                 'sells_5m': gmgn_data['sells_5m'],
                 'swaps_5m': gmgn_data['swaps_5m'],
@@ -147,6 +154,7 @@ class TokenMonitorEngine:
                 'holder_count': current_holder,
                 'holder_5m_change': holder_5m_change,
                 'holder_1h_change': holder_1h_change,
+                'holderChange': holder_5m_change,  # TriggerLogic 使用这个字段
             }
             
             return stats5m
@@ -377,7 +385,7 @@ class TokenMonitorEngine:
         # 打印触发的事件
         logger.info(f"   🚨 触发监控！触发逻辑: {trigger_logic}")
         for event in triggered_events:
-            logger.info(f"      ✓ {event.event_type}: 当前值={event.current_value}, 阈值={event.threshold}")
+            logger.info(f"      ✓ {event.type}: 当前值={event.value}, 阈值={event.threshold}")
         
         # 检查冷却期
         in_cooldown = await self.check_cooldown(ca, events_config_str)

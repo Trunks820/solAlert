@@ -38,15 +38,35 @@ class TelegramNotifier(BaseNotifier):
             if self.bot_token:
                 logger.info(f"正在初始化Telegram机器人，Token长度: {len(self.bot_token)}")
                 
-                # 优化连接池配置
-                request = HTTPXRequest(
-                    connect_timeout=10.0,
-                    read_timeout=10.0,
-                    pool_timeout=30.0,
-                    connection_pool_size=200,
-                )
-                self.bot = Bot(token=self.bot_token, request=request)
-                logger.info("✅ Telegram机器人初始化成功 (连接池: 200, 超时: 30秒)")
+                # 检查是否启用代理
+                proxy_config = TELEGRAM_CONFIG.get('proxy', {})
+                proxy_enabled = proxy_config.get('enabled', False)
+                
+                if proxy_enabled:
+                    # 配置代理
+                    proxy_type = proxy_config.get('type', 'socks5')
+                    proxy_host = proxy_config.get('host', '127.0.0.1')
+                    proxy_port = proxy_config.get('port', 1081)
+                    proxy_url = f"{proxy_type}://{proxy_host}:{proxy_port}"
+                    
+                    logger.info(f"使用代理: {proxy_url}")
+                    
+                    # 创建带代理的 HTTPXRequest
+                    request = HTTPXRequest(
+                        proxy=proxy_url,
+                        connection_pool_size=8,
+                        connect_timeout=10.0,
+                        read_timeout=10.0,
+                        write_timeout=10.0,
+                        pool_timeout=10.0
+                    )
+                    
+                    self.bot = Bot(token=self.bot_token, request=request)
+                    logger.info("✅ Telegram机器人初始化成功（已启用代理）")
+                else:
+                    # 不使用代理
+                    self.bot = Bot(token=self.bot_token)
+                    logger.info("✅ Telegram机器人初始化成功（未使用代理）")
             else:
                 logger.error("❌ 未配置Telegram Bot Token")
                 self.bot = None

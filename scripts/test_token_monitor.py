@@ -21,16 +21,10 @@ logger = setup_logger()
 # ============================================================
 # 本地测试代理配置
 # ============================================================
-USE_PROXY = True  # 本地测试设置为True
-PROXY_HOST = "127.0.0.1"
-PROXY_PORT = 1081
-
-if USE_PROXY:
-    # 设置环境变量，httpx和telegram会自动使用
-    os.environ['HTTP_PROXY'] = f'socks5://{PROXY_HOST}:{PROXY_PORT}'
-    os.environ['HTTPS_PROXY'] = f'socks5://{PROXY_HOST}:{PROXY_PORT}'
-    logger.info(f"🔧 本地测试模式：使用代理 socks5://{PROXY_HOST}:{PROXY_PORT}")
-    logger.info(f"   ✅ httpx 和 telegram 会自动使用代理")
+# ⚠️ 只为 GMGN API 启用代理，不影响其他 HTTP 请求
+os.environ['HTTP_PROXY_ENABLED'] = 'true'
+logger.info("🔧 本地测试模式：只为 GMGN API 启用代理")
+logger.info("   ✅ GMGN API 会使用 socks5://127.0.0.1:1081")
 # ============================================================
 
 
