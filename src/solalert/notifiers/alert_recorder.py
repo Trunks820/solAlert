@@ -118,7 +118,7 @@ class AlertRecorder:
         ca: str,
         description: str,
         alert_time: Optional[str] = None,
-        chain: str = "sol",
+        chain: str = "bsc",
         price: Optional[float] = None,
         price_change: Optional[float] = None,
         market_cap: Optional[float] = None,
