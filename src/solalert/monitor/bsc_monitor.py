@@ -634,10 +634,11 @@ class BSCMonitor:
                     pair_address=pair_address
                 )
                 
-                # 异步发送 TG 消息
+                # 异步发送 TG 消息到 BSC 专用频道
                 try:
                     from ..core.config import TELEGRAM_CONFIG
-                    target_channel = str(TELEGRAM_CONFIG.get('target_channel_id'))
+                    # 使用 BSC 专用频道 ID
+                    target_channel = str(TELEGRAM_CONFIG.get('bsc_channel_id'))
                     
                     tg_success = await self.notification_manager.send_telegram(
                         target=target_channel,
@@ -645,7 +646,7 @@ class BSCMonitor:
                     )
                     
                     if tg_success:
-                        logger.info(f"📢 Telegram推送: ✅ 成功")
+                        logger.info(f"📢 Telegram推送: ✅ 成功 (频道: {target_channel})")
                     else:
                         logger.warning(f"📢 Telegram推送: ⚠️  失败")
                 except Exception as e:

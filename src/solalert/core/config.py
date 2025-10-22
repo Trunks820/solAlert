@@ -64,6 +64,7 @@ TELEGRAM_CONFIG = {
     'forum_group_id': int(os.getenv('TG_FORUM_GROUP', -1003073529793)),
     'target_channel_id': int(os.getenv('TG_TARGET_CHANNEL', -1002569647443)),
     'gmgn_channel_id': int(os.getenv('TG_GMGN_CHANNEL', -1002115686230)),  # GMGN频道ID
+    'bsc_channel_id': int(os.getenv('TG_BSC_CHANNEL', -1002926135363)),  # BSC监控专用频道ID
     # 代理配置（服务器默认关闭，开发环境需要时设置 TG_PROXY_ENABLED=true）
     'proxy': {
         'enabled': os.getenv('TG_PROXY_ENABLED', 'false').lower() == 'true',
