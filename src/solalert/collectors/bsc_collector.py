@@ -591,7 +591,7 @@ class BSCBlockCollector:
             logger.error(f"处理区块 {block_number} 失败: {e}")
             return []
     
-    def collect(self):
+    async def collect(self):
         """
         主监控循环（实现 BaseCollector 抽象方法）
         """
@@ -614,7 +614,13 @@ class BSCBlockCollector:
                         
                         # 如果有交易事件，调用回调处理
                         if events:
-                            self.on_data_received(events)
+                            # 如果回调是协程，使用 await；否则直接调用
+                            import asyncio
+                            import inspect
+                            if inspect.iscoroutinefunction(self.on_data_received):
+                                await self.on_data_received(events)
+                            else:
+                                self.on_data_received(events)
                         
                         self.last_block += 1
                     

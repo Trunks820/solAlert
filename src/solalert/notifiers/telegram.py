@@ -42,6 +42,10 @@ class TelegramNotifier(BaseNotifier):
                 proxy_config = TELEGRAM_CONFIG.get('proxy', {})
                 proxy_enabled = proxy_config.get('enabled', False)
                 
+                # 禁用 SSL 验证警告
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                
                 if proxy_enabled:
                     # 配置代理
                     proxy_type = proxy_config.get('type', 'socks5')
@@ -51,22 +55,46 @@ class TelegramNotifier(BaseNotifier):
                     
                     logger.info(f"使用代理: {proxy_url}")
                     
-                    # 创建带代理的 HTTPXRequest
-                    request = HTTPXRequest(
+                    # 创建带代理的 HTTPXRequest（增大连接池，禁用SSL验证）
+                    import httpx
+                    http_client = httpx.AsyncClient(
                         proxy=proxy_url,
-                        connection_pool_size=8,
-                        connect_timeout=10.0,
-                        read_timeout=10.0,
-                        write_timeout=10.0,
-                        pool_timeout=10.0
+                        verify=False,  # 禁用SSL验证
+                        timeout=httpx.Timeout(
+                            connect=30.0,
+                            read=30.0,
+                            write=30.0,
+                            pool=30.0
+                        ),
+                        limits=httpx.Limits(
+                            max_connections=50,
+                            max_keepalive_connections=20
+                        )
                     )
+                    request = HTTPXRequest(http_version="1.1", client=http_client)
                     
                     self.bot = Bot(token=self.bot_token, request=request)
-                    logger.info("✅ Telegram机器人初始化成功（已启用代理）")
+                    logger.info("✅ Telegram机器人初始化成功（已启用代理，SSL验证已禁用）")
                 else:
-                    # 不使用代理
-                    self.bot = Bot(token=self.bot_token)
-                    logger.info("✅ Telegram机器人初始化成功（未使用代理）")
+                    # 不使用代理（增大连接池，禁用SSL验证）
+                    import httpx
+                    http_client = httpx.AsyncClient(
+                        verify=False,  # 禁用SSL验证
+                        timeout=httpx.Timeout(
+                            connect=30.0,
+                            read=30.0,
+                            write=30.0,
+                            pool=30.0
+                        ),
+                        limits=httpx.Limits(
+                            max_connections=50,
+                            max_keepalive_connections=20
+                        )
+                    )
+                    request = HTTPXRequest(http_version="1.1", client=http_client)
+                    
+                    self.bot = Bot(token=self.bot_token, request=request)
+                    logger.info("✅ Telegram机器人初始化成功（未使用代理，SSL验证已禁用）")
             else:
                 logger.error("❌ 未配置Telegram Bot Token")
                 self.bot = None

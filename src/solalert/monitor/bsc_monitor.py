@@ -208,7 +208,7 @@ class BSCMonitor:
             logger.error(f"❌ 解析 events_config 失败: {e}")
             return None
     
-    def handle_block_events(self, events: List[Dict]):
+    async def handle_block_events(self, events: List[Dict]):
         """
         处理区块事件（第一层过滤：按区块聚合）
         
@@ -228,9 +228,9 @@ class BSCMonitor:
         # 处理每个区块
         for block_number, block_events in blocks.items():
             logger.debug(f"   区块 {block_number}: {len(block_events)} 个事件")
-            self.process_block_trades(block_number, block_events)
+            await self.process_block_trades(block_number, block_events)
     
-    def process_block_trades(self, block_number: int, events: List[Dict]):
+    async def process_block_trades(self, block_number: int, events: List[Dict]):
         """
         处理单个区块的交易（第一层过滤 + Redis冷却期检查）
         
@@ -268,7 +268,7 @@ class BSCMonitor:
                     continue
                 
                 # 进入第二层过滤（调用 API）
-                self.apply_second_layer_filter(
+                await self.apply_second_layer_filter(
                     token_address,
                     trades[0]['pair_address'],
                     single_max,
@@ -276,7 +276,7 @@ class BSCMonitor:
                     block_number
                 )
     
-    def apply_second_layer_filter(
+    async def apply_second_layer_filter(
         self,
         token_address: str,
         pair_address: str,
@@ -348,7 +348,7 @@ class BSCMonitor:
             )
             
             # 发送推送（包含数据库、WebSocket、TG）
-            self.send_bsc_alert(
+            await self.send_bsc_alert(
                 token_address=token_address,
                 token_data=token_data,
                 triggered_events=triggered_events,
@@ -523,7 +523,7 @@ class BSCMonitor:
         except Exception as e:
             logger.error(f"更新推送历史失败: {e}")
     
-    def send_bsc_alert(
+    async def send_bsc_alert(
         self,
         token_address: str,
         token_data: Dict,
@@ -581,39 +581,41 @@ class BSCMonitor:
                 logger.warning(f"计算价格失败: {e}")
                 price_usdt = 0.0
             
-            # 构建触发事件列表（转换为字典格式）
-            trigger_events_list = [e.to_dict() for e in triggered_events]
-            
-            # 构建推送原因
+            # 构建推送原因（仅第二层触发原因）
             alert_reasons = [e.description for e in triggered_events]
-            alert_reasons.append(f"💰 单笔最大: ${single_max:.2f} USDT")
-            alert_reasons.append(f"📊 区块累计: ${total_sum:.2f} USDT")
             
-            # 1. 数据库写入 + WebSocket 推送
+            # 获取额外的 Token 数据
+            price_change = token_data.get('price_5m_change_percent', 0)
+            volume_24h = token_data.get('volume', 0)
+            holders = token_data.get('holder_count', 0)
+            market_cap = token_data.get('market_cap', 0) or token_data.get('liquidity', 0)
+            logo = token_data.get('logo', '')
+            
+            # 1. 数据库写入 + WebSocket 推送（使用 write_bsc_alert）
             logger.info(f"📢 记录 BSC 监控预警: {symbol} ({token_address[:10]}...)")
             
-            notify_result = self.alert_recorder.send_alert_notification(
-                config_id=0,  # BSC 监控使用 config_id = 0
+            success = self.alert_recorder.write_bsc_alert(
                 ca=token_address,
                 token_name=name,
                 token_symbol=symbol,
-                trigger_events=trigger_events_list,
-                stats_data=stats,
-                notify_methods="telegram,wechat"
+                single_max=single_max,
+                total_sum=total_sum,
+                alert_reasons=alert_reasons,
+                block_number=block_number,
+                price_usdt=price_usdt,
+                pair_address=pair_address,
+                market_cap=market_cap,
+                price_change=price_change,
+                volume_24h=volume_24h,
+                holders=holders,
+                logo=logo
             )
             
-            success = notify_result['db_success']
-            
             if success:
-                logger.info(f"📝 数据库写入: ✅ 成功")
+                logger.info(f"📝 数据库写入 + WebSocket推送: ✅ 成功")
             else:
                 logger.error(f"❌ BSC 预警记录写入失败")
                 return
-            
-            if notify_result['realtime_success']:
-                logger.info(f"🌐 WebSocket推送: ✅ 成功")
-            else:
-                logger.warning(f"🌐 WebSocket推送: ⚠️  失败")
             
             # 设置 Redis 冷却期
             self.update_alert_history(token_address)
@@ -633,22 +635,13 @@ class BSCMonitor:
                 )
                 
                 # 异步发送 TG 消息
-                import asyncio
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                
                 try:
                     from ..core.config import TELEGRAM_CONFIG
                     target_channel = str(TELEGRAM_CONFIG.get('target_channel_id'))
                     
-                    tg_success = loop.run_until_complete(
-                        self.notification_manager.send_telegram(
-                            target=target_channel,
-                            message=message
-                        )
+                    tg_success = await self.notification_manager.send_telegram(
+                        target=target_channel,
+                        message=message
                     )
                     
                     if tg_success:
@@ -713,8 +706,13 @@ class BSCMonitor:
         
         return message
     
-    def start(self):
+    async def start(self):
         """启动监控"""
         logger.info("🚀 BSC 监控器启动中...")
-        self.collector.collect()
+        await self.collector.collect()
+    
+    async def stop(self):
+        """停止监控"""
+        logger.info("⏹️  BSC 监控器停止中...")
+        await self.collector.stop()
 
