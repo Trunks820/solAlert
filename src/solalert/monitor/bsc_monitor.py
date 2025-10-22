@@ -26,6 +26,24 @@ logger = logging.getLogger(__name__)
 class BSCMonitor:
     """BSC 链上交易监控器"""
     
+    @staticmethod
+    def format_number(value: float) -> str:
+        """
+        格式化数字，自动添加 K/M 后缀
+        
+        Args:
+            value: 数值
+            
+        Returns:
+            格式化后的字符串
+        """
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.2f}M"
+        elif value >= 1_000:
+            return f"{value / 1_000:.2f}K"
+        else:
+            return f"{value:.0f}"
+    
     def __init__(self, config: Dict):
         """
         初始化 BSC 监控器
@@ -38,9 +56,9 @@ class BSCMonitor:
         # 全局监控配置（从数据库或 Redis 读取）
         self.global_config = self.load_global_config()
         
-        # 第一层过滤：交易金额阈值
-        self.single_max_usdt = self.global_config.get('min_transaction_usd', 400) if self.global_config else 400
-        self.block_accumulate_usdt = 1000  # 写死
+        # 第一层过滤：交易金额阈值（临时降低测试）
+        self.single_max_usdt = self.global_config.get('min_transaction_usd', 50) if self.global_config else 50
+        self.block_accumulate_usdt = 100  # 临时降低测试
         
         # 第二层过滤：events_config（从配置解析）
         self.events_config = self.parse_events_config(
@@ -78,6 +96,7 @@ class BSCMonitor:
             logger.info(f"   配置名称: {self.global_config.get('config_name')}")
             logger.info(f"   链类型: {self.global_config.get('chain_type')}")
         logger.info(f"   第一层过滤：单笔 >= {self.single_max_usdt} USDT OR 累计 >= {self.block_accumulate_usdt} USDT")
+        logger.info(f"   平台过滤：仅监控 fourmeme 平台代币")
         if self.events_config:
             logger.info(f"   第二层过滤：价格涨跌 >= {self.events_config.get('priceChange', {}).get('risePercent')}%, 交易量变化 >= {self.events_config.get('volume', {}).get('increasePercent')}%")
         logger.info(f"   第三层控制：推送间隔 >= {self.min_interval_seconds} 秒")
@@ -218,6 +237,9 @@ class BSCMonitor:
         if not events:
             return
         
+        import time
+        start_time = time.time()
+        
         logger.info(f"🔄 处理 {len(events)} 个交易事件")
         
         # 按区块号聚合
@@ -229,6 +251,10 @@ class BSCMonitor:
         for block_number, block_events in blocks.items():
             logger.debug(f"   区块 {block_number}: {len(block_events)} 个事件")
             await self.process_block_trades(block_number, block_events)
+        
+        # 统计处理时间
+        elapsed = time.time() - start_time
+        logger.info(f"⏱️  区块事件处理完成，耗时: {elapsed:.2f}秒")
     
     async def process_block_trades(self, block_number: int, events: List[Dict]):
         """
@@ -238,11 +264,25 @@ class BSCMonitor:
             block_number: 区块号
             events: 该区块的交易事件
         """
+        import time
+        block_start_time = time.time()
+        
         # 按代币地址聚合
         token_trades = defaultdict(list)
         for event in events:
             token_address = event['base_token']
             token_trades[token_address].append(event)
+        
+        # 统计
+        filter_stats = {
+            'total_tokens': len(token_trades),
+            'passed_amount': 0,
+            'non_launchpad': 0,
+            'other_platform': 0,
+            'fourmeme_found': 0,
+            'in_cooldown': 0,
+            'triggered': 0
+        }
         
         # 对每个代币进行第一层过滤
         for token_address, trades in token_trades.items():
@@ -253,18 +293,35 @@ class BSCMonitor:
             
             # 第一层：判断是否触发金额条件
             if single_max >= self.single_max_usdt or total_sum >= self.block_accumulate_usdt:
+                filter_stats['passed_amount'] += 1
+                
+                # 第一层后立即检查：判断是否是 fourmeme 平台
+                launchpad_info = self.gmgn_api.get_token_launchpad_info('bsc', token_address)
+                
+                if launchpad_info is None:
+                    filter_stats['non_launchpad'] += 1
+                    logger.info(f"⏭️  跳过 {token_address} (非Launchpad) 单笔{single_max:.0f}U")
+                    continue
+                
+                launchpad_platform = launchpad_info.get('launchpad')
+                if launchpad_platform != 'fourmeme':
+                    filter_stats['other_platform'] += 1
+                    logger.info(f"⏭️  跳过 {token_address} (平台: {launchpad_platform}) 单笔{single_max:.0f}U")
+                    continue
+                
+                filter_stats['fourmeme_found'] += 1
+                
+                # 通过 fourmeme 验证，记录详细信息
                 logger.info(
-                    f"✅ [第一层触发] 区块 {block_number}, "
-                    f"代币 {token_address[:10]}..., "
-                    f"单笔最大: {single_max:.2f} USDT, "
-                    f"累计: {total_sum:.2f} USDT, "
-                    f"交易笔数: {len(trades)}"
+                    f"🎯 [Fourmeme] {token_address} "
+                    f"单笔{single_max:.0f}U 累计{total_sum:.0f}U 笔数{len(trades)}"
                 )
                 
                 # 提前检查 Redis 冷却期（减少 API 调用）
                 cooldown_minutes = self.min_interval_seconds / 60
                 if not self.check_alert_cooldown(token_address, cooldown_minutes):
-                    logger.debug(f"⏭️  [冷却期拦截] 代币 {token_address[:10]}... 在冷却期内，跳过")
+                    filter_stats['in_cooldown'] += 1
+                    logger.info(f"⏭️  跳过 {token_address} (冷却期 {self.min_interval_seconds}秒)")
                     continue
                 
                 # 进入第二层过滤（调用 API）
@@ -273,8 +330,22 @@ class BSCMonitor:
                     trades[0]['pair_address'],
                     single_max,
                     total_sum,
-                    block_number
+                    block_number,
+                    launchpad_info
                 )
+        
+        # 输出区块处理统计
+        elapsed = time.time() - block_start_time
+        logger.info(
+            f"📊 区块 {block_number} 统计: "
+            f"总代币{filter_stats['total_tokens']} | "
+            f"达标{filter_stats['passed_amount']} | "
+            f"非Launch{filter_stats['non_launchpad']} | "
+            f"其他平台{filter_stats['other_platform']} | "
+            f"Fourmeme{filter_stats['fourmeme_found']} | "
+            f"冷却{filter_stats['in_cooldown']} | "
+            f"耗时{elapsed:.2f}秒"
+        )
     
     async def apply_second_layer_filter(
         self,
@@ -282,7 +353,8 @@ class BSCMonitor:
         pair_address: str,
         single_max: float,
         total_sum: float,
-        block_number: int
+        block_number: int,
+        launchpad_info: Dict
     ):
         """
         第二层过滤：调用 GMGN API + events_config 判断
@@ -293,31 +365,42 @@ class BSCMonitor:
             single_max: 单笔最大金额
             total_sum: 累计金额
             block_number: 区块号
+            launchpad_info: Launchpad 信息
         """
         try:
             # 1. 调用 GMGN API 获取代币数据
             gmgn_data_list = self.gmgn_api.get_token_info_batch('bsc', [token_address])
             
             if not gmgn_data_list or len(gmgn_data_list) == 0:
-                logger.warning(f"⚠️  无法获取代币数据: {token_address[:10]}...")
+                logger.debug(f"⏭️  跳过 {token_address[:10]}... (无GMGN数据)")
                 return
             
             # 2. 解析代币数据
             token_data = self.gmgn_api.parse_token_data(gmgn_data_list[0])
             if not token_data:
-                logger.warning(f"⚠️  解析代币数据失败: {token_address[:10]}...")
+                logger.debug(f"⏭️  跳过 {token_address[:10]}... (解析失败)")
                 return
             
-            # 3. 计算 5分钟涨跌幅和交易量
+            # 3. 计算 5分钟涨跌幅和交易量变化
             price_5m = token_data.get('price_5m', 0)
             price_current = token_data.get('price', 0)
+            volume_1m = token_data.get('volume_1m', 0)
             volume_5m = token_data.get('volume_5m', 0)
             
-            # 价格变化百分比
+            # 价格变化百分比（当前价格相对于5分钟前）
             if price_5m and price_5m > 0:
                 price_change_5m = ((price_current - price_5m) / price_5m) * 100
             else:
                 price_change_5m = 0
+            
+            # 交易量变化百分比（1分钟交易量相对于5分钟交易量）
+            # volume_1m 是最近1分钟的交易量
+            # volume_5m 是5分钟前的交易量
+            # (volume_1m - volume_5m) / volume_5m * 100 = 交易量涨跌幅
+            if volume_5m and volume_5m > 0:
+                volume_change_percent = ((volume_1m - volume_5m) / volume_5m) * 100
+            else:
+                volume_change_percent = 0
             
             # 构造 stats5m 数据（用于 TriggerLogic 评估）
             stats = {
@@ -328,7 +411,7 @@ class BSCMonitor:
             
             # 4. 判断是否满足 events_config
             if not self.events_config:
-                logger.warning("⚠️  events_config 未配置，跳过第二层判断")
+                logger.debug("⏭️  跳过 (无events_config)")
                 return
             
             # 使用 TriggerLogic 评估触发条件
@@ -338,14 +421,15 @@ class BSCMonitor:
             )
             
             if not should_trigger:
-                logger.debug(f"⏭️  [第二层未触发] 代币 {token_address[:10]}... 不满足 events_config 条件")
+                logger.info(
+                    f"⏭️  跳过 {token_address} (未达指标) "
+                    f"涨幅{price_change_5m:.1f}% 量变{volume_change_percent:.1f}%"
+                )
                 return
             
             # 5. 满足条件，准备推送
-            logger.info(
-                f"✅ [第二层触发] 代币 {token_address[:10]}..., "
-                f"触发事件数: {len(triggered_events)}"
-            )
+            symbol = token_data.get('symbol', 'Unknown')
+            logger.info(f"🚨 [触发推送] {symbol} {token_address} (事件数: {len(triggered_events)})")
             
             # 发送推送（包含数据库、WebSocket、TG）
             await self.send_bsc_alert(
@@ -355,7 +439,8 @@ class BSCMonitor:
                 single_max=single_max,
                 total_sum=total_sum,
                 block_number=block_number,
-                pair_address=pair_address
+                pair_address=pair_address,
+                launchpad_info=launchpad_info
             )
             
         except Exception as e:
@@ -531,7 +616,8 @@ class BSCMonitor:
         single_max: float,
         total_sum: float,
         block_number: int,
-        pair_address: str
+        pair_address: str,
+        launchpad_info: Dict
     ):
         """
         发送 BSC 监控推送通知
@@ -544,6 +630,7 @@ class BSCMonitor:
             total_sum: 累计金额
             block_number: 区块号
             pair_address: 交易对地址
+            launchpad_info: Launchpad 信息
         """
         try:
             # 获取代币信息
@@ -591,9 +678,7 @@ class BSCMonitor:
             market_cap = token_data.get('market_cap', 0) or token_data.get('liquidity', 0)
             logo = token_data.get('logo', '')
             
-            # 1. 数据库写入 + WebSocket 推送（使用 write_bsc_alert）
-            logger.info(f"📢 记录 BSC 监控预警: {symbol} ({token_address[:10]}...)")
-            
+            # 1. 数据库写入 + WebSocket 推送
             success = self.alert_recorder.write_bsc_alert(
                 ca=token_address,
                 token_name=name,
@@ -611,10 +696,8 @@ class BSCMonitor:
                 logo=logo
             )
             
-            if success:
-                logger.info(f"📝 数据库写入 + WebSocket推送: ✅ 成功")
-            else:
-                logger.error(f"❌ BSC 预警记录写入失败")
+            if not success:
+                logger.error(f"❌ 数据库写入失败: {symbol}")
                 return
             
             # 设置 Redis 冷却期
@@ -629,34 +712,59 @@ class BSCMonitor:
                     price_usdt=price_usdt,
                     single_max=single_max,
                     total_sum=total_sum,
+                    market_cap=market_cap,
                     alert_reasons=alert_reasons,
                     block_number=block_number,
-                    pair_address=pair_address
+                    pair_address=pair_address,
+                    launchpad_info=launchpad_info
                 )
+                
+                # 创建按钮
+                buttons = self.create_bsc_buttons(token_address)
                 
                 # 异步发送 TG 消息到 BSC 专用频道
                 try:
                     from ..core.config import TELEGRAM_CONFIG
-                    # 使用 BSC 专用频道 ID
                     target_channel = str(TELEGRAM_CONFIG.get('bsc_channel_id'))
                     
                     tg_success = await self.notification_manager.send_telegram(
                         target=target_channel,
-                        message=message
+                        message=message,
+                        reply_markup=buttons
                     )
                     
                     if tg_success:
-                        logger.info(f"📢 Telegram推送: ✅ 成功 (频道: {target_channel})")
+                        logger.info(f"✅ 推送完成: {symbol} ({token_address}) -> TG频道")
                     else:
-                        logger.warning(f"📢 Telegram推送: ⚠️  失败")
+                        logger.warning(f"⚠️  TG推送失败: {symbol} ({token_address})")
                 except Exception as e:
-                    logger.warning(f"📢 Telegram推送异常: {e}")
+                    logger.warning(f"⚠️  TG推送异常 {token_address}: {e}")
         
         except Exception as e:
             logger.error(f"发送推送通知失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
     
+    
+    def create_bsc_buttons(self, token_address: str):
+        """
+        创建 BSC 代币的 Telegram 内联按钮
+        
+        Args:
+            token_address: 代币合约地址
+            
+        Returns:
+            InlineKeyboardMarkup 对象
+        """
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        
+        buttons = [
+            [
+                InlineKeyboardButton("📊 GMGN", url=f"https://gmgn.ai/bsc/token/{token_address}"),
+                InlineKeyboardButton("🔍 OKX", url=f"https://www.okx.com/web3/dex-swap#inputChain=56&inputCurrency={token_address}&outputChain=56&outputCurrency=0x55d398326f99059fF775485246999027B3197955")
+            ]
+        ]
+        return InlineKeyboardMarkup(buttons)
     
     def format_bsc_tg_message(
         self,
@@ -666,9 +774,11 @@ class BSCMonitor:
         price_usdt: float,
         single_max: float,
         total_sum: float,
+        market_cap: float,
         alert_reasons: List[str],
         block_number: int,
-        pair_address: str
+        pair_address: str,
+        launchpad_info: Dict
     ) -> str:
         """
         格式化 BSC 监控的 Telegram 消息
@@ -676,33 +786,45 @@ class BSCMonitor:
         Returns:
             HTML 格式的消息
         """
-        # GMGN 和其他链接
-        gmgn_url = f'https://gmgn.ai/bsc/token/{token_address}'
-        bscscan_url = f'https://bscscan.com/token/{token_address}'
-        pancake_url = f'https://pancakeswap.finance/swap?outputCurrency={token_address}'
+        # 解析 launchpad 信息
+        launchpad_status = launchpad_info.get('launchpad_status', 0)
+        launchpad_progress = float(launchpad_info.get('launchpad_progress', 0))
         
-        message = f"""<b>🟢 BSC 链上信号</b>
+        # 判断内外盘
+        if launchpad_status == 0:
+            pool_status = "🔴 内盘"
+        else:
+            pool_status = "🟢 外盘"
+        
+        # 进度百分比
+        progress_percent = launchpad_progress * 100
+        
+        # 格式化数字（使用 K/M 后缀）
+        single_max_str = self.format_number(single_max)
+        total_sum_str = self.format_number(total_sum)
+        market_cap_str = self.format_number(market_cap)
+        
+        message = f"""<b>🟢 BSC 链上信号 (Fourmeme)</b>
 
 💰 代币: {symbol}
 📝 名称: {name}
 🔗 合约: <code>{token_address}</code>
 
 📊 <b>实时数据</b>
-💵 当前价格: ${price_usdt:.10f} USDT
+💵 当前价格: ${price_usdt:.5f} USDT
+💎 市值: ${market_cap_str}
+🏊 状态: {pool_status} | 进度: {progress_percent:.1f}%
 🏦 交易对: {pair_address[:10]}...
 
 📉 <b>交易数据</b>
-💰 单笔最大: ${single_max:.2f} USDT
-📊 区块累计: ${total_sum:.2f} USDT
+💰 单笔最大: ${single_max_str}
+📊 区块累计: ${total_sum_str}
 🔢 区块号: #{block_number}
 
 ✨ <b>触发原因</b>
 {chr(10).join('• ' + reason for reason in alert_reasons)}
 
 ⏰ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-🔗 <b>链接</b>
-📊 <a href="{gmgn_url}">GMGN</a> | <a href="{bscscan_url}">BscScan</a> | <a href="{pancake_url}">PancakeSwap</a>
 """
         
         return message

@@ -52,7 +52,7 @@ HTTP_PROXY_CONFIG = {
 # ==================== GMGN Cookie 配置 ====================
 GMGN_COOKIE_CONFIG = {
     'sol': os.getenv('GMGN_COOKIE_SOL', '_ga=GA1.1.777785332.1712628586; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; _ga_0XM0LYXGC8=deleted; GMGN_CHAIN=sol; cf_clearance=kGk1fviudvjYoycoB8p0lDvQlLZ.NVwppcBClXoCyuU-1758871878-1.2.1.1-8bKzlJQgrLdW2FYpzTOc3GV0uVLtag97R7TmcvV3czBzp4X9eJ5GKKDNcDR1ieB_sdid5hjhvjzRZLBBZA79HnkWXp4eePChJZ2M5OtlmZg0COt806bwv3vVUGWwefahHy7B6SNQq8wyhiKWvWZviAPNTcqSXgVRycDXlSypZZNz8aRYSS.kP8aZQb.TGcQyhcVoMHLOyaak2QZz4LElXrSrPP_Iu9QiXpO4Gp5oXg0; sid=gmgn%7Cdd0338480e80cb62fd084a997f5ba619; _ga_UGLVBMV4Z0=GS1.2.1761122267756211.245e6720757dcf65dbf07509eaa78e45.TqKHb9RERMXgyylHkzVEdw%3D%3D.cUVssZurif44ulffusd0jg%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.vROC4NpoXjbF3TCihM4z2w%3D%3D; __cf_bm=yz2XKoOxZ00nQmhdqdOh0VfMQFELYPmT4KD7I_kEnlU-1761123382-1.0.1.1-phndFEJydfCR22kUhC4tgVdqdFwEpq30cCvpcrE7dCI_7ujjWu231tKZEdfKtQRrusEtfzvngHc5rbMjJZMXb3XDEsSGCshmMmGyNML3xhg; _ga_0XM0LYXGC8=GS2.1.s1761118331$o625$g1$t1761123866$j48$l0$h0'),
-    'bsc': os.getenv('GMGN_COOKIE_BSC', '_ga=GA1.1.777785332.1712628586; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; _ga_0XM0LYXGC8=deleted; GMGN_CHAIN=sol; cf_clearance=kGk1fviudvjYoycoB8p0lDvQlLZ.NVwppcBClXoCyuU-1758871878-1.2.1.1-8bKzlJQgrLdW2FYpzTOc3GV0uVLtag97R7TmcvV3czBzp4X9eJ5GKKDNcDR1ieB_sdid5hjhvjzRZLBBZA79HnkWXp4eePChJZ2M5OtlmZg0COt806bwv3vVUGWwefahHy7B6SNQq8wyhiKWvWZviAPNTcqSXgVRycDXlSypZZNz8aRYSS.kP8aZQb.TGcQyhcVoMHLOyaak2QZz4LElXrSrPP_Iu9QiXpO4Gp5oXg0; sid=gmgn%7Cdd0338480e80cb62fd084a997f5ba619; _ga_UGLVBMV4Z0=GS1.2.1761122267756211.245e6720757dcf65dbf07509eaa78e45.TqKHb9RERMXgyylHkzVEdw%3D%3D.cUVssZurif44ulffusd0jg%3D%3D.7yaEtYt33EhexBLBa3Preg%3D%3D.vROC4NpoXjbF3TCihM4z2w%3D%3D; __cf_bm=yz2XKoOxZ00nQmhdqdOh0VfMQFELYPmT4KD7I_kEnlU-1761123382-1.0.1.1-phndFEJydfCR22kUhC4tgVdqdFwEpq30cCvpcrE7dCI_7ujjWu231tKZEdfKtQRrusEtfzvngHc5rbMjJZMXb3XDEsSGCshmMmGyNML3xhg; _ga_0XM0LYXGC8=GS2.1.s1761118331$o625$g1$t1761123866$j48$l0$h0'),
+    'bsc': os.getenv('GMGN_COOKIE_BSC', '_ga=GA1.1.704572436.1712248135; _ga_0XM0LYXGC8=deleted; b-user-id=f3b3bb30-0b5c-fc55-f1fa-5af0522175ce; GMGN_LOCALE=zh-CN; GMGN_THEME=dark; GMGN_CHAIN=sol; cf_clearance=PGHzmubD5oFQazvAIgnbP4hBuLlLcqVdkuBbsXYZ7Xw-1759155150-1.2.1.1-MUP7EJ6hz4BaJx4qkU3Ivb9KQvRoT8S9Kx8f_42Q_Hjj4CpcDlCHhEAtqgm8zygsdPNNicukT.4y4vfxlj_Tj5OJB1J9IuHJS8XuOm0l1aUvoQLAGzvtQs.Tlu9vjoyNf5MlZtRUirLX8c9fgrbobIr5IsaCvJ5bgRwhauOfIZXETUgOskXUgPdD4Eo2aeQoFxfKSCVLBPjEpTCzfWJ2ekehhEvI_bi.hiAtvhszakc; sid=gmgn%7C292e8be4097562533efc439a90ff1d8f; _ga_UGLVBMV4Z0=GS1.2.1761148244898649.245e6720757dcf65dbf07509eaa78e45.1M6xVOwKz93csAzwIUEo9w%3D%3D.527qAuccPC2DZbPS2ub1%2FA%3D%3D.GkANTRUWGTCtPvD1KE8jSA%3D%3D.9kVJPku7MucUdFCHGcaXDQ%3D%3D; _ga_0XM0LYXGC8=GS2.1.s1761148221$o171$g1$t1761149202$j60$l0$h0; __cf_bm=ExB40DsFkARkqey7OcNO5wZTrXEmkubK5YF3.HNX8S4-1761149207-1.0.1.1-DOsJFZq4qrntmIR82lFX3QlEjYtKxrXXlotuUQU1iQUsBP_bR2LGGtIJwopA4KOrd7GNXJgEHWD6A_1KdkGfBVD6yYdYkf9zhnNDSoxdpyA'),
 }
 
 
@@ -64,7 +64,7 @@ TELEGRAM_CONFIG = {
     'forum_group_id': int(os.getenv('TG_FORUM_GROUP', -1003073529793)),
     'target_channel_id': int(os.getenv('TG_TARGET_CHANNEL', -1002569647443)),
     'gmgn_channel_id': int(os.getenv('TG_GMGN_CHANNEL', -1002115686230)),  # GMGN频道ID
-    'bsc_channel_id': int(os.getenv('TG_BSC_CHANNEL', -1002926135363)),  # BSC监控专用频道ID
+    'bsc_channel_id': int(os.getenv('TG_BSC_CHANNEL', -1002569554228)),  # BSC监控专用频道ID
     # 代理配置（服务器默认关闭，开发环境需要时设置 TG_PROXY_ENABLED=true）
     'proxy': {
         'enabled': os.getenv('TG_PROXY_ENABLED', 'false').lower() == 'true',
@@ -214,15 +214,7 @@ def get_config_summary() -> Dict[str, Any]:
 # ==================== BSC 监控配置 ====================
 BSC_MONITOR_CONFIG = {
     'rpc_endpoints': [
-        "https://bsc-dataseed.binance.org",
-        "https://bsc-dataseed1.binance.org",
-        "https://bsc-dataseed2.binance.org",
-        "https://bsc-dataseed3.binance.org",
-        "https://bsc-dataseed4.binance.org",
-        "https://bsc-dataseed1.defibit.io",
-        "https://bsc-dataseed1.ninicoin.io",
-        "https://rpc.ankr.com/bsc",
-        "https://bscrpc.com",
+        "https://bnb-mainnet.g.alchemy.com/v2/tWN9bIGWh3OMCNHpii7ui",  # Alchemy（稳定）
     ],
     'confirmations': 12,
     'poll_interval': 0.8,
