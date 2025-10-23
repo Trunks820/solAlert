@@ -125,11 +125,11 @@ class TriggerLogic:
         config: Dict[str, Any]
     ) -> Tuple[bool, Optional[TriggerEvent]]:
         """
-        判断交易量变化是否触发
+        判断交易量是否触发（使用绝对值）
         
         Args:
-            stats: stats5m 数据
-            config: volume 配置
+            stats: stats5m 数据（包含 volume_24h 等字段）
+            config: volume 配置（使用 threshold 绝对值，单位 USDT）
             
         Returns:
             (是否触发, 触发事件对象)
@@ -137,6 +137,24 @@ class TriggerLogic:
         if not config.get("enabled"):
             return False, None
         
+        # 优先使用 threshold（绝对值，单位 USDT）
+        volume_threshold = config.get("threshold")
+        
+        if volume_threshold is not None:
+            # 获取 1 分钟交易量（DBotX API 提供）
+            current_volume = stats.get("volume_1m", 0) or stats.get("volume", 0)
+            
+            # 判断是否达到阈值
+            if current_volume >= volume_threshold:
+                event = TriggerEvent(
+                    event_type="交易量达标",
+                    value=current_volume,
+                    threshold=volume_threshold,
+                    description=f"💰 1分钟交易量 ${current_volume:,.0f} (阈值: ≥${volume_threshold:,.0f})"
+                )
+                return True, event
+        
+        # 兼容旧版：如果没有 threshold，则用涨跌幅判断（保留原逻辑）
         volume_change = stats.get("volumeChange", 0)
         increase_threshold = config.get("increasePercent")
         decrease_threshold = config.get("decreasePercent")

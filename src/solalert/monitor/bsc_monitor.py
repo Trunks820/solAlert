@@ -1,9 +1,14 @@
 """
 BSC 监控主逻辑
-实现三层过滤机制：
+实现三层过滤机制 + DBotX API 集成：
 1. 第一层：交易金额过滤（单笔 >= 400 USDT OR 区块累计 >= 1000 USDT）
-2. 第二层：数据库配置指标过滤（价格涨幅、交易量等）
+2. 第二层：fourmeme 平台验证 + 指标过滤（使用 DBotX API，1分钟实时数据）
 3. 第三层：推送频率控制（同一代币 30 秒冷却期）
+
+优势：
+- 使用 DBotX API（API Key 认证，比 GMGN Cookie 更稳定）
+- 1分钟实时数据（比 GMGN 5分钟数据快5倍）
+- 单次 API 调用获取所有信息（launchpad + 价格 + 交易量）
 """
 import logging
 import time
@@ -17,7 +22,7 @@ from ..core.redis_client import get_redis
 from ..core.database import get_db
 from ..notifiers.alert_recorder import get_alert_recorder
 from ..notifiers.manager import get_notification_manager
-from ..api.gmgn_api import get_gmgn_api
+from ..api.dbotx_api import DBotXAPI
 from .trigger_logic import TriggerLogic
 
 logger = logging.getLogger(__name__)
@@ -56,9 +61,9 @@ class BSCMonitor:
         # 全局监控配置（从数据库或 Redis 读取）
         self.global_config = self.load_global_config()
         
-        # 第一层过滤：交易金额阈值（临时降低测试）
-        self.single_max_usdt = self.global_config.get('min_transaction_usd', 50) if self.global_config else 50
-        self.block_accumulate_usdt = 100  # 临时降低测试
+        # 第一层过滤：交易金额阈值
+        self.single_max_usdt = self.global_config.get('min_transaction_usd', 400) if self.global_config else 400
+        self.block_accumulate_usdt = 1000  # 区块累计阈值
         
         # 第二层过滤：events_config（从配置解析）
         self.events_config = self.parse_events_config(
@@ -84,22 +89,15 @@ class BSCMonitor:
         # 通知管理器（用于 TG 推送）
         self.notification_manager = get_notification_manager()
         
-        # GMGN API（用于获取 BSC 代币数据）
-        self.gmgn_api = get_gmgn_api()
+        # DBotX API（用于获取 BSC 代币数据，比 GMGN 更稳定）
+        self.dbotx_api = DBotXAPI()
         
         # 区块收集器
         self.collector = BSCBlockCollector(config)
         self.collector.on_data_received = self.handle_block_events
         
-        logger.info(f"✅ BSC 监控器初始化完成")
-        if self.global_config:
-            logger.info(f"   配置名称: {self.global_config.get('config_name')}")
-            logger.info(f"   链类型: {self.global_config.get('chain_type')}")
-        logger.info(f"   第一层过滤：单笔 >= {self.single_max_usdt} USDT OR 累计 >= {self.block_accumulate_usdt} USDT")
-        logger.info(f"   平台过滤：仅监控 fourmeme 平台代币")
-        if self.events_config:
-            logger.info(f"   第二层过滤：价格涨跌 >= {self.events_config.get('priceChange', {}).get('risePercent')}%, 交易量变化 >= {self.events_config.get('volume', {}).get('increasePercent')}%")
-        logger.info(f"   第三层控制：推送间隔 >= {self.min_interval_seconds} 秒")
+        # 初始化完成（详细配置已在 start.py 显示）
+        logger.debug(f"BSC Monitor 已就绪")
     
     def load_global_config(self) -> Optional[Dict]:
         """
@@ -240,21 +238,13 @@ class BSCMonitor:
         import time
         start_time = time.time()
         
-        logger.info(f"🔄 处理 {len(events)} 个交易事件")
-        
-        # 按区块号聚合
+        # 按区块号聚合并处理
         blocks = defaultdict(list)
         for event in events:
             blocks[event['block_number']].append(event)
         
-        # 处理每个区块
         for block_number, block_events in blocks.items():
-            logger.debug(f"   区块 {block_number}: {len(block_events)} 个事件")
             await self.process_block_trades(block_number, block_events)
-        
-        # 统计处理时间
-        elapsed = time.time() - start_time
-        logger.info(f"⏱️  区块事件处理完成，耗时: {elapsed:.2f}秒")
     
     async def process_block_trades(self, block_number: int, events: List[Dict]):
         """
@@ -270,8 +260,9 @@ class BSCMonitor:
         # 按代币地址聚合
         token_trades = defaultdict(list)
         for event in events:
-            token_address = event['base_token']
-            token_trades[token_address].append(event)
+            token_trades[event['base_token']].append(event)
+        
+        logger.info(f"🔍 区块 #{block_number} | 交易: {len(events)} | 代币: {len(token_trades)}")
         
         # 统计
         filter_stats = {
@@ -296,32 +287,29 @@ class BSCMonitor:
                 filter_stats['passed_amount'] += 1
                 
                 # 第一层后立即检查：判断是否是 fourmeme 平台
-                launchpad_info = self.gmgn_api.get_token_launchpad_info('bsc', token_address)
+                launchpad_info = self.dbotx_api.get_token_launchpad_info('bsc', token_address)
                 
                 if launchpad_info is None:
                     filter_stats['non_launchpad'] += 1
-                    logger.info(f"⏭️  跳过 {token_address} (非Launchpad) 单笔{single_max:.0f}U")
+                    logger.debug(f"⏭️  {token_address[:10]}... 非Launchpad")
                     continue
                 
                 launchpad_platform = launchpad_info.get('launchpad')
                 if launchpad_platform != 'fourmeme':
                     filter_stats['other_platform'] += 1
-                    logger.info(f"⏭️  跳过 {token_address} (平台: {launchpad_platform}) 单笔{single_max:.0f}U")
+                    logger.debug(f"⏭️  {token_address[:10]}... 平台:{launchpad_platform}")
                     continue
                 
                 filter_stats['fourmeme_found'] += 1
                 
                 # 通过 fourmeme 验证，记录详细信息
-                logger.info(
-                    f"🎯 [Fourmeme] {token_address} "
-                    f"单笔{single_max:.0f}U 累计{total_sum:.0f}U 笔数{len(trades)}"
-                )
+                logger.info(f"   🎯 {token_address[:10]}... | 单笔{single_max:.0f}U 累计{total_sum:.0f}U")
                 
                 # 提前检查 Redis 冷却期（减少 API 调用）
                 cooldown_minutes = self.min_interval_seconds / 60
                 if not self.check_alert_cooldown(token_address, cooldown_minutes):
                     filter_stats['in_cooldown'] += 1
-                    logger.info(f"⏭️  跳过 {token_address} (冷却期 {self.min_interval_seconds}秒)")
+                    logger.debug(f"⏭️  {token_address[:10]}... 冷却中")
                     continue
                 
                 # 进入第二层过滤（调用 API）
@@ -334,17 +322,12 @@ class BSCMonitor:
                     launchpad_info
                 )
         
-        # 输出区块处理统计
-        elapsed = time.time() - block_start_time
+        # 单行显示过滤统计
         logger.info(
-            f"📊 区块 {block_number} 统计: "
-            f"总代币{filter_stats['total_tokens']} | "
-            f"达标{filter_stats['passed_amount']} | "
-            f"非Launch{filter_stats['non_launchpad']} | "
-            f"其他平台{filter_stats['other_platform']} | "
-            f"Fourmeme{filter_stats['fourmeme_found']} | "
-            f"冷却{filter_stats['in_cooldown']} | "
-            f"耗时{elapsed:.2f}秒"
+            f"   → 金额✓:{filter_stats['passed_amount']} "
+            f"Fourmeme:{filter_stats['fourmeme_found']} "
+            f"冷却:{filter_stats['in_cooldown']} "
+            f"🎯推送:{filter_stats['triggered']}"
         )
     
     async def apply_second_layer_filter(
@@ -368,51 +351,47 @@ class BSCMonitor:
             launchpad_info: Launchpad 信息
         """
         try:
-            # 1. 调用 GMGN API 获取代币数据
-            gmgn_data_list = self.gmgn_api.get_token_info_batch('bsc', [token_address])
-            
-            if not gmgn_data_list or len(gmgn_data_list) == 0:
-                logger.debug(f"⏭️  跳过 {token_address[:10]}... (无GMGN数据)")
+            # 1. 使用 launchpad_info 中返回的交易对地址获取详细数据
+            api_pair_address = launchpad_info.get('pair_address')
+            if not api_pair_address:
+                logger.debug(f"⏭️  跳过 {token_address[:10]}... (无交易对地址)")
                 return
             
-            # 2. 解析代币数据
-            token_data = self.gmgn_api.parse_token_data(gmgn_data_list[0])
+            # 2. 调用 DBotX API 获取代币数据
+            raw_data = self.dbotx_api.get_pair_info('bsc', api_pair_address)
+            
+            if not raw_data:
+                logger.debug(f"⏭️  跳过 {token_address[:10]}... (无DBotX数据)")
+                return
+            
+            # 3. 解析代币数据（使用1分钟实时数据）
+            token_data = self.dbotx_api.parse_token_data(raw_data)
             if not token_data:
                 logger.debug(f"⏭️  跳过 {token_address[:10]}... (解析失败)")
                 return
             
-            # 3. 计算 5分钟涨跌幅和交易量变化
-            price_5m = token_data.get('price_5m', 0)
-            price_current = token_data.get('price', 0)
-            volume_1m = token_data.get('volume_1m', 0)
-            volume_5m = token_data.get('volume_5m', 0)
+            # 4. 获取1分钟实时数据（比GMGN的5分钟数据更及时）
+            price_change_1m = token_data.get('price_change', 0)  # 1分钟涨幅（已转换为%）
+            volume_1m = token_data.get('volume', 0)  # 1分钟交易量
             
-            # 价格变化百分比（当前价格相对于5分钟前）
-            if price_5m and price_5m > 0:
-                price_change_5m = ((price_current - price_5m) / price_5m) * 100
-            else:
-                price_change_5m = 0
-            
-            # 交易量变化百分比（1分钟交易量相对于5分钟交易量）
-            # volume_1m 是最近1分钟的交易量
-            # volume_5m 是5分钟前的交易量
-            # (volume_1m - volume_5m) / volume_5m * 100 = 交易量涨跌幅
-            if volume_5m and volume_5m > 0:
-                volume_change_percent = ((volume_1m - volume_5m) / volume_5m) * 100
-            else:
-                volume_change_percent = 0
-            
-            # 构造 stats5m 数据（用于 TriggerLogic 评估）
+            # 构造 stats 数据（用于 TriggerLogic 评估）
             stats = {
-                'priceChange': price_change_5m,
-                'volume': volume_5m,
-                'holderChange': 0  # GMGN API 没有提供 5m holder 变化，默认 0
+                'priceChange': price_change_1m,
+                'volume': volume_1m,
+                'holderChange': 0  # 暂不使用持有者变化
             }
             
             # 4. 判断是否满足 events_config
             if not self.events_config:
                 logger.debug("⏭️  跳过 (无events_config)")
                 return
+            
+            symbol = token_data.get('symbol', 'Unknown')
+            logger.info(f"")
+            logger.info(f"🔎 [DBotX 指标检查] {symbol} ({token_address[:10]}...)")
+            logger.info(f"   ├─ 1分钟涨幅: {price_change_1m:+.2f}%")
+            logger.info(f"   ├─ 1分钟交易量: ${volume_1m:,.2f}")
+            logger.info(f"   └─ 5分钟涨幅: {token_data.get('price_5m', 0):+.2f}% (参考)")
             
             # 使用 TriggerLogic 评估触发条件
             trigger_logic = self.global_config.get('trigger_logic', 'any') if self.global_config else 'any'
@@ -421,15 +400,14 @@ class BSCMonitor:
             )
             
             if not should_trigger:
-                logger.info(
-                    f"⏭️  跳过 {token_address} (未达指标) "
-                    f"涨幅{price_change_5m:.1f}% 量变{volume_change_percent:.1f}%"
-                )
+                logger.info(f"   ❌ 未达到触发条件")
+                logger.info("")
                 return
             
             # 5. 满足条件，准备推送
-            symbol = token_data.get('symbol', 'Unknown')
-            logger.info(f"🚨 [触发推送] {symbol} {token_address} (事件数: {len(triggered_events)})")
+            logger.info(f"   ✅ 满足条件！触发 {len(triggered_events)} 个事件")
+            logger.info(f"")
+            logger.info(f"🚨 [准备推送] {symbol} | 单笔${single_max:.0f} | 累计${total_sum:.0f}")
             
             # 发送推送（包含数据库、WebSocket、TG）
             await self.send_bsc_alert(
@@ -671,11 +649,11 @@ class BSCMonitor:
             # 构建推送原因（仅第二层触发原因）
             alert_reasons = [e.description for e in triggered_events]
             
-            # 获取额外的 Token 数据
-            price_change = token_data.get('price_5m_change_percent', 0)
-            volume_24h = token_data.get('volume', 0)
+            # 获取额外的 Token 数据（DBotX API）
+            price_change = token_data.get('price_1m', 0)  # 1分钟涨幅
+            volume_24h = token_data.get('volume_24h', 0)  # 24小时交易量
             holders = token_data.get('holder_count', 0)
-            market_cap = token_data.get('market_cap', 0) or token_data.get('liquidity', 0)
+            market_cap = token_data.get('market_cap', 0)
             logo = token_data.get('logo', '')
             
             # 1. 数据库写入 + WebSocket 推送
@@ -700,8 +678,11 @@ class BSCMonitor:
                 logger.error(f"❌ 数据库写入失败: {symbol}")
                 return
             
+            logger.info(f"✅ [数据库] 写入成功 | WebSocket 已推送")
+            
             # 设置 Redis 冷却期
             self.update_alert_history(token_address)
+            logger.info(f"🔒 [冷却期] 已设置 {self.min_interval_seconds}秒冷却期")
             
             # 2. Telegram 推送
             if self.enable_telegram:
@@ -734,11 +715,15 @@ class BSCMonitor:
                     )
                     
                     if tg_success:
-                        logger.info(f"✅ 推送完成: {symbol} ({token_address}) -> TG频道")
+                        logger.info(f"✅ [Telegram] 推送成功 -> BSC 频道")
+                        logger.info(f"")
+                        logger.info(f"🎉 [完成] {symbol} 推送流程已全部完成！")
+                        logger.info("=" * 80)
+                        logger.info("")
                     else:
-                        logger.warning(f"⚠️  TG推送失败: {symbol} ({token_address})")
+                        logger.warning(f"⚠️  [Telegram] 推送失败")
                 except Exception as e:
-                    logger.warning(f"⚠️  TG推送异常 {token_address}: {e}")
+                    logger.warning(f"⚠️  [Telegram] 推送异常: {e}")
         
         except Exception as e:
             logger.error(f"发送推送通知失败: {e}")
@@ -788,16 +773,12 @@ class BSCMonitor:
         """
         # 解析 launchpad 信息
         launchpad_status = launchpad_info.get('launchpad_status', 0)
-        launchpad_progress = float(launchpad_info.get('launchpad_progress', 0))
         
         # 判断内外盘
         if launchpad_status == 0:
-            pool_status = "🔴 内盘"
+            pool_status = "🔴 Fourmeme内盘"
         else:
-            pool_status = "🟢 外盘"
-        
-        # 进度百分比
-        progress_percent = launchpad_progress * 100
+            pool_status = "🟢 已迁移外盘"
         
         # 格式化数字（使用 K/M 后缀）
         single_max_str = self.format_number(single_max)
@@ -813,7 +794,7 @@ class BSCMonitor:
 📊 <b>实时数据</b>
 💵 当前价格: ${price_usdt:.5f} USDT
 💎 市值: ${market_cap_str}
-🏊 状态: {pool_status} | 进度: {progress_percent:.1f}%
+🏊 状态: {pool_status}
 🏦 交易对: {pair_address[:10]}...
 
 📉 <b>交易数据</b>

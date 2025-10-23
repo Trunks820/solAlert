@@ -75,11 +75,20 @@ class AlertRecorder:
             trigger_events_json = json.dumps(trigger_events, ensure_ascii=False)
             stats_data_json = json.dumps(stats_data, ensure_ascii=False)
             
-            # SQL插入语句
+            # 从 stats_data 中提取 market_cap 和 chain_type
+            market_cap = stats_data.get('marketCap') or stats_data.get('market_cap')
+            chain_type = stats_data.get('chain')  # 必须明确提供，不设默认值
+            
+            # 如果没有提供 chain 字段，记录警告并跳过
+            if not chain_type:
+                logger.warning(f"⚠️ stats_data 中缺少 'chain' 字段，无法保存预警记录: {ca[:10]}...")
+                return False
+            
+            # SQL插入语句（添加 market_cap 和 chain_type 字段）
             sql = """
             INSERT INTO token_monitor_alert_log 
-            (config_id, ca, token_name, token_symbol, trigger_time, trigger_events, stats_data, notify_methods, notify_status, create_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (config_id, ca, token_name, token_symbol, trigger_time, trigger_events, stats_data, notify_methods, notify_status, market_cap, chain_type, create_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             
             # 执行插入
@@ -93,6 +102,8 @@ class AlertRecorder:
                 stats_data_json,
                 notify_methods,
                 'success',  # 通知状态
+                market_cap,
+                chain_type,
                 trigger_time
             ))
             

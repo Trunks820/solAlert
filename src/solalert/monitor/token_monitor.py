@@ -310,6 +310,15 @@ class TokenMonitorEngine:
             # 转换stats数据为JSON（保留中文字符）
             stats_json = json.dumps(stats_data, ensure_ascii=False)
             
+            # 从 stats_data 中提取 market_cap 和 chain_type
+            market_cap = stats_data.get('marketCap') or stats_data.get('market_cap')
+            chain_type = stats_data.get('chain')  # 必须明确提供，不设默认值
+            
+            # 如果没有提供 chain 字段，记录警告并跳过
+            if not chain_type:
+                logger.warning(f"⚠️ stats_data 中缺少 'chain' 字段，无法保存预警记录: {ca[:10]}...")
+                return False
+            
             # 判断通知状态
             if all(notify_results.values()):
                 notify_status = "success"
@@ -324,14 +333,14 @@ class TokenMonitorEngine:
             sql = """
             INSERT INTO token_monitor_alert_log
             (config_id, ca, token_name, token_symbol, trigger_time,
-             trigger_events, stats_data, notify_methods, notify_status, notify_error)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             trigger_events, stats_data, notify_methods, notify_status, notify_error, market_cap, chain_type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             
             params = (
                 config_id, ca, token_name, token_symbol, datetime.now(),
                 trigger_events_json, stats_json, notify_methods,
-                notify_status, notify_error
+                notify_status, notify_error, market_cap, chain_type
             )
             
             rowcount = self.db.execute_update(sql, params)
