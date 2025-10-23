@@ -1,0 +1,293 @@
+"""
+DBotX API 客户端
+用于获取 Token 的实时价格、交易量、持有人数等数据
+相比 GMGN API 更稳定（使用 API Key 而非 Cookie）
+"""
+import logging
+from typing import Dict, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
+
+
+class DBotXAPI:
+    """DBotX API 客户端"""
+    
+    def __init__(self, api_key: str = "i1o3elfavv59ds02fggj9rsd0eg8w657"):
+        self.base_url = "https://api-data-v1.dbotx.com"
+        self.api_key = api_key
+        self.session = self._create_session()
+    
+    def _create_session(self) -> requests.Session:
+        """创建带重试机制的 session"""
+        session = requests.Session()
+        
+        # 禁用 SSL 证书验证（解决本地环境证书问题）
+        session.verify = False
+        
+        # 禁用 SSL 警告
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        
+        return session
+    
+    def search_pairs(self, token_address: str) -> Optional[Dict]:
+        """
+        搜索代币的所有交易对，返回交易量最大的交易对信息
+        
+        Args:
+            token_address: 代币地址
+        
+        Returns:
+            交易量最大的交易对信息字典（包含 _id, poolType, currencyReserve, isLaunchMigration 等），失败返回 None
+        """
+        try:
+            url = f"{self.base_url}/kline/search"
+            
+            params = {
+                'keyword': token_address.lower()
+            }
+            
+            headers = {
+                'x-api-key': self.api_key
+            }
+            
+            response = self.session.get(url, params=params, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('err') is False and data.get('res'):
+                    pairs = data['res']
+                    if len(pairs) > 0:
+                        # 第一个就是交易量最大的
+                        largest_pair = pairs[0]
+                        pair_id = largest_pair.get('_id') or largest_pair.get('id')
+                        volume_24h = largest_pair.get('buyAndSellVolume24h', 0)
+                        pool_type = largest_pair.get('poolType', '')
+                        currency_reserve = largest_pair.get('currencyReserve', 0)
+                        
+                        logger.debug(
+                            f"✅ 找到最大交易对: {pair_id[:10]}... "
+                            f"(24h: ${volume_24h:,.0f}, 池: {pool_type}, 储备: {currency_reserve:.2f})"
+                        )
+                        
+                        # 返回完整信息（用于判断内外盘）
+                        return {
+                            'pair_address': pair_id,
+                            'pool_type': pool_type,
+                            'currency_reserve': currency_reserve or 0,
+                            'is_launch_migration': largest_pair.get('isLaunchMigration', False),
+                            'volume_24h': volume_24h
+                        }
+                    else:
+                        logger.debug(f"⚠️  未找到交易对")
+                        return None
+                else:
+                    logger.debug(f"⚠️  Search API 返回错误: {data}")
+                    return None
+            
+            else:
+                logger.warning(f"⚠️  Search API HTTP错误 {response.status_code}")
+                return None
+        
+        except Exception as e:
+            logger.warning(f"⚠️  Search API 请求失败: {e}")
+            return None
+    
+    def get_pair_info(self, chain: str, pair_address: str) -> Optional[Dict]:
+        """
+        获取交易对信息
+        
+        Args:
+            chain: 链名称（如 'bsc', 'sol'）
+            pair_address: 交易对地址
+        
+        Returns:
+            交易对信息字典，失败返回 None
+        """
+        try:
+            url = f"{self.base_url}/kline/pair_info"
+            
+            params = {
+                'chain': chain.lower(),
+                'pair': pair_address.lower()
+            }
+            
+            headers = {
+                'x-api-key': self.api_key
+            }
+            
+            response = self.session.get(url, params=params, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('err') is False and data.get('res'):
+                    logger.debug(f"✅ DBotX API 成功: {pair_address[:10]}...")
+                    return data['res']
+                else:
+                    logger.debug(f"⚠️  DBotX API 返回错误: {data}")
+                    return None
+            
+            else:
+                logger.warning(f"⚠️  DBotX API HTTP错误 {response.status_code}")
+                return None
+        
+        except Exception as e:
+            logger.warning(f"⚠️  DBotX API 请求失败: {e}")
+            return None
+    
+    def get_token_launchpad_info(self, chain: str, token_address: str) -> Optional[Dict]:
+        """
+        获取代币 Launchpad 信息
+        
+        Args:
+            chain: 链名称
+            token_address: 代币地址
+        
+        Returns:
+            Launchpad 信息：{'launchpad': 'fourmeme', 'pair_address': '0x...', 'launchpad_status': 0/1, ...}
+        """
+        try:
+            # 1. 先搜索获取交易量最大的交易对信息
+            pair_info = self.search_pairs(token_address)
+            
+            if not pair_info:
+                return None
+            
+            # 提取关键信息
+            pair_address = pair_info.get('pair_address')
+            pool_type = pair_info.get('pool_type', '').lower()
+            currency_reserve = pair_info.get('currency_reserve', 0)
+            is_launch_migration = pair_info.get('is_launch_migration', False)
+            
+            # 2. 用交易对地址查询详细信息（获取更多数据）
+            detailed_info = self.get_pair_info(chain, pair_address)
+            
+            if not detailed_info:
+                return None
+            
+            # 提取 preDex 信息
+            pre_dex = detailed_info.get('preDex', '').lower()
+            
+            # 判断是否是 fourmeme
+            if pool_type == 'fourmeme' or pre_dex == 'fourmeme':
+                # 判断内外盘：
+                # 1. pool_type == 'fourmeme' && currencyReserve < 18 → 内盘 (status=0)
+                # 2. 其他情况 → 外盘 (status=1)
+                launchpad_status = 0 if (pool_type == 'fourmeme' and currency_reserve < 18) else 1
+                
+                logger.debug(
+                    f"Fourmeme 判断: pool={pool_type}, reserve={currency_reserve:.2f} → "
+                    f"{'内盘' if launchpad_status == 0 else '外盘'}"
+                )
+                
+                return {
+                    'launchpad': 'fourmeme',
+                    'poolType': pool_type,
+                    'preDex': pre_dex,
+                    'pair_address': pair_address,
+                    'launchpad_status': launchpad_status,  # 0=内盘, 1=外盘
+                    'currency_reserve': currency_reserve,
+                    'is_launch_migration': is_launch_migration
+                }
+            
+            # 其他平台
+            if pool_type or pre_dex:
+                return {
+                    'launchpad': pool_type or pre_dex,
+                    'poolType': pool_type,
+                    'preDex': pre_dex,
+                    'pair_address': pair_address,
+                    'launchpad_status': 1  # 非 fourmeme 默认为外盘
+                }
+            
+            return None
+        
+        except Exception as e:
+            logger.debug(f"解析 Launchpad 信息失败: {e}")
+            return None
+    
+    def parse_token_data(self, raw_data: Dict) -> Optional[Dict]:
+        """
+        解析 DBotX API 返回的代币数据
+        
+        Args:
+            raw_data: API 返回的原始数据
+        
+        Returns:
+            标准化的代币数据字典
+        """
+        try:
+            # 使用1分钟数据（更实时）
+            price_change_1m = raw_data.get('priceChange1m', 0) * 100  # 转换为百分比
+            volume_1m = raw_data.get('buyAndSellVolume1m', 0)
+            
+            # 也保留其他时间段数据作为参考
+            price_change_5m = raw_data.get('priceChange5m', 0) * 100
+            volume_5m = raw_data.get('buyAndSellVolume5m', 0)
+            
+            return {
+                'address': raw_data.get('token', ''),
+                'symbol': raw_data.get('symbol', 'Unknown'),
+                'name': raw_data.get('name', 'Unknown'),
+                'price': raw_data.get('tokenPriceUsd', 0),
+                
+                # 主要使用1分钟数据
+                'price_change': price_change_1m,
+                'volume': volume_1m,
+                
+                # 保留各时间段数据
+                'price_1m': price_change_1m,
+                'price_5m': price_change_5m,
+                'price_1h': raw_data.get('priceChange1h', 0) * 100,
+                'price_24h': raw_data.get('priceChange24h', 0) * 100,
+                
+                'volume_1m': volume_1m,
+                'volume_5m': volume_5m,
+                'volume_1h': raw_data.get('buyAndSellVolume1h', 0),
+                'volume_24h': raw_data.get('buyAndSellVolume24h', 0),
+                
+                # 交易次数
+                'buy_count_1m': raw_data.get('buyTimes1m', 0),
+                'sell_count_1m': raw_data.get('sellTimes1m', 0),
+                'buy_count_24h': raw_data.get('buyTimes24h', 0),
+                'sell_count_24h': raw_data.get('sellTimes24h', 0),
+                
+                # 市值和流动性
+                'market_cap': raw_data.get('marketCap', 0),
+                'liquidity': raw_data.get('marketCap', 0),
+                
+                # 持有者信息
+                'holder_count': raw_data.get('holders', 0),
+                'top10_holder_rate': raw_data.get('safetyInfo', {}).get('top10HolderRate', 0),
+                
+                # 安全信息
+                'is_honeypot': raw_data.get('safetyInfo', {}).get('isHoneypot', False),
+                'is_open_source': raw_data.get('safetyInfo', {}).get('isOpenSource', False),
+                'can_mint': raw_data.get('safetyInfo', {}).get('canMint', False),
+                'is_proxy': raw_data.get('safetyInfo', {}).get('isProxy', False),
+                
+                # 图标
+                'logo': raw_data.get('image', ''),
+            }
+        
+        except Exception as e:
+            logger.error(f"解析代币数据失败: {e}")
+            return None
+
