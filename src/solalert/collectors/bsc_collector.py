@@ -63,6 +63,10 @@ class BSCBlockCollector:
         self.symbol_cache: Dict[str, Tuple[str, str]] = {}  # token -> (symbol, name)
         self.reserve_snapshot: Dict[str, Tuple[int, int, int]] = {}  # pair -> (ts, r0, r1)
         
+        # 🔥 WBNB/USDT 价格缓存（避免频繁 RPC 调用）
+        self.wbnb_usdt_price_cache: Optional[Tuple[int, float]] = None  # (timestamp, price)
+        self.wbnb_usdt_price_ttl = 30  # 缓存 30 秒
+        
         # 时间窗口数据
         self.reserve_fresh_seconds = config.get('reserve_fresh_seconds', 15)
         
@@ -315,11 +319,20 @@ class BSCBlockCollector:
     
     def get_wbnb_usdt_price(self) -> float:
         """
-        获取 WBNB/USDT 价格（从参考池）
+        获取 WBNB/USDT 价格（从参考池，带缓存避免频繁 RPC 调用）
         
         Returns:
             1 WBNB = ??? USDT
         """
+        now = int(time.time())
+        
+        # 🔥 检查缓存是否有效
+        if self.wbnb_usdt_price_cache:
+            cache_ts, cached_price = self.wbnb_usdt_price_cache
+            if now - cache_ts < self.wbnb_usdt_price_ttl:
+                return cached_price
+        
+        # 缓存失效或不存在，从链上获取
         try:
             token0, token1 = self.get_token0_token1(self.usdt_wbnb_pair)
             reserve0, reserve1 = self.get_reserves(self.usdt_wbnb_pair)
@@ -334,14 +347,25 @@ class BSCBlockCollector:
             qty1 = reserve1 / (10 ** decimals1)
             
             # 判断哪个是 USDT，哪个是 WBNB
+            price = 0.0
             if token0 == self.usdt_address and token1 == self.wbnb_address:
-                return qty0 / qty1 if qty1 > 0 else 0.0
+                price = qty0 / qty1 if qty1 > 0 else 0.0
             elif token0 == self.wbnb_address and token1 == self.usdt_address:
-                return qty1 / qty0 if qty0 > 0 else 0.0
+                price = qty1 / qty0 if qty0 > 0 else 0.0
             
-            return 0.0
+            # 🔥 更新缓存
+            if price > 0:
+                self.wbnb_usdt_price_cache = (now, price)
+                logger.debug(f"💰 WBNB 价格缓存已更新: ${price:.2f}")
+            
+            return price
         except Exception as e:
             logger.error(f"获取 WBNB/USDT 价格失败: {e}")
+            # 如果有旧缓存，即使过期也返回（降级策略）
+            if self.wbnb_usdt_price_cache:
+                _, old_price = self.wbnb_usdt_price_cache
+                logger.warning(f"⚠️ 使用过期缓存价格: ${old_price:.2f}")
+                return old_price
             return 0.0
     
     def quote_to_usdt(self, quote_token: str, amount: float) -> float:
