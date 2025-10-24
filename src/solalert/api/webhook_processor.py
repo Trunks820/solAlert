@@ -9,16 +9,22 @@ logger = logging.getLogger(__name__)
 
 
 class AlchemyWebhookProcessor:
-    """Alchemy Webhook 数据处理器"""
+    """Alchemy Webhook 数据处理器（支持外盘+Fourmeme内盘）"""
     
     # PancakeSwap V2/V3 常量
     TOPIC_V2_SWAP = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822'
     TOPIC_V3_SWAP = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67'
     
+    # ERC20 Transfer 事件
+    TOPIC_TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+    
     # 代币地址
     USDT_ADDRESS = '0x55d398326f99059ff775485246999027b3197955'.lower()
     WBNB_ADDRESS = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'.lower()
     USDT_WBNB_PAIR = '0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae'.lower()
+    
+    # Fourmeme 内盘
+    FOURMEME_PROXY = '0x5c952063c7fc8610ffdb798152d69f0b9550762b'.lower()
     
     def __init__(self, bsc_collector):
         """
@@ -274,6 +280,135 @@ class AlchemyWebhookProcessor:
             logger.debug(f"处理 Swap log 失败: {e}")
             return None
     
+    def parse_transfer_event(self, log: Dict) -> Optional[Dict]:
+        """
+        解析 Transfer 事件
+        
+        Returns:
+            {'from': str, 'to': str, 'value': int, 'token': str} 或 None
+        """
+        topics = log.get('topics', [])
+        if len(topics) != 3:
+            return None
+        
+        from_addr = "0x" + topics[1][-40:]
+        to_addr = "0x" + topics[2][-40:]
+        token = log.get('address', '').lower()
+        data = log.get('data', '0x')
+        
+        try:
+            value = int(data[2:], 16) if len(data) > 2 else 0
+        except:
+            value = 0
+        
+        return {
+            'from': from_addr.lower(),
+            'to': to_addr.lower(),
+            'value': value,
+            'token': token
+        }
+    
+    def is_fourmeme_internal(self, logs: List[Dict]) -> bool:
+        """
+        判断是否是 Fourmeme 内盘交易
+        只要 logs 里出现过 Fourmeme Proxy 地址，就认为是内盘
+        """
+        for log in logs:
+            if log.get('address', '').lower() == self.FOURMEME_PROXY:
+                return True
+        return False
+    
+    def process_fourmeme_internal(self, log: Dict, all_transfers: List[Dict], tx_info: Dict) -> Optional[Dict]:
+        """
+        处理 Fourmeme 内盘交易
+        
+        Args:
+            log: 当前日志
+            all_transfers: 所有 Transfer 事件
+            tx_info: 交易信息 (包含 from, value)
+        
+        Returns:
+            事件字典或 None
+        """
+        try:
+            # 1. 获取交易发起人
+            tx_from = tx_info.get('from', {}).get('address', '').lower()
+            if not tx_from:
+                return None
+            
+            # 2. 获取基准币金额（BNB from tx.value, or USDT/WBNB from Transfer）
+            # 注意：这里的 log 可能不是 Transfer，需要从 all_transfers 中查找
+            
+            # 先尝试 USDT
+            usdt_to_proxy = sum(
+                t['value'] for t in all_transfers
+                if t['token'] == self.USDT_ADDRESS and t['to'] == self.FOURMEME_PROXY
+            )
+            
+            if usdt_to_proxy > 0:
+                base_symbol = "USDT"
+                base_amount_wei = usdt_to_proxy
+                base_decimals = 18
+            else:
+                # 尝试 WBNB
+                wbnb_to_proxy = sum(
+                    t['value'] for t in all_transfers
+                    if t['token'] == self.WBNB_ADDRESS and t['to'] == self.FOURMEME_PROXY
+                )
+                
+                if wbnb_to_proxy > 0:
+                    base_symbol = "WBNB"
+                    base_amount_wei = wbnb_to_proxy
+                    base_decimals = 18
+                else:
+                    # 没有找到 USDT/WBNB 转账，可能是 BNB（需要从 tx.value 获取）
+                    # 这里暂时跳过，因为 webhook log 没有 tx.value
+                    return None
+            
+            # 3. 找出目标代币（流向用户的非基准币）
+            target_transfer = None
+            for t in all_transfers:
+                if (t['to'] == tx_from and 
+                    t['token'] not in (self.USDT_ADDRESS, self.WBNB_ADDRESS)):
+                    if target_transfer is None or t['value'] > target_transfer['value']:
+                        target_transfer = t
+            
+            if not target_transfer:
+                return None
+            
+            # 4. 计算 USDT 价值
+            base_amount = base_amount_wei / (10 ** base_decimals)
+            
+            if base_symbol == "USDT":
+                usdt_value = base_amount
+            elif base_symbol == "WBNB":
+                usdt_value = base_amount * self.wbnb_usdt_price
+            else:
+                return None
+            
+            # 5. 只处理买入（USDT/WBNB 进池，代币流向用户）
+            if usdt_value <= 0:
+                return None
+            
+            # 6. 构造事件
+            event = {
+                'tx_hash': tx_info.get('hash', ''),
+                'pair_address': self.FOURMEME_PROXY,  # 内盘用 Proxy 地址
+                'base_token': target_transfer['token'],
+                'quote_token': self.USDT_ADDRESS if base_symbol == "USDT" else self.WBNB_ADDRESS,
+                'usdt_value': usdt_value,
+                'is_buy': True,
+                'is_fourmeme_internal': True  # 标记为内盘
+            }
+            
+            logger.debug(f"🟡 Fourmeme 内盘: {event['base_token'][:10]}... | ${usdt_value:.2f}")
+            
+            return event
+        
+        except Exception as e:
+            logger.debug(f"处理 Fourmeme 内盘失败: {e}")
+            return None
+    
     def process_webhook_data(self, webhook_data: Dict) -> List[Dict]:
         """
         处理完整的 webhook 数据
@@ -305,35 +440,68 @@ class AlchemyWebhookProcessor:
             stats = {
                 'total_logs': len(logs),
                 'v2_swaps': 0,
-                'non_target_pairs': 0,
-                'sell_trades': 0,
+                'fourmeme_internal': 0,
                 'buy_trades': 0,
-                'low_value': 0
             }
             
-            # 处理所有 logs
-            events = []
+            # 1️⃣ 先解析所有 Transfer 事件（用于 Fourmeme 内盘）
+            all_transfers = []
             for log in logs:
-                # 统计 V2 Swap
                 topics = log.get('topics', [])
-                if topics and topics[0].lower() == self.TOPIC_V2_SWAP:
-                    stats['v2_swaps'] += 1
+                if topics and topics[0].lower() == self.TOPIC_TRANSFER:
+                    transfer = self.parse_transfer_event(log)
+                    if transfer:
+                        all_transfers.append(transfer)
+            
+            # 2️⃣ 检查是否是 Fourmeme 内盘交易
+            is_fourmeme = self.is_fourmeme_internal(logs)
+            
+            # 3️⃣ 处理所有 logs
+            events = []
+            processed_txs = set()  # 防止同一笔交易重复处理
+            
+            for log in logs:
+                topics = log.get('topics', [])
+                if not topics:
+                    continue
                 
-                event_result = self.process_swap_log(log, block_number, timestamp)
-                if event_result:
-                    stats['buy_trades'] += 1
-                    events.append(event_result)
+                topic0 = topics[0].lower()
+                tx_info = log.get('transaction', {})
+                tx_hash = tx_info.get('hash', '')
+                
+                # 如果是 Fourmeme 内盘，使用内盘处理逻辑
+                if is_fourmeme:
+                    # 只处理一次每个交易（避免重复）
+                    if tx_hash and tx_hash not in processed_txs:
+                        event_result = self.process_fourmeme_internal(log, all_transfers, tx_info)
+                        if event_result:
+                            stats['fourmeme_internal'] += 1
+                            stats['buy_trades'] += 1
+                            events.append(event_result)
+                            processed_txs.add(tx_hash)
+                
+                # 外盘：处理标准 V2 Swap
+                elif topic0 == self.TOPIC_V2_SWAP:
+                    stats['v2_swaps'] += 1
+                    event_result = self.process_swap_log(log, block_number, timestamp)
+                    if event_result:
+                        stats['buy_trades'] += 1
+                        events.append(event_result)
             
             # 打印详细统计
             logger.info(f"📊 [Processor] 区块 #{block_number} 处理结果:")
             logger.info(f"   └─ 总 Logs: {stats['total_logs']}")
-            logger.info(f"   └─ V2 Swap: {stats['v2_swaps']}")
-            logger.info(f"   └─ 目标交易对: {stats['buy_trades']} 个（USDT/WBNB + 买入）")
+            if is_fourmeme:
+                logger.info(f"   └─ 🟡 Fourmeme 内盘: {stats['fourmeme_internal']} 笔")
+            else:
+                logger.info(f"   └─ 🟢 V2 Swap (外盘): {stats['v2_swaps']}")
+            logger.info(f"   └─ 目标交易: {stats['buy_trades']} 个")
             
             if stats['buy_trades'] > 0:
                 # 显示每个目标交易的详情
                 for i, evt in enumerate(events, 1):
-                    logger.info(f"   └─ [{i}] {evt['base_token'][:10]}... | ${evt['usdt_value']:.2f} USDT")
+                    pool_type = "🟡内盘" if evt.get('is_fourmeme_internal') else "🟢外盘"
+                    logger.info(f"   └─ [{i}] {pool_type} {evt['base_token'][:10]}... | ${evt['usdt_value']:.2f} USDT")
             
             return events
         
