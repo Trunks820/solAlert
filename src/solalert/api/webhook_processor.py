@@ -472,37 +472,23 @@ class AlchemyWebhookProcessor:
                     base_amount_wei = wbnb_to_proxy
                     base_decimals = 18
                 else:
-                    # BNB 买入：GraphQL 的 transaction 没有 value 字段
-                    # 尽量推断目标代币（✅ 必须 from=Proxy）
-                    cand = {}
-                    for t in all_transfers:
-                        if (t['from'] == self.FOURMEME_PROXY and
-                            t['to'] == tx_from and 
-                            t['token'] not in (self.USDT_ADDRESS, self.WBNB_ADDRESS)):
-                            cand[t['token']] = cand.get(t['token'], 0) + t['value']
+                    # BNB 买入：尝试从 tx.value 获取原生 BNB 金额
+                    tx_value_hex = tx_info.get('value', '0x0')
+                    try:
+                        bnb_wei = int(tx_value_hex, 16) if isinstance(tx_value_hex, str) else int(tx_value_hex or 0)
+                    except:
+                        bnb_wei = 0
                     
-                    target_token = max(cand.items(), key=lambda kv: kv[1])[0] if cand else None
-                    
-                    # 计算目标币数量
-                    if target_token:
-                        target_decimals = self.get_decimals_cached(target_token)
-                        target_amount = cand[target_token] / (10 ** target_decimals)
+                    if bnb_wei > 0:
+                        # 有 BNB 金额，使用 WBNB 价格计算
+                        base_symbol = "BNB"
+                        base_amount_wei = bnb_wei
+                        base_decimals = 18
+                        logger.debug(f"🟡 Fourmeme BNB 买入: {bnb_wei / 1e18:.4f} BNB")
                     else:
-                        target_amount = 0.0
-                    
-                    logger.debug(f"🟡 Fourmeme BNB 买入（金额待回填）: {self._short(target_token)}")
-                    return {
-                        'tx_hash': tx_info.get('hash', ''),
-                        'pair_address': self.FOURMEME_PROXY,
-                        'base_token': target_token,  # ✅ 尽量填充
-                        'base_token_amount': target_amount,
-                        'base_token_amount_wei': int(cand.get(target_token, 0)) if target_token else 0,
-                        'quote_token': self.WBNB_ADDRESS,  # BNB 视为 WBNB
-                        'usdt_value': 0.0,  # 金额待回填
-                        'is_buy': True,
-                        'is_fourmeme_internal': True,
-                        'note': 'BUY_NATIVE_NO_VALUE'  # 标注待处理
-                    }
+                        # 完全没有基准币，跳过
+                        logger.debug(f"🟡 Fourmeme 交易：无 USDT/WBNB/BNB，跳过")
+                        return None
             
             # 3. 找出目标代币（来自 Proxy → 用户的非基准币，聚合求和）
             # ✅ 必须 from=Proxy，避免空投/转账误判
@@ -529,9 +515,11 @@ class AlchemyWebhookProcessor:
             
             if base_symbol == "USDT":
                 usdt_value = base_amount
-            elif base_symbol == "WBNB":
+            elif base_symbol in ("WBNB", "BNB"):
+                # WBNB 和 BNB 使用相同价格
                 usdt_value = base_amount * self.wbnb_usdt_price
             else:
+                logger.warning(f"未知基准币: {base_symbol}")
                 return None
             
             # 5. 只处理买入（USDT/WBNB 进池，代币流向用户）
@@ -539,13 +527,21 @@ class AlchemyWebhookProcessor:
                 return None
             
             # 6. 构造事件（需要添加 block_number 和 timestamp）
+            # 确定 quote_token
+            if base_symbol == "USDT":
+                quote_token = self.USDT_ADDRESS
+            elif base_symbol in ("WBNB", "BNB"):
+                quote_token = self.WBNB_ADDRESS
+            else:
+                quote_token = self.USDT_ADDRESS  # 默认
+            
             event = {
                 'tx_hash': tx_info.get('hash', ''),
                 'pair_address': self.FOURMEME_PROXY,  # 内盘用 Proxy 地址
                 'base_token': target_token,
                 'base_token_amount': target_amount,
                 'base_token_amount_wei': int(target_amount_wei),
-                'quote_token': self.USDT_ADDRESS if base_symbol == "USDT" else self.WBNB_ADDRESS,
+                'quote_token': quote_token,
                 'usdt_value': usdt_value,
                 'is_buy': True,
                 'is_fourmeme_internal': True,  # 标记为内盘
