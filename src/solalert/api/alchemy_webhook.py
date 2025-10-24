@@ -346,7 +346,7 @@ async def start_webhook_server_async(host: str = "0.0.0.0", port: int = 8001):
         workers=1,                 # 单进程（2核4G 够用，省内存）
         backlog=4096,              # 队列大小（匹配系统 somaxconn）
         timeout_keep_alive=75,     # 保持连接（默认值）
-        limit_concurrency=100,     # 限制并发连接数（防止过载）
+        limit_concurrency=500,     # 限制并发连接数（提高到 500）
         limit_max_requests=10000,  # 10k 请求后重启 worker（防止内存泄漏）
         # === 性能优化 ===
         log_level="warning",       # 只记录警告和错误
@@ -393,7 +393,7 @@ def start_webhook_server(host: str = "0.0.0.0", port: int = 8001):
             workers=1,                 # 单进程（2核4G 够用，省内存）
             backlog=4096,              # 队列大小（匹配系统 somaxconn）
             timeout_keep_alive=75,     # 保持连接（默认值）
-            limit_concurrency=100,     # 限制并发连接数（防止过载）
+            limit_concurrency=500,     # 限制并发连接数（提高到 500）
             limit_max_requests=10000,  # 10k 请求后重启 worker（防止内存泄漏）
             # === 性能优化 ===
             log_level="warning",       # 只记录警告和错误
