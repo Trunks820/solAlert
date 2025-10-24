@@ -83,6 +83,52 @@ class TelegramAPI:
         return str(chat_id)
     
     @classmethod
+    def _convert_reply_markup_to_buttons_array(cls, reply_markup: InlineKeyboardMarkup) -> List[List[Dict[str, str]]]:
+        """
+        将 InlineKeyboardMarkup 转换为按钮数组格式（适用于后端 HTTP API）
+        
+        后端 API 需要的格式:
+        [
+            [{"text": "按钮1", "url": "https://..."}, {"text": "按钮2", "url": "https://..."}],
+            [{"text": "按钮3", "callback_data": "data"}]
+        ]
+        
+        Args:
+            reply_markup: InlineKeyboardMarkup 对象
+            
+        Returns:
+            二维数组格式的按钮数据
+        """
+        if not reply_markup:
+            return []
+        
+        # 提取按钮数据（转换为二维数组）
+        buttons_array = []
+        for row in reply_markup.inline_keyboard:
+            button_row = []
+            for button in row:
+                button_data = {
+                    'text': button.text
+                }
+                
+                # 添加按钮动作（URL、callback_data 等）
+                if button.url:
+                    button_data['url'] = button.url
+                elif button.callback_data:
+                    button_data['callback_data'] = button.callback_data
+                elif button.switch_inline_query:
+                    button_data['switch_inline_query'] = button.switch_inline_query
+                elif button.switch_inline_query_current_chat:
+                    button_data['switch_inline_query_current_chat'] = button.switch_inline_query_current_chat
+                
+                button_row.append(button_data)
+            
+            if button_row:
+                buttons_array.append(button_row)
+        
+        return buttons_array
+    
+    @classmethod
     async def send_message(
         cls,
         chat_id: Union[str, int],
@@ -135,9 +181,13 @@ class TelegramAPI:
             if topic_id:
                 payload["message_thread_id"] = topic_id
             
-            # 如果有按钮，记录警告（HTTP API 暂不支持）
+            # 如果有按钮，转换为后端 API 需要的 buttons 数组格式
             if reply_markup:
-                logger.warning("⚠️ HTTP API 模式暂不支持按钮，将忽略 reply_markup 参数")
+                try:
+                    buttons_array = cls._convert_reply_markup_to_buttons_array(reply_markup)
+                    payload["buttons"] = buttons_array
+                except Exception as e:
+                    logger.warning(f"⚠️ 按钮转换失败: {e}")
             
             # 使用信号量限制并发
             async with cls._semaphore:

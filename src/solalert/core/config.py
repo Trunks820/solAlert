@@ -225,6 +225,10 @@ BSC_MONITOR_CONFIG = {
     'wbnb_address': '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
     'usdt_wbnb_pair': '0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae',
     'reserve_fresh_seconds': 15,
+    'notification': {
+        'enable_telegram': True,
+        'enable_wechat': True,
+    }
 }
 
 
