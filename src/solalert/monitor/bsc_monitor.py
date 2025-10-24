@@ -79,6 +79,8 @@ class BSCMonitor:
         self.enable_telegram = config.get('notification', {}).get('enable_telegram', True)
         self.enable_wechat = config.get('notification', {}).get('enable_wechat', True)
         
+        logger.info(f"🔧 [初始化] enable_telegram={self.enable_telegram}, enable_wechat={self.enable_wechat}")
+        
         # Redis 客户端（用于冷却期控制）
         self.redis_client = get_redis()
         
@@ -312,7 +314,7 @@ class BSCMonitor:
                 in_cooldown = not self.check_alert_cooldown(token_address, cooldown_minutes)
                 if in_cooldown:
                     filter_stats['in_cooldown'] += 1
-                    logger.debug(f"⏭️  {token_address[:10]}... 冷却中（仍会保存但不推送）")
+                    logger.info(f"⏰ [冷却期] {token_address[:10]}... 在冷却中 (会保存到DB+WS，但不推送TG)")
                 
                 # 进入第二层过滤（调用 API），传递冷静期状态
                 await self.apply_second_layer_filter(
@@ -697,6 +699,8 @@ class BSCMonitor:
             else:
                 logger.info(f"✅ [数据库] 写入成功 | WebSocket 已推送")
             
+            logger.info(f"🔍 [配置检查] enable_telegram={self.enable_telegram}, enable_wechat={self.enable_wechat}, in_cooldown={in_cooldown}")
+            
             # 设置 Redis 冷却期（添加随机抖动）
             if not in_cooldown:  # 只在第一次推送时设置冷却期
                 self.update_alert_history(token_address)
@@ -707,7 +711,9 @@ class BSCMonitor:
                 logger.info(f"🔒 [冷却期] 已设置 {cooldown_minutes:.1f}分钟冷却期 (基础{self.min_interval_seconds//60}分 + 抖动{jitter}秒)")
             
             # 2. Telegram 推送（仅在非冷静期时推送）
+            logger.info(f"📤 [TG检查] enable_telegram={self.enable_telegram}, in_cooldown={in_cooldown}")
             if self.enable_telegram and not in_cooldown:
+                logger.info(f"📤 [Telegram] 开始准备发送消息...")
                 message = self.format_bsc_tg_message(
                     token_address=token_address,
                     symbol=symbol,
@@ -729,12 +735,15 @@ class BSCMonitor:
                 try:
                     from ..core.config import TELEGRAM_CONFIG
                     target_channel = str(TELEGRAM_CONFIG.get('bsc_channel_id'))
-                    
+                    logger.info(f"📤 [Telegram] 目标频道: {target_channel}")
+                
                     tg_success = await self.notification_manager.send_telegram(
                         target=target_channel,
                         message=message,
                         reply_markup=buttons
                     )
+                    
+                    logger.info(f"📤 [Telegram] 发送结果: {tg_success}")
                     
                     if tg_success:
                         logger.info(f"✅ [Telegram] 推送成功 -> BSC 频道")
@@ -746,6 +755,8 @@ class BSCMonitor:
                         logger.warning(f"⚠️  [Telegram] 推送失败")
                 except Exception as e:
                     logger.warning(f"⚠️  [Telegram] 推送异常: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
         
         except Exception as e:
             logger.error(f"发送推送通知失败: {e}")

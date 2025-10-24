@@ -681,12 +681,6 @@ class AlchemyWebhookProcessor:
                 logger.info(f"   └─ 🟢 V2 Swap (外盘): {stats['v2_swaps']} 笔")
             logger.info(f"   └─ 目标交易: {stats['buy_trades']} 个")
             
-            if stats['buy_trades'] > 0:
-                # 显示每个目标交易的详情
-                for i, evt in enumerate(events, 1):
-                    pool_type = "🟡内盘" if evt.get('is_fourmeme_internal') else "🟢外盘"
-                    logger.info(f"   └─ [{i}] {pool_type} {self._short(evt.get('base_token'))} | ${evt['usdt_value']:.2f} USDT")
-            
             return events
         
         except Exception as e:
