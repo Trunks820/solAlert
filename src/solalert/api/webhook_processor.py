@@ -538,7 +538,7 @@ class AlchemyWebhookProcessor:
             if usdt_value <= 0:
                 return None
             
-            # 6. 构造事件
+            # 6. 构造事件（需要添加 block_number 和 timestamp）
             event = {
                 'tx_hash': tx_info.get('hash', ''),
                 'pair_address': self.FOURMEME_PROXY,  # 内盘用 Proxy 地址
@@ -548,7 +548,9 @@ class AlchemyWebhookProcessor:
                 'quote_token': self.USDT_ADDRESS if base_symbol == "USDT" else self.WBNB_ADDRESS,
                 'usdt_value': usdt_value,
                 'is_buy': True,
-                'is_fourmeme_internal': True  # 标记为内盘
+                'is_fourmeme_internal': True,  # 标记为内盘
+                'block_number': 0,  # 将在外部填充
+                'timestamp': 0      # 将在外部填充
             }
             
             logger.debug(f"🟡 Fourmeme 内盘: {self._short(target_token)} | ${usdt_value:.2f}")
@@ -639,6 +641,9 @@ class AlchemyWebhookProcessor:
                     tx_info = tx_logs[0].get('transaction', {})
                     evt = self.process_fourmeme_internal(tx_logs[0], tx_transfers, tx_info)
                     if evt:
+                        # 填充 block_number 和 timestamp
+                        evt['block_number'] = block_number
+                        evt['timestamp'] = timestamp
                         stats['fourmeme_internal'] += 1
                         stats['buy_trades'] += 1
                         events.append(evt)
