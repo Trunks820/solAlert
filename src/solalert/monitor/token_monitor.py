@@ -144,11 +144,12 @@ class TokenMonitorEngine:
                 'price_5m_change_percent': price_5m_change,
                 'price_1h_change_percent': price_1h_change,
                 'priceChange': price_5m_change,  # TriggerLogic 使用这个字段
+                'volume': current_volume_5m,  # 🔥 当前交易量（5分钟），用于 threshold 绝对值判断
                 'volume_5m': current_volume_5m,
                 'volume_1h': current_volume_1h,
                 'volume_5m_change_percent': volume_5m_change,
                 'volume_1h_change_percent': volume_1h_change,
-                'volumeChange': volume_5m_change,  # TriggerLogic 使用这个字段
+                'volumeChange': volume_5m_change,  # TriggerLogic 使用这个字段（百分比）
                 'buys_5m': gmgn_data['buys_5m'],
                 'sells_5m': gmgn_data['sells_5m'],
                 'swaps_5m': gmgn_data['swaps_5m'],

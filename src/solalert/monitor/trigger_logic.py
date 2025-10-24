@@ -141,16 +141,19 @@ class TriggerLogic:
         volume_threshold = config.get("threshold")
         
         if volume_threshold is not None:
-            # 获取 1 分钟交易量（DBotX API 提供）
+            # 获取当前交易量（优先使用 volume_1m，其次 volume，兼容不同数据源）
             current_volume = stats.get("volume_1m", 0) or stats.get("volume", 0)
             
             # 判断是否达到阈值
             if current_volume >= volume_threshold:
+                # 根据数据源判断时间窗口
+                time_window = "1分钟" if stats.get("volume_1m") else "5分钟"
+                
                 event = TriggerEvent(
                     event_type="交易量达标",
                     value=current_volume,
                     threshold=volume_threshold,
-                    description=f"💰 1分钟交易量 ${current_volume:,.0f} (阈值: ≥${volume_threshold:,.0f})"
+                    description=f"💰 {time_window}交易量 ${current_volume:,.0f} (阈值: ≥${volume_threshold:,.0f})"
                 )
                 return True, event
         
