@@ -5,11 +5,10 @@
 import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from ..core.logger import get_logger
 from ..core.config import TELEGRAM_CONFIG, WECHAT_CONFIG
+from ..api.telegram_api import TelegramAPI
 
 logger = get_logger(__name__)
 
@@ -78,18 +77,18 @@ class NotificationMessage:
 
 
 class TelegramNotifier:
-    """Telegram通知服务"""
+    """Telegram通知服务（基于 HTTP API）"""
     
     def __init__(self, bot_token: str, chat_id: int):
         """
         初始化Telegram通知器
         
         Args:
-            bot_token: Telegram Bot Token
+            bot_token: Telegram Bot Token（保留参数以兼容旧代码，但不再使用）
             chat_id: 目标聊天ID
         """
-        self.bot = Bot(token=bot_token)
         self.chat_id = chat_id
+        logger.info(f"✅ TelegramNotifier 初始化成功（HTTP API 模式），Chat ID: {chat_id}")
     
     def create_buttons(self, ca: str) -> InlineKeyboardMarkup:
         """
@@ -116,44 +115,40 @@ class TelegramNotifier:
         max_retries: int = 3
     ) -> bool:
         """
-        发送Telegram消息
+        发送Telegram消息（通过 HTTP API）
         
         Args:
             message: 消息文本（支持HTML格式）
-            ca: Token合约地址（用于生成按钮）
+            ca: Token合约地址（用于生成按钮，HTTP API 暂不支持）
             max_retries: 最大重试次数
             
         Returns:
             是否发送成功
         """
-        for attempt in range(max_retries):
-            try:
-                # 准备按钮
-                reply_markup = self.create_buttons(ca) if ca else None
-                
-                await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=message,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
-                    disable_web_page_preview=True
-                )
+        try:
+            # 准备按钮（HTTP API 暂不支持，会在 TelegramAPI 内部记录警告）
+            reply_markup = self.create_buttons(ca) if ca else None
+            
+            # 调用 HTTP API 发送消息
+            result = await TelegramAPI.send_message(
+                chat_id=self.chat_id,
+                message=message,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                max_retries=max_retries
+            )
+            
+            if result.get('success'):
                 logger.info(f"✅ Telegram消息发送成功")
                 return True
-                
-            except TelegramError as e:
-                logger.warning(f"⚠️ Telegram发送失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # 指数退避
-                else:
-                    logger.error(f"❌ Telegram发送最终失败: {e}")
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"❌ Telegram发送异常: {e}")
+            else:
+                error_msg = result.get('error', 'unknown')
+                logger.error(f"❌ Telegram发送失败: {error_msg}")
                 return False
-        
-        return False
+                
+        except Exception as e:
+            logger.error(f"❌ Telegram发送异常: {e}")
+            return False
 
 
 class WeChatNotifier:
@@ -267,8 +262,3 @@ class NotificationService:
             logger.warning(f"⚠️ 通知发送部分失败: {success_count}/{total_count} 成功")
         
         return results
-
-
-# 需要导入asyncio
-import asyncio
-
