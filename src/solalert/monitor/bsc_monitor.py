@@ -71,7 +71,7 @@ class BSCMonitor:
         )
         
         # 第三层控制：推送频率
-        self.min_interval_seconds = 30  # 冷却期30秒
+        self.min_interval_seconds = 90  # 冷却期90秒（避免重复推送）
         
         # 通知配置
         self.enable_telegram = config.get('notification', {}).get('enable_telegram', True)
@@ -377,7 +377,8 @@ class BSCMonitor:
             # 构造 stats 数据（用于 TriggerLogic 评估）
             stats = {
                 'priceChange': price_change_1m,
-                'volume': volume_1m,
+                'volume': volume_1m,  # 兼容旧版
+                'volume_1m': volume_1m,  # 🔥 DBotX API 提供的1分钟交易量
                 'holderChange': 0  # 暂不使用持有者变化
             }
             
@@ -682,7 +683,8 @@ class BSCMonitor:
             
             # 设置 Redis 冷却期
             self.update_alert_history(token_address)
-            logger.info(f"🔒 [冷却期] 已设置 {self.min_interval_seconds}秒冷却期")
+            cooldown_minutes = self.min_interval_seconds // 60
+            logger.info(f"🔒 [冷却期] 已设置 {cooldown_minutes}分钟冷却期")
             
             # 2. Telegram 推送
             if self.enable_telegram:
