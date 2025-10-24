@@ -40,7 +40,8 @@ class AlertRecorder:
         token_symbol: str,
         trigger_events: List[Dict[str, Any]],
         stats_data: Dict[str, Any],
-        notify_methods: str = "telegram"
+        notify_methods: str = "telegram",
+        notify_error: str = None
     ) -> bool:
         """
         将预警记录写入数据库
@@ -65,6 +66,7 @@ class AlertRecorder:
                     "volumeChange": 120.5
                 }
             notify_methods: 通知方式，默认"telegram"
+            notify_error: 推送失败原因（如"冷静期内不播报"），None表示正常推送
         
         Returns:
             bool: 是否写入成功
@@ -84,11 +86,14 @@ class AlertRecorder:
                 logger.warning(f"⚠️ stats_data 中缺少 'chain' 字段，无法保存预警记录: {ca[:10]}...")
                 return False
             
-            # SQL插入语句（添加 market_cap 和 chain_type 字段）
+            # SQL插入语句（添加 market_cap、chain_type 和 notify_error 字段）
+            # 根据 notify_error 设置通知状态
+            notify_status = 'skipped' if notify_error else 'success'
+            
             sql = """
             INSERT INTO token_monitor_alert_log 
-            (config_id, ca, token_name, token_symbol, trigger_time, trigger_events, stats_data, notify_methods, notify_status, market_cap, chain_type, create_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (config_id, ca, token_name, token_symbol, trigger_time, trigger_events, stats_data, notify_methods, notify_status, notify_error, market_cap, chain_type, create_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             
             # 执行插入
@@ -101,16 +106,19 @@ class AlertRecorder:
                 trigger_events_json,
                 stats_data_json,
                 notify_methods,
-                'success',  # 通知状态
+                notify_status,  # 通知状态：success 或 skipped
+                notify_error,   # 推送失败原因（如"冷静期内不播报"）
                 market_cap,
                 chain_type,
                 trigger_time
             ))
             
             if rowcount > 0:
+                status_emoji = "⏰" if notify_error else "✅"
+                status_text = f"({notify_error})" if notify_error else ""
                 logger.info(
-                    f"✅ 预警记录已写入数据库: {token_symbol} ({ca[:10]}...) - "
-                    f"{trigger_events[0].get('description', '未知触发')} "
+                    f"{status_emoji} 预警记录已写入数据库: {token_symbol} ({ca[:10]}...) - "
+                    f"{trigger_events[0].get('description', '未知触发')} {status_text}"
                 )
                 return True
             else:
@@ -233,7 +241,8 @@ class AlertRecorder:
         token_symbol: str,
         trigger_events: List[Dict[str, Any]],
         stats_data: Dict[str, Any],
-        notify_methods: str = "telegram"
+        notify_methods: str = "telegram",
+        notify_error: str = None
     ) -> Dict[str, bool]:
         """
         发送完整的预警通知（推荐使用此方法）
@@ -249,6 +258,7 @@ class AlertRecorder:
             trigger_events: 触发事件列表
             stats_data: 统计数据
             notify_methods: 通知方式
+            notify_error: 推送失败原因（如"冷静期内不播报"）
         
         Returns:
             dict: {"db_success": bool, "realtime_success": bool}
@@ -261,10 +271,19 @@ class AlertRecorder:
             token_symbol=token_symbol,
             trigger_events=trigger_events,
             stats_data=stats_data,
-            notify_methods=notify_methods
+            notify_methods=notify_methods,
+            notify_error=notify_error
         )
         
         # 2. 发送实时通知（尽力而为，失败了也没关系）
+        # 如果在冷静期内，跳过实时推送
+        if notify_error:
+            logger.debug(f"⏰ 冷静期内，跳过 WebSocket 实时推送: {token_symbol}")
+            return {
+                "db_success": db_result,
+                "realtime_success": False
+            }
+        
         # 合并所有触发原因
         descriptions = [event.get('description', '') for event in trigger_events if event.get('description')]
         description = '; '.join(descriptions) if descriptions else '触发监控条件'
@@ -377,7 +396,8 @@ class AlertRecorder:
         price_change: float = 0.0,
         volume_24h: float = 0.0,
         holders: int = 0,
-        logo: str = ""
+        logo: str = "",
+        notify_error: str = None
     ) -> bool:
         """
         写入 BSC 监控预警
@@ -393,6 +413,7 @@ class AlertRecorder:
             price_usdt: 当前价格（USDT）
             pair_address: 交易对地址
             market_cap: 市值
+            notify_error: 推送失败原因（如"冷静期内不播报"）
         
         Returns:
             bool: 是否写入成功
@@ -433,7 +454,8 @@ class AlertRecorder:
             token_symbol=token_symbol,
             trigger_events=trigger_events,
             stats_data=stats_data,
-            notify_methods="telegram,wechat"
+            notify_methods="telegram,wechat",
+            notify_error=notify_error  # 传递冷静期状态
         )
         
         return result['db_success']

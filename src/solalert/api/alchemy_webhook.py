@@ -1,10 +1,16 @@
 """
 Alchemy Webhook 接收服务
 接收 Alchemy 推送的区块链交易数据
+
+优化策略：
+- 立即返回 200（不阻塞 Alchemy）
+- 后台异步处理（asyncio.create_task）
+- 并发控制（Semaphore 限制）
 """
 import logging
 import json
 import os
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request, HTTPException
@@ -13,6 +19,10 @@ from starlette.requests import ClientDisconnect
 import uvicorn
 
 logger = logging.getLogger(__name__)
+
+# === 后台任务管理 ===
+background_tasks = set()  # 保存任务引用，防止被 GC
+processing_semaphore = asyncio.Semaphore(20)  # 限制并发处理数（2核4G 服务器）
 
 app = FastAPI(
     title="Alchemy Webhook Service",
@@ -204,74 +214,96 @@ async def health():
     return {"status": "ok"}
 
 
+async def process_webhook_background(data: dict):
+    """
+    后台处理 webhook 数据
+    不阻塞主请求，失败也不影响响应
+    """
+    async with processing_semaphore:  # 控制并发
+        try:
+            # 保存文件
+            save_to_file = os.getenv('WEBHOOK_SAVE_JSON', 'true').lower() == 'true'
+            if save_to_file:
+                filename = "webhook_data_all.jsonl"
+                try:
+                    import time
+                    with open(filename, 'a', encoding='utf-8') as f:
+                        data_with_meta = {
+                            'received_at': time.time(),
+                            'received_at_str': datetime.now().isoformat(),
+                            'data': data
+                        }
+                        f.write(json.dumps(data_with_meta, ensure_ascii=False) + '\n')
+                    print(f"💾 数据已追加到: {filename}")
+                except Exception as e:
+                    logger.error(f"保存文件失败: {e}")
+            
+            # 处理 webhook 数据（耗时操作）
+            result = await webhook_handler.handle_webhook_data(data)
+            logger.debug(f"✅ 后台处理完成")
+            
+        except Exception as e:
+            logger.error(f"❌ 后台处理失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+
 @app.post("/webhook/alchemy/bsc")
 async def receive_alchemy_webhook(request: Request):
     """
-    接收 Alchemy webhook 推送
+    接收 Alchemy webhook 推送 - 优化版（立即返回）
     
-    这个是你在 Alchemy 配置中填写的 Webhook URL
-    例如: https://your-domain.com/webhook/alchemy/bsc
+    策略：
+    1. 快速接收数据
+    2. 立即返回 200（<10ms）
+    3. 后台异步处理（不阻塞）
     """
     try:
-        # 1. 获取原始数据
-        body = await request.body()
+        # 1. 快速接收数据
         data = await request.json()
         
-        # 2. 记录接收（不打印详细 JSON）
-        logger.debug(f"收到 Webhook 数据: {len(body)} bytes")
+        # 2. 立即返回 200（关键！让 Alchemy 知道收到了）
+        response_data = {
+            "status": "received",
+            "timestamp": datetime.now().isoformat()
+        }
         
-        # 保存到文件（追加模式）- 所有数据保存到同一个文件
-        save_to_file = os.getenv('WEBHOOK_SAVE_JSON', 'true').lower() == 'true'  # 默认开启
-        if save_to_file:
-            filename = "webhook_data_all.jsonl"  # 使用 JSONL 格式（每行一个JSON）
-            try:
-                import time
-                # 追加写入，每条数据一行
-                with open(filename, 'a', encoding='utf-8') as f:
-                    # 添加时间戳和分隔信息
-                    data_with_meta = {
-                        'received_at': time.time(),
-                        'received_at_str': datetime.now().isoformat(),
-                        'data': data
-                    }
-                    f.write(json.dumps(data_with_meta, ensure_ascii=False) + '\n')
-                print(f"💾 数据已追加到: {filename}")
-            except Exception as e:
-                print(f"保存文件失败: {e}")
+        # 3. 创建后台任务（不等待完成）
+        task = asyncio.create_task(process_webhook_background(data))
         
-        # 日志已在 handle_webhook_data 中打印，这里不重复
+        # 保存任务引用，防止被 GC
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)  # 完成后自动移除
         
-        # 3. 验证签名（可选，Alchemy 支持签名验证）
-        # signature = request.headers.get('X-Alchemy-Signature')
-        # if not verify_signature(body, signature):
-        #     raise HTTPException(status_code=401, detail="Invalid signature")
-        
-        # 4. 处理数据
-        result = await webhook_handler.handle_webhook_data(data)
-        
-        # 5. 返回响应
+        # 4. 立即返回
         return JSONResponse(
             status_code=200,
-            content=result
+            content=response_data
         )
     
     except ClientDisconnect:
-        # Alchemy 提前关闭连接，这是正常的，直接返回成功
-        logger.debug("⚠️  客户端提前断开连接（Alchemy 已收到响应）")
+        # Alchemy 提前关闭连接，正常情况
+        logger.debug("⚠️  客户端提前断开连接")
         return JSONResponse(
             status_code=200,
-            content={"status": "ok", "message": "received"}
+            content={"status": "received"}
         )
     
     except json.JSONDecodeError as e:
+        # JSON 解析失败也返回 200，避免 Alchemy 重试
         logger.error(f"❌ JSON 解析失败: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        return JSONResponse(
+            status_code=200,
+            content={"status": "error", "message": "invalid_json"}
+        )
     
     except Exception as e:
-        logger.error(f"❌ Webhook 处理失败: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        # 任何错误都返回 200，避免积压重试
+        logger.error(f"❌ Webhook 接收失败: {e}")
+        return JSONResponse(
+            status_code=200,
+            content={"status": "error", "message": str(e)}
+        )
 
 
 @app.post("/webhook/alchemy/bsc/test")
@@ -310,8 +342,15 @@ async def start_webhook_server_async(host: str = "0.0.0.0", port: int = 8001):
         app,
         host=host,
         port=port,
-        log_level="warning",
-        access_log=False,
+        # === 高并发优化 ===
+        workers=1,                 # 单进程（2核4G 够用，省内存）
+        backlog=4096,              # 队列大小（匹配系统 somaxconn）
+        timeout_keep_alive=75,     # 保持连接（默认值）
+        limit_concurrency=100,     # 限制并发连接数（防止过载）
+        limit_max_requests=10000,  # 10k 请求后重启 worker（防止内存泄漏）
+        # === 性能优化 ===
+        log_level="warning",       # 只记录警告和错误
+        access_log=False,          # 关闭访问日志
         lifespan="on"
     )
     server = uvicorn.Server(config)
@@ -350,9 +389,16 @@ def start_webhook_server(host: str = "0.0.0.0", port: int = 8001):
             app,
             host=host,
             port=port,
-            log_level="warning",  # 只显示 warning 及以上级别
-            access_log=False,     # 禁用访问日志
-            lifespan="on"         # 启用生命周期事件
+            # === 高并发优化 ===
+            workers=1,                 # 单进程（2核4G 够用，省内存）
+            backlog=4096,              # 队列大小（匹配系统 somaxconn）
+            timeout_keep_alive=75,     # 保持连接（默认值）
+            limit_concurrency=100,     # 限制并发连接数（防止过载）
+            limit_max_requests=10000,  # 10k 请求后重启 worker（防止内存泄漏）
+            # === 性能优化 ===
+            log_level="warning",       # 只记录警告和错误
+            access_log=False,          # 关闭访问日志
+            lifespan="on"              # 启用生命周期事件
         )
     except KeyboardInterrupt:
         logger.info("\n⏹️  服务已停止")

@@ -13,6 +13,7 @@ BSC 监控主逻辑
 import logging
 import time
 import json
+import random
 from typing import Dict, List, Optional
 from collections import defaultdict
 from datetime import datetime
@@ -71,7 +72,8 @@ class BSCMonitor:
         )
         
         # 第三层控制：推送频率
-        self.min_interval_seconds = 90  # 冷却期90秒（避免重复推送）
+        self.min_interval_seconds = 180  # 冷却期180秒（避免重复推送）
+        self.cooldown_jitter = 30  # 冷却期抖动：30秒内随机
         
         # 通知配置
         self.enable_telegram = config.get('notification', {}).get('enable_telegram', True)
@@ -305,21 +307,22 @@ class BSCMonitor:
                 # 通过 fourmeme 验证，记录详细信息
                 logger.info(f"   🎯 {token_address[:10]}... | 单笔{single_max:.0f}U 累计{total_sum:.0f}U")
                 
-                # 提前检查 Redis 冷却期（减少 API 调用）
+                # 检查 Redis 冷却期（但不跳过，继续处理）
                 cooldown_minutes = self.min_interval_seconds / 60
-                if not self.check_alert_cooldown(token_address, cooldown_minutes):
+                in_cooldown = not self.check_alert_cooldown(token_address, cooldown_minutes)
+                if in_cooldown:
                     filter_stats['in_cooldown'] += 1
-                    logger.debug(f"⏭️  {token_address[:10]}... 冷却中")
-                    continue
+                    logger.debug(f"⏭️  {token_address[:10]}... 冷却中（仍会保存但不推送）")
                 
-                # 进入第二层过滤（调用 API）
+                # 进入第二层过滤（调用 API），传递冷静期状态
                 await self.apply_second_layer_filter(
                     token_address,
                     trades[0]['pair_address'],
                     single_max,
                     total_sum,
                     block_number,
-                    launchpad_info
+                    launchpad_info,
+                    in_cooldown=in_cooldown
                 )
         
         # 单行显示过滤统计
@@ -337,7 +340,8 @@ class BSCMonitor:
         single_max: float,
         total_sum: float,
         block_number: int,
-        launchpad_info: Dict
+        launchpad_info: Dict,
+        in_cooldown: bool = False
     ):
         """
         第二层过滤：调用 GMGN API + events_config 判断
@@ -349,6 +353,7 @@ class BSCMonitor:
             total_sum: 累计金额
             block_number: 区块号
             launchpad_info: Launchpad 信息
+            in_cooldown: 是否在冷静期内
         """
         try:
             # 1. 使用 launchpad_info 中返回的交易对地址获取详细数据
@@ -408,9 +413,13 @@ class BSCMonitor:
             # 5. 满足条件，准备推送
             logger.info(f"   ✅ 满足条件！触发 {len(triggered_events)} 个事件")
             logger.info(f"")
-            logger.info(f"🚨 [准备推送] {symbol} | 单笔${single_max:.0f} | 累计${total_sum:.0f}")
             
-            # 发送推送（包含数据库、WebSocket、TG）
+            if in_cooldown:
+                logger.info(f"⏰ [冷静期内] {symbol} | 单笔${single_max:.0f} | 累计${total_sum:.0f} （保存记录但不推送）")
+            else:
+                logger.info(f"🚨 [准备推送] {symbol} | 单笔${single_max:.0f} | 累计${total_sum:.0f}")
+            
+            # 发送推送（包含数据库、WebSocket、TG），传递冷静期状态
             await self.send_bsc_alert(
                 token_address=token_address,
                 token_data=token_data,
@@ -419,7 +428,8 @@ class BSCMonitor:
                 total_sum=total_sum,
                 block_number=block_number,
                 pair_address=pair_address,
-                launchpad_info=launchpad_info
+                launchpad_info=launchpad_info,
+                in_cooldown=in_cooldown
             )
             
         except Exception as e:
@@ -596,7 +606,8 @@ class BSCMonitor:
         total_sum: float,
         block_number: int,
         pair_address: str,
-        launchpad_info: Dict
+        launchpad_info: Dict,
+        in_cooldown: bool = False
     ):
         """
         发送 BSC 监控推送通知
@@ -610,6 +621,7 @@ class BSCMonitor:
             block_number: 区块号
             pair_address: 交易对地址
             launchpad_info: Launchpad 信息
+            in_cooldown: 是否在冷静期内（冷静期内只保存不推送）
         """
         try:
             # 获取代币信息
@@ -672,22 +684,30 @@ class BSCMonitor:
                 price_change=price_change,
                 volume_24h=volume_24h,
                 holders=holders,
-                logo=logo
+                logo=logo,
+                notify_error="冷静期内不播报" if in_cooldown else None
             )
             
             if not success:
                 logger.error(f"❌ 数据库写入失败: {symbol}")
                 return
             
-            logger.info(f"✅ [数据库] 写入成功 | WebSocket 已推送")
+            if in_cooldown:
+                logger.info(f"⏰ [数据库] 写入成功（冷静期，WebSocket 跳过）")
+            else:
+                logger.info(f"✅ [数据库] 写入成功 | WebSocket 已推送")
             
-            # 设置 Redis 冷却期
-            self.update_alert_history(token_address)
-            cooldown_minutes = self.min_interval_seconds // 60
-            logger.info(f"🔒 [冷却期] 已设置 {cooldown_minutes}分钟冷却期")
+            # 设置 Redis 冷却期（添加随机抖动）
+            if not in_cooldown:  # 只在第一次推送时设置冷却期
+                self.update_alert_history(token_address)
+                # 基础冷却时间 + 随机抖动
+                jitter = random.randint(0, self.cooldown_jitter)
+                total_cooldown = self.min_interval_seconds + jitter
+                cooldown_minutes = total_cooldown / 60
+                logger.info(f"🔒 [冷却期] 已设置 {cooldown_minutes:.1f}分钟冷却期 (基础{self.min_interval_seconds//60}分 + 抖动{jitter}秒)")
             
-            # 2. Telegram 推送
-            if self.enable_telegram:
+            # 2. Telegram 推送（仅在非冷静期时推送）
+            if self.enable_telegram and not in_cooldown:
                 message = self.format_bsc_tg_message(
                     token_address=token_address,
                     symbol=symbol,
