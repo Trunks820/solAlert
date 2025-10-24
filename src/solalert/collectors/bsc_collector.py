@@ -89,11 +89,21 @@ class BSCBlockCollector:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
-        retry = Retry(
-            total=4, connect=3, read=3, backoff_factor=0.3,
-            status_forcelist=[408, 429, 500, 502, 503, 504],
-            allowed_methods=["POST", "GET"],
-        )
+        # 兼容新旧版本 urllib3
+        try:
+            retry = Retry(
+                total=4, connect=3, read=3, backoff_factor=0.3,
+                status_forcelist=[408, 429, 500, 502, 503, 504],
+                allowed_methods=["POST", "GET"]  # 新版本 (urllib3 >= 1.26)
+            )
+        except TypeError:
+            # 旧版本使用 method_whitelist
+            retry = Retry(
+                total=4, connect=3, read=3, backoff_factor=0.3,
+                status_forcelist=[408, 429, 500, 502, 503, 504],
+                method_whitelist=["POST", "GET"]  # 旧版本
+            )
+        
         s.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=64))
         s.headers.update({"Content-Type": "application/json"})
         return s
