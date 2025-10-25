@@ -373,10 +373,8 @@ class BSCMonitor:
                     }
                     filter_stats['fourmeme_found'] += 1
                 else:
-                    # 外盘：调用 API 验证平台（放到线程池避免阻塞）
-                    launchpad_info = await asyncio.to_thread(
-                        self.dbotx_api.get_token_launchpad_info, 'bsc', token_address
-                    )
+                    # 外盘：调用 API 验证平台（异步调用，不阻塞）
+                    launchpad_info = await self.dbotx_api.get_token_launchpad_info('bsc', token_address)
                     
                     if launchpad_info is None:
                         filter_stats['non_launchpad'] += 1
@@ -463,10 +461,8 @@ class BSCMonitor:
                 logger.debug(f"⏭️  跳过 {token_address[:10]}... (无交易对地址)")
                 return
             
-            # 2. 调用 DBotX API 获取代币数据（放到线程池避免阻塞）
-            raw_data = await asyncio.to_thread(
-                self.dbotx_api.get_pair_info, 'bsc', api_pair_address
-            )
+            # 2. 调用 DBotX API 获取代币数据（异步调用，不阻塞）
+            raw_data = await self.dbotx_api.get_pair_info('bsc', api_pair_address)
             
             if not raw_data:
                 logger.debug(f"⏭️  跳过 {token_address[:10]}... (无DBotX数据)")

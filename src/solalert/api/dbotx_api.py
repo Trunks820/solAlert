@@ -1,53 +1,43 @@
 """
-DBotX API 客户端
+DBotX API 客户端（异步版本）
 用于获取 Token 的实时价格、交易量、持有人数等数据
 相比 GMGN API 更稳定（使用 API Key 而非 Cookie）
+
+✅ 使用 httpx.AsyncClient 替代 requests，避免阻塞事件循环
 """
 import logging
 from typing import Dict, Optional
-
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import httpx
 
 logger = logging.getLogger(__name__)
 
 
 class DBotXAPI:
-    """DBotX API 客户端"""
+    """DBotX API 客户端（异步）"""
     
     def __init__(self, api_key: str = "i1o3elfavv59ds02fggj9rsd0eg8w657"):
         self.base_url = "https://api-data-v1.dbotx.com"
         self.api_key = api_key
-        self.session = self._create_session()
-    
-    def _create_session(self) -> requests.Session:
-        """创建带重试机制的 session"""
-        session = requests.Session()
         
-        # 禁用 SSL 证书验证（解决本地环境证书问题）
-        session.verify = False
+        # 创建异步 HTTP 客户端
+        self.client = httpx.AsyncClient(
+            verify=False,  # 禁用 SSL 验证
+            timeout=httpx.Timeout(10.0, connect=5.0),  # 总超时10秒，连接超时5秒
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            follow_redirects=True
+        )
         
         # 禁用 SSL 警告
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"]
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        
-        return session
     
-    def search_pairs(self, token_address: str) -> Optional[Dict]:
+    async def close(self):
+        """关闭 HTTP 客户端"""
+        await self.client.aclose()
+    
+    async def search_pairs(self, token_address: str) -> Optional[Dict]:
         """
-        搜索代币的所有交易对，返回交易量最大的交易对信息
+        搜索代币的所有交易对，返回交易量最大的交易对信息（异步）
         
         Args:
             token_address: 代币地址
@@ -66,52 +56,78 @@ class DBotXAPI:
                 'x-api-key': self.api_key
             }
             
-            response = self.session.get(url, params=params, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('err') is False and data.get('res'):
-                    pairs = data['res']
-                    if len(pairs) > 0:
-                        # 第一个就是交易量最大的
-                        largest_pair = pairs[0]
-                        pair_id = largest_pair.get('_id') or largest_pair.get('id')
-                        volume_24h = largest_pair.get('buyAndSellVolume24h', 0)
-                        pool_type = largest_pair.get('poolType', '')
-                        currency_reserve = largest_pair.get('currencyReserve', 0)
+            # 异步请求，最多重试 3 次
+            for attempt in range(3):
+                try:
+                    response = await self.client.get(url, params=params, headers=headers)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
                         
-                        logger.debug(
-                            f"✅ 找到最大交易对: {pair_id[:10]}... "
-                            f"(24h: ${volume_24h:,.0f}, 池: {pool_type}, 储备: {currency_reserve:.2f})"
-                        )
-                        
-                        # 返回完整信息（用于判断内外盘）
-                        return {
-                            'pair_address': pair_id,
-                            'pool_type': pool_type,
-                            'currency_reserve': currency_reserve or 0,
-                            'is_launch_migration': largest_pair.get('isLaunchMigration', False),
-                            'volume_24h': volume_24h
-                        }
-                    else:
-                        logger.debug(f"⚠️  未找到交易对")
+                        if data.get('err') is False and data.get('res'):
+                            pairs = data['res']
+                            if len(pairs) > 0:
+                                # 第一个就是交易量最大的
+                                largest_pair = pairs[0]
+                                pair_id = largest_pair.get('_id') or largest_pair.get('id')
+                                volume_24h = largest_pair.get('buyAndSellVolume24h', 0)
+                                pool_type = largest_pair.get('poolType', '')
+                                currency_reserve = largest_pair.get('currencyReserve', 0)
+                                
+                                logger.debug(
+                                    f"✅ 找到最大交易对: {pair_id[:10]}... "
+                                    f"(24h: ${volume_24h:,.0f}, 池: {pool_type}, 储备: {currency_reserve:.2f})"
+                                )
+                                
+                                # 返回完整信息（用于判断内外盘）
+                                return {
+                                    'pair_address': pair_id,
+                                    'pool_type': pool_type,
+                                    'currency_reserve': currency_reserve or 0,
+                                    'is_launch_migration': largest_pair.get('isLaunchMigration', False),
+                                    'volume_24h': volume_24h
+                                }
+                            else:
+                                logger.debug(f"⚠️  未找到交易对")
+                                return None
+                        else:
+                            logger.debug(f"⚠️  Search API 返回错误: {data}")
+                            return None
+                    
+                    elif response.status_code in [429, 500, 502, 503, 504]:
+                        # 可重试的错误
+                        if attempt < 2:
+                            await asyncio.sleep(1 * (attempt + 1))  # 递增延迟
+                            continue
+                        logger.warning(f"⚠️  Search API HTTP错误 {response.status_code}（已重试{attempt + 1}次）")
                         return None
-                else:
-                    logger.debug(f"⚠️  Search API 返回错误: {data}")
+                    else:
+                        logger.warning(f"⚠️  Search API HTTP错误 {response.status_code}")
+                        return None
+                
+                except httpx.TimeoutException:
+                    if attempt < 2:
+                        logger.debug(f"⏱️ Search API 超时，重试 {attempt + 1}/3")
+                        await asyncio.sleep(1)
+                        continue
+                    logger.warning(f"⚠️  Search API 超时（已重试3次）")
+                    return None
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+                        continue
+                    logger.warning(f"⚠️  Search API 请求失败: {e}")
                     return None
             
-            else:
-                logger.warning(f"⚠️  Search API HTTP错误 {response.status_code}")
-                return None
+            return None
         
         except Exception as e:
-            logger.warning(f"⚠️  Search API 请求失败: {e}")
+            logger.warning(f"⚠️  Search API 外部异常: {e}")
             return None
     
-    def get_pair_info(self, chain: str, pair_address: str) -> Optional[Dict]:
+    async def get_pair_info(self, chain: str, pair_address: str) -> Optional[Dict]:
         """
-        获取交易对信息
+        获取交易对信息（异步）
         
         Args:
             chain: 链名称（如 'bsc', 'sol'）
@@ -132,29 +148,54 @@ class DBotXAPI:
                 'x-api-key': self.api_key
             }
             
-            response = self.session.get(url, params=params, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
+            # 异步请求，最多重试 3 次
+            for attempt in range(3):
+                try:
+                    response = await self.client.get(url, params=params, headers=headers)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        
+                        if data.get('err') is False and data.get('res'):
+                            logger.debug(f"✅ DBotX API 成功: {pair_address[:10]}...")
+                            return data['res']
+                        else:
+                            logger.debug(f"⚠️  DBotX API 返回错误: {data}")
+                            return None
+                    
+                    elif response.status_code in [429, 500, 502, 503, 504]:
+                        if attempt < 2:
+                            await asyncio.sleep(1 * (attempt + 1))
+                            continue
+                        logger.warning(f"⚠️  DBotX API HTTP错误 {response.status_code}（已重试{attempt + 1}次）")
+                        return None
+                    else:
+                        logger.warning(f"⚠️  DBotX API HTTP错误 {response.status_code}")
+                        return None
                 
-                if data.get('err') is False and data.get('res'):
-                    logger.debug(f"✅ DBotX API 成功: {pair_address[:10]}...")
-                    return data['res']
-                else:
-                    logger.debug(f"⚠️  DBotX API 返回错误: {data}")
+                except httpx.TimeoutException:
+                    if attempt < 2:
+                        logger.debug(f"⏱️ DBotX API 超时，重试 {attempt + 1}/3")
+                        await asyncio.sleep(1)
+                        continue
+                    logger.warning(f"⚠️  DBotX API 超时（已重试3次）")
+                    return None
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+                        continue
+                    logger.warning(f"⚠️  DBotX API 请求失败: {e}")
                     return None
             
-            else:
-                logger.warning(f"⚠️  DBotX API HTTP错误 {response.status_code}")
-                return None
+            return None
         
         except Exception as e:
-            logger.warning(f"⚠️  DBotX API 请求失败: {e}")
+            logger.warning(f"⚠️  DBotX API 外部异常: {e}")
             return None
     
-    def get_token_launchpad_info(self, chain: str, token_address: str) -> Optional[Dict]:
+    async def get_token_launchpad_info(self, chain: str, token_address: str) -> Optional[Dict]:
         """
-        获取代币 Launchpad 信息
+        获取代币 Launchpad 信息（异步）
         
         Args:
             chain: 链名称
@@ -165,7 +206,7 @@ class DBotXAPI:
         """
         try:
             # 1. 先搜索获取交易量最大的交易对信息
-            pair_info = self.search_pairs(token_address)
+            pair_info = await self.search_pairs(token_address)
             
             if not pair_info:
                 return None
@@ -177,7 +218,7 @@ class DBotXAPI:
             is_launch_migration = pair_info.get('is_launch_migration', False)
             
             # 2. 用交易对地址查询详细信息（获取更多数据）
-            detailed_info = self.get_pair_info(chain, pair_address)
+            detailed_info = await self.get_pair_info(chain, pair_address)
             
             if not detailed_info:
                 return None
@@ -225,7 +266,7 @@ class DBotXAPI:
     
     def parse_token_data(self, raw_data: Dict) -> Optional[Dict]:
         """
-        解析 DBotX API 返回的代币数据
+        解析 DBotX API 返回的代币数据（同步，仅解析不涉及 I/O）
         
         Args:
             raw_data: API 返回的原始数据
@@ -290,4 +331,15 @@ class DBotXAPI:
         except Exception as e:
             logger.error(f"解析代币数据失败: {e}")
             return None
+    
+    async def __aenter__(self):
+        """支持 async with 语法"""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """支持 async with 语法"""
+        await self.close()
 
+
+# 需要导入 asyncio（用于重试延迟）
+import asyncio

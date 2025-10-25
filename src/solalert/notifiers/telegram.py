@@ -80,7 +80,7 @@ class TelegramQueue:
                 
                 send_start = time.monotonic()
                 max_retries = 2  # 最多重试2次
-                base_retry_delay = 3  # 基础重试间隔3秒
+                base_retry_delay = 5  # 基础重试间隔5秒（增加间隔，避免连续失败）
                 result = None
                 last_error = None
                 
@@ -101,7 +101,7 @@ class TelegramQueue:
                                     reply_markup=reply_markup,
                                     disable_web_page_preview=True
                                 ),
-                                timeout=10.0  # 单次尝试超时10秒（更激进的超时）
+                                timeout=8.0  # 单次尝试超时8秒（考虑到 HTTPXRequest 已设置 5秒超时）
                             )
                         except asyncio.TimeoutError:
                             attempt_cost = time.monotonic() - attempt_start
@@ -209,18 +209,18 @@ class TelegramNotifier(BaseNotifier):
         # 创建 Bot 实例，参考成功项目的配置
         if self.bot_token:
             
-            # 优化连接池配置（参考成功项目） - 使用更激进的超时避免卡住
+            # 优化连接池配置 - 更激进的超时避免卡住
             request = HTTPXRequest(
-                connect_timeout=10.0,       # 连接超时10秒（更快失败）
-                read_timeout=10.0,          # 读取超时10秒（更快失败）
-                write_timeout=10.0,         # 写入超时10秒
-                pool_timeout=30.0,          # 连接池超时30秒
+                connect_timeout=5.0,        # 连接超时5秒（更快失败）
+                read_timeout=5.0,           # 读取超时5秒（更快失败）
+                write_timeout=5.0,          # 写入超时5秒
+                pool_timeout=10.0,          # 连接池超时10秒
                 connection_pool_size=100,   # 连接池大小100
                 http_version="1.1"          # 强制使用 HTTP/1.1（避免 HTTP/2 多路复用问题）
             )
             
             self.bot = Bot(token=self.bot_token, request=request)
-            logger.info("✅ Telegram Bot 初始化成功 (连接池: 100, 超时: 10s, HTTP/1.1)")
+            logger.info("✅ Telegram Bot 初始化成功 (连接池: 100, 超时: 5s, HTTP/1.1)")
         else:
             self.bot = None
             logger.error("❌ 未配置 Telegram Bot Token")
