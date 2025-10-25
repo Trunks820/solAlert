@@ -77,21 +77,27 @@ class TelegramQueue:
                 
                 # 重试机制
                 for attempt in range(max_retries):
+                    attempt_start = time.monotonic()
                     try:
                         logger.info(f"🔄 [TelegramQueue] 尝试发送 ({attempt + 1}/{max_retries}) -> {target}")
                         
-                        # 执行发送（带超时保护）
-                        result = await asyncio.wait_for(
-                            bot.send_message(
-                                chat_id=target,
-                                text=message,
-                                parse_mode=parse_mode,
-                                message_thread_id=topic_id,
-                                reply_markup=reply_markup,
-                                disable_web_page_preview=True
-                            ),
-                            timeout=20.0  # 单次尝试超时20秒（快速失败）
-                        )
+                        # 执行发送（带超时保护 - 使用更短的超时避免卡住）
+                        try:
+                            result = await asyncio.wait_for(
+                                bot.send_message(
+                                    chat_id=target,
+                                    text=message,
+                                    parse_mode=parse_mode,
+                                    message_thread_id=topic_id,
+                                    reply_markup=reply_markup,
+                                    disable_web_page_preview=True
+                                ),
+                                timeout=10.0  # 单次尝试超时10秒（更激进的超时）
+                            )
+                        except asyncio.TimeoutError:
+                            attempt_cost = time.monotonic() - attempt_start
+                            logger.warning(f"⏱️ [TelegramQueue] 单次尝试超时 ({attempt + 1}/{max_retries}) -> {target} | 耗时={attempt_cost:.2f}s")
+                            raise TimedOut(f"Request timed out after {attempt_cost:.2f}s")
                         
                         send_cost = time.monotonic() - send_start
                         logger.info(f"✅ [TelegramQueue] 消息发送成功 -> {target} | message_id={result.message_id} | 耗时={send_cost:.2f}s | 尝试={attempt + 1}")
@@ -194,15 +200,20 @@ class TelegramNotifier(BaseNotifier):
         # 创建 Bot 实例，参考成功项目的配置
         if self.bot_token:
             from telegram.request import HTTPXRequest
-            # 优化连接池配置（参考成功项目）
+            import httpx
+            
+            # 优化连接池配置（参考成功项目） - 使用更激进的超时避免卡住
             request = HTTPXRequest(
-                connect_timeout=15.0,       # 连接超时15秒（快速失败）
-                read_timeout=15.0,          # 读取超时15秒
-                pool_timeout=60.0,          # 连接池超时60秒（增加）
-                connection_pool_size=500,   # 连接池大小500（大幅增加）
+                connect_timeout=10.0,       # 连接超时10秒（更快失败）
+                read_timeout=10.0,          # 读取超时10秒（更快失败）
+                write_timeout=10.0,         # 写入超时10秒
+                pool_timeout=30.0,          # 连接池超时30秒
+                connection_pool_size=100,   # 连接池大小100
+                http_version="1.1"          # 强制使用 HTTP/1.1（避免 HTTP/2 多路复用问题）
             )
+            
             self.bot = Bot(token=self.bot_token, request=request)
-            logger.info("✅ Telegram Bot 初始化成功 (连接池: 500, 超时: 15s/60s)")
+            logger.info("✅ Telegram Bot 初始化成功 (连接池: 100, 超时: 10s, HTTP/1.1)")
         else:
             self.bot = None
             logger.error("❌ 未配置 Telegram Bot Token")
