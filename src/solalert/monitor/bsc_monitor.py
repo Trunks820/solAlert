@@ -396,7 +396,7 @@ class BSCMonitor:
                 
                 # 检查 Redis 冷却期（但不跳过，继续处理）
                 cooldown_minutes = self.min_interval_seconds / 60
-                in_cooldown = not self.check_alert_cooldown(token_address, cooldown_minutes)
+                in_cooldown = not await self.check_alert_cooldown(token_address, cooldown_minutes)
                 if in_cooldown:
                     filter_stats['in_cooldown'] += 1
                     logger.info(f"⏰ [冷却期] {token_address[:10]}... 在冷却中 (会保存到DB+WS，但不推送TG)")
@@ -541,7 +541,7 @@ class BSCMonitor:
             import traceback
             logger.error(traceback.format_exc())
     
-    def apply_third_layer_control(
+    async def apply_third_layer_control(
         self,
         token_address: str,
         pair_address: str,
@@ -576,7 +576,7 @@ class BSCMonitor:
             return
         
         # 检查冷却期
-        if self.check_alert_cooldown(token_address, cooldown_minutes):
+        if await self.check_alert_cooldown(token_address, cooldown_minutes):
             logger.info(
                 f"✅ [第三层通过] 代币 {token_address[:10]}... "
                 f"不在冷却期内，准备推送"
@@ -593,14 +593,14 @@ class BSCMonitor:
             )
             
             # 更新推送历史
-            self.update_alert_history(token_address)
+            await self.update_alert_history(token_address)
         else:
             logger.debug(
                 f"⏭️  [第三层拦截] 代币 {token_address[:10]}... "
                 f"在冷却期内，跳过推送"
             )
     
-    def get_token_monitor_config(self, token_address: str) -> Optional[Dict]:
+    async def get_token_monitor_config(self, token_address: str) -> Optional[Dict]:
         """
         从数据库获取代币监控配置
         
@@ -625,7 +625,7 @@ class BSCMonitor:
             logger.warning(f"查询代币监控配置失败: {e}")
             return None
     
-    def check_alert_cooldown(self, token_address: str, cooldown_minutes: float) -> bool:
+    async def check_alert_cooldown(self, token_address: str, cooldown_minutes: float) -> bool:
         """
         检查代币是否在冷却期内
         
@@ -667,7 +667,7 @@ class BSCMonitor:
             logger.error(f"检查冷却期失败: {e}")
             return True  # 出错时允许推送
     
-    def update_alert_history(self, token_address: str):
+    async def update_alert_history(self, token_address: str):
         """
         更新代币推送历史
         
@@ -819,7 +819,7 @@ class BSCMonitor:
             
             # 设置 Redis 冷却期（添加随机抖动）
             if not in_cooldown:  # 只在第一次推送时设置冷却期
-                self.update_alert_history(token_address)
+                await self.update_alert_history(token_address)
                 # 基础冷却时间 + 随机抖动
                 jitter = random.randint(0, self.cooldown_jitter)
                 total_cooldown = self.min_interval_seconds + jitter
