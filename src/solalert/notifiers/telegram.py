@@ -227,16 +227,9 @@ class TelegramNotifier(BaseNotifier):
             self.bot = None
             logger.error("❌ 未配置 Telegram Bot Token")
         
-        # 初始化消息队列
+        # 初始化消息队列（队列将在首次发送时自动启动）
         self.queue = TelegramQueue()
         
-        # 启动队列工作线程（在事件循环中）
-        try:
-            asyncio.create_task(self.queue.start_worker())
-        except RuntimeError:
-            # 如果还没有事件循环，稍后启动
-            logger.warning("⚠️ [TelegramNotifier] 事件循环未就绪，队列将在首次使用时启动")
-            
         logger.info("✅ Telegram通知器初始化成功（Bot API + 消息队列模式）")
         logger.info(f"   Bot Token: {self.bot_token[:20]}..." if self.bot_token else "   ⚠️ 未配置 Bot Token")
     

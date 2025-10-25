@@ -733,31 +733,39 @@ class BSCMonitor:
             name = token_data.get('name', 'Unknown')
             stats = token_data.get('stats5m', {})
             
-            # 获取当前价格（从储备量计算）
+            # 获取当前价格（从储备量计算，放到线程池避免阻塞）
             try:
-                token0, token1 = self.collector.get_token0_token1(pair_address)
-                reserve0, reserve1 = self.collector.get_reserves(pair_address)
+                token0, token1 = await asyncio.to_thread(
+                    self.collector.get_token0_token1, pair_address
+                )
+                reserve0, reserve1 = await asyncio.to_thread(
+                    self.collector.get_reserves, pair_address
+                )
                 
                 # 判断哪个是基础代币
                 if token0.lower() == token_address.lower():
-                    # token0 是基础代币
-                    decimals0 = self.collector.get_decimals(token0)
-                    decimals1 = self.collector.get_decimals(token1)
+                    # token0 是基础代币（放到线程池避免阻塞）
+                    decimals0 = await asyncio.to_thread(self.collector.get_decimals, token0)
+                    decimals1 = await asyncio.to_thread(self.collector.get_decimals, token1)
                     qty0 = reserve0 / (10 ** decimals0)
                     qty1 = reserve1 / (10 ** decimals1)
                     price_in_quote = qty1 / qty0 if qty0 > 0 else 0
                     
                     # 转换为 USDT
-                    price_usdt = self.collector.quote_to_usdt(token1, price_in_quote)
+                    price_usdt = await asyncio.to_thread(
+                        self.collector.quote_to_usdt, token1, price_in_quote
+                    )
                 else:
-                    # token1 是基础代币
-                    decimals0 = self.collector.get_decimals(token0)
-                    decimals1 = self.collector.get_decimals(token1)
+                    # token1 是基础代币（放到线程池避免阻塞）
+                    decimals0 = await asyncio.to_thread(self.collector.get_decimals, token0)
+                    decimals1 = await asyncio.to_thread(self.collector.get_decimals, token1)
                     qty0 = reserve0 / (10 ** decimals0)
                     qty1 = reserve1 / (10 ** decimals1)
                     price_in_quote = qty0 / qty1 if qty1 > 0 else 0
                     
-                    price_usdt = self.collector.quote_to_usdt(token0, price_in_quote)
+                    price_usdt = await asyncio.to_thread(
+                        self.collector.quote_to_usdt, token0, price_in_quote
+                    )
             
             except Exception as e:
                 logger.warning(f"计算价格失败: {e}")
