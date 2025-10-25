@@ -66,27 +66,100 @@ class TelegramQueue:
                 
                 logger.info(f"📨 [TelegramQueue] 从队列取出消息 -> {target} | 队列剩余: {self.queue.qsize()}")
                 
-                try:
-                    # 执行发送
-                    result = await bot.send_message(
-                        chat_id=target,
-                        text=message,
-                        parse_mode=parse_mode,
-                        message_thread_id=topic_id,
-                        reply_markup=reply_markup,
-                        disable_web_page_preview=True
-                    )
-                    # 设置结果
-                    if not future.done():
-                        future.set_result(result)
-                except Exception as e:
-                    # 设置异常
-                    if not future.done():
-                        future.set_exception(e)
-                finally:
-                    self.queue.task_done()
-                    # 发送完一条后，稍微等待一下，避免过快
-                    await asyncio.sleep(0.1)
+                import time
+                from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError
+                
+                send_start = time.monotonic()
+                max_retries = 2  # 最多重试2次
+                base_retry_delay = 3  # 基础重试间隔3秒
+                result = None
+                last_error = None
+                
+                # 重试机制
+                for attempt in range(max_retries):
+                    try:
+                        logger.info(f"🔄 [TelegramQueue] 尝试发送 ({attempt + 1}/{max_retries}) -> {target}")
+                        
+                        # 执行发送（带超时保护）
+                        result = await asyncio.wait_for(
+                            bot.send_message(
+                                chat_id=target,
+                                text=message,
+                                parse_mode=parse_mode,
+                                message_thread_id=topic_id,
+                                reply_markup=reply_markup,
+                                disable_web_page_preview=True
+                            ),
+                            timeout=20.0  # 单次尝试超时20秒（快速失败）
+                        )
+                        
+                        send_cost = time.monotonic() - send_start
+                        logger.info(f"✅ [TelegramQueue] 消息发送成功 -> {target} | message_id={result.message_id} | 耗时={send_cost:.2f}s | 尝试={attempt + 1}")
+                        
+                        # 设置结果
+                        if not future.done():
+                            future.set_result(result)
+                        break  # 成功则跳出重试循环
+                        
+                    except BadRequest as e:
+                        send_cost = time.monotonic() - send_start
+                        if "can't parse entities" in str(e).lower():
+                            logger.warning(f"⚠️ [TelegramQueue] 解析错误，尝试纯文本模式 -> {target}")
+                            try:
+                                result = await asyncio.wait_for(
+                                    bot.send_message(
+                                        chat_id=target,
+                                        text=message,
+                                        message_thread_id=topic_id,
+                                        reply_markup=reply_markup,
+                                        disable_web_page_preview=True
+                                    ),
+                                    timeout=20.0
+                                )
+                                logger.info(f"✅ [TelegramQueue] 纯文本模式成功 -> {target} | message_id={result.message_id}")
+                                if not future.done():
+                                    future.set_result(result)
+                                break
+                            except Exception as e2:
+                                logger.error(f"❌ [TelegramQueue] 纯文本模式也失败 -> {target}: {e2}")
+                                last_error = e2
+                        else:
+                            logger.error(f"❌ [TelegramQueue] BadRequest -> {target}: {e} | 耗时={send_cost:.2f}s")
+                            last_error = e
+                            break  # BadRequest 不重试
+                    
+                    except Forbidden as e:
+                        send_cost = time.monotonic() - send_start
+                        logger.error(f"❌ [TelegramQueue] 权限错误 -> {target}: {e} | 耗时={send_cost:.2f}s")
+                        last_error = e
+                        break  # Forbidden 不重试
+                    
+                    except (asyncio.TimeoutError, TimedOut, NetworkError) as e:
+                        send_cost = time.monotonic() - send_start
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            wait_time = base_retry_delay * (2 ** attempt)
+                            logger.warning(f"⚠️ [TelegramQueue] 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}) -> {target}: {e}")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logger.error(f"❌ [TelegramQueue] 网络错误，已达最大重试 -> {target} | 耗时={send_cost:.2f}s")
+                    
+                    except Exception as e:
+                        send_cost = time.monotonic() - send_start
+                        logger.error(f"❌ [TelegramQueue] 未知错误 ({attempt + 1}/{max_retries}) -> {target}: {type(e).__name__}: {e} | 耗时={send_cost:.2f}s")
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(base_retry_delay)
+                
+                # 如果所有重试都失败，设置异常
+                if result is None and not future.done():
+                    total_cost = time.monotonic() - send_start
+                    logger.error(f"❌ [TelegramQueue] 所有重试均失败 -> {target} | 总耗时={total_cost:.2f}s")
+                    future.set_exception(last_error or Exception("发送失败"))
+                
+                self.queue.task_done()
+                # 发送完一条后，稍微等待一下，避免过快
+                await asyncio.sleep(0.2)
                     
             except asyncio.TimeoutError:
                 # 队列空闲，继续等待
@@ -118,20 +191,21 @@ class TelegramNotifier(BaseNotifier):
         super().__init__(enabled)
         self.bot_token = bot_token or TELEGRAM_CONFIG.get('bot_token')
         
-        # 创建 Bot 实例，配置更大的连接池和超时
+        # 创建 Bot 实例，参考成功项目的配置
         if self.bot_token:
             from telegram.request import HTTPXRequest
-            # 配置 HTTPXRequest：更大的连接池，更长的超时
+            # 优化连接池配置（参考成功项目）
             request = HTTPXRequest(
-                connection_pool_size=20,  # 连接池大小
-                connect_timeout=30.0,      # 连接超时
-                read_timeout=30.0,         # 读取超时
-                write_timeout=30.0,        # 写入超时
-                pool_timeout=10.0          # 池超时
+                connect_timeout=15.0,       # 连接超时15秒（快速失败）
+                read_timeout=15.0,          # 读取超时15秒
+                pool_timeout=60.0,          # 连接池超时60秒（增加）
+                connection_pool_size=500,   # 连接池大小500（大幅增加）
             )
             self.bot = Bot(token=self.bot_token, request=request)
+            logger.info("✅ Telegram Bot 初始化成功 (连接池: 500, 超时: 15s/60s)")
         else:
             self.bot = None
+            logger.error("❌ 未配置 Telegram Bot Token")
         
         # 初始化消息队列
         self.queue = TelegramQueue()
@@ -195,12 +269,18 @@ class TelegramNotifier(BaseNotifier):
                     self.bot, target, message, parse_mode, topic_id, reply_markup
                 )
                 
-                # 等待队列处理完成（带超时）
-                result = await asyncio.wait_for(future, timeout=90.0)
+                # 等待队列处理完成（带超时，考虑队列等待时间 + 发送时间）
+                # 队列超时 = 60s(发送超时) + 30s(排队等待) = 90s
+                result = await asyncio.wait_for(future, timeout=120.0)
                 
             except asyncio.TimeoutError:
                 cost = time.monotonic() - start
-                logger.error(f"⏱️ [TelegramNotifier] 队列处理超时 -> {target} | 耗时={cost:.2f}s (超过90秒)")
+                logger.error(f"⏱️ [TelegramNotifier] 队列处理超时 -> {target} | 耗时={cost:.2f}s (超过120秒)")
+                return False
+            except TimeoutError as e:
+                # 来自队列的超时异常
+                cost = time.monotonic() - start
+                logger.error(f"⏱️ [TelegramNotifier] 发送超时 -> {target} | {e} | 总耗时={cost:.2f}s")
                 return False
             
             cost = time.monotonic() - start
