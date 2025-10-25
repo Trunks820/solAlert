@@ -102,6 +102,9 @@ class BSCMonitor:
         self.enable_telegram = config.get('notification', {}).get('enable_telegram', True)
         self.enable_wechat = config.get('notification', {}).get('enable_wechat', True)
         
+        # 打印通知配置状态
+        logger.info(f"📢 通知配置: Telegram={self.enable_telegram}, WeChat={self.enable_wechat}")
+        
         # Redis 客户端（用于冷却期控制）
         self.redis_client = get_redis()
         
@@ -796,6 +799,7 @@ class BSCMonitor:
                 logger.info(f"🔒 [冷却期] 已设置 {cooldown_minutes:.1f}分钟冷却期 (基础{self.min_interval_seconds//60}分 + 抖动{jitter}秒)")
             
             # 2. Telegram 推送（仅在非冷静期时推送）
+            logger.info(f"🔍 [TG推送检查] enable_telegram={self.enable_telegram}, in_cooldown={in_cooldown}")
             if self.enable_telegram and not in_cooldown:
                 message = self.format_bsc_tg_message(
                     token_address=token_address,
@@ -818,6 +822,13 @@ class BSCMonitor:
                 try:
                     from ..core.config import TELEGRAM_CONFIG
                     target_channel = str(TELEGRAM_CONFIG.get('bsc_channel_id'))
+                    
+                    # 推送前日志
+                    logger.info(
+                        f"📤 [BSCMonitor] 准备推送至 Telegram -> {target_channel} | "
+                        f"token={symbol} ({token_address[:10]}...) | "
+                        f"单笔${single_max:.0f} | 累计${total_sum:.0f}"
+                    )
                 
                     tg_success = await self.notification_manager.send_telegram(
                         target=target_channel,
@@ -825,14 +836,15 @@ class BSCMonitor:
                         reply_markup=buttons
                     )
                     
+                    # 推送后日志
                     if tg_success:
-                        logger.info(f"✅ [Telegram] {symbol} 推送成功（含GMGN+OKX按钮）")
+                        logger.info(f"✅ [BSCMonitor] Telegram 推送完成 -> {symbol} | success=True（含GMGN+OKX按钮）")
                     else:
-                        logger.warning(f"⚠️ [Telegram] 推送失败")
+                        logger.warning(f"⚠️ [BSCMonitor] Telegram 推送完成 -> {symbol} | success=False")
                 except Exception as e:
-                    logger.warning(f"⚠️  [Telegram] 推送异常: {e}")
+                    logger.error(f"❌ [BSCMonitor] Telegram 推送异常 -> {symbol}: {type(e).__name__} - {e}")
                     import traceback
-                    logger.error(traceback.format_exc())
+                    logger.error(f"   堆栈跟踪:\n{traceback.format_exc()}")
         
         except Exception as e:
             logger.error(f"发送推送通知失败: {e}")

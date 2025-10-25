@@ -78,8 +78,12 @@ class TelegramNotifier(BaseNotifier):
         
         try:
             # 直接调用 Bot API 发送消息
+            import time
+            from telegram.error import RetryAfter, TimedOut, NetworkError
+            
             logger.debug(f"📤 [Bot API] 发送消息 -> {target}")
             
+            start = time.monotonic()
             result = await self.bot.send_message(
                 chat_id=target,
                 text=message,
@@ -88,21 +92,50 @@ class TelegramNotifier(BaseNotifier):
                 reply_markup=reply_markup,
                 disable_web_page_preview=True
             )
+            cost = time.monotonic() - start
             
             if result:
-                self.log_success(target, f"Message ID: {result.message_id}")
+                logger.info(
+                    f"✅ [TelegramNotifier] 消息发送成功 -> {target} | "
+                    f"message_id={result.message_id} | 耗时={cost:.2f}s | "
+                    f"thread_id={topic_id or 'None'} | buttons={bool(reply_markup)}"
+                )
                 return True
             else:
                 logger.error(f"❌ [TelegramNotifier] 发送失败 -> {target}")
                 return False
                 
+        except RetryAfter as e:
+            logger.warning(
+                f"⏳ [TelegramNotifier] 被 Telegram 限流 -> {target} | "
+                f"重试等待={e.retry_after}s"
+            )
+            return False
+        except TimedOut as e:
+            logger.error(
+                f"⌛ [TelegramNotifier] 请求超时 -> {target} | "
+                f"错误详情: {e}"
+            )
+            return False
+        except NetworkError as e:
+            logger.error(
+                f"🌐 [TelegramNotifier] 网络错误 -> {target} | "
+                f"错误详情: {e}"
+            )
+            return False
         except TelegramError as e:
-            logger.error(f"❌ [TelegramNotifier] Telegram错误 -> {target}: {e}")
+            logger.error(
+                f"❌ [TelegramNotifier] Telegram错误 -> {target} | "
+                f"错误类型: {type(e).__name__} | 详情: {e}"
+            )
             return False
         except Exception as e:
             import traceback
-            logger.error(f"❌ [TelegramNotifier] 发送异常 -> {target}: {type(e).__name__} - {e}")
-            logger.error(f"   详细错误: {traceback.format_exc()}")
+            logger.error(
+                f"❌ [TelegramNotifier] 发送异常 -> {target} | "
+                f"错误类型: {type(e).__name__} | 详情: {e}"
+            )
+            logger.error(f"   堆栈跟踪:\n{traceback.format_exc()}")
             return False
     
     async def send_to_forum_topic(

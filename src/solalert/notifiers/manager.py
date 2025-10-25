@@ -46,6 +46,12 @@ class NotificationManager:
         reply_markup: Optional[InlineKeyboardMarkup] = None
     ) -> bool:
         """发送Telegram消息"""
+        # 发送前日志
+        logger.info(
+            f"📤 [NotificationManager] 准备发送 Telegram 消息 -> {target} | "
+            f"文本长度={len(message)} | buttons={bool(reply_markup)} | topic={topic_id}"
+        )
+        
         return await self.telegram.send(
             target=target,
             message=message,
