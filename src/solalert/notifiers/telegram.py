@@ -66,6 +66,15 @@ class TelegramQueue:
                 
                 logger.info(f"📨 [TelegramQueue] 从队列取出消息 -> {target} | 队列剩余: {self.queue.qsize()}")
                 
+                # 诊断：打印当前所有任务
+                try:
+                    import asyncio
+                    all_tasks = asyncio.all_tasks()
+                    running_count = len([t for t in all_tasks if not t.done()])
+                    logger.info(f"🔍 [诊断] 当前运行中的异步任务数: {running_count}/{len(all_tasks)}")
+                except Exception as e:
+                    logger.debug(f"任务统计失败: {e}")
+                
                 import time
                 from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError
                 

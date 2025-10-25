@@ -57,6 +57,12 @@ class BSCBlockCollector:
         self.SEL_SYMBOL = "0x95d89b41"
         self.SEL_NAME = "0x06fdde03"
         
+        # 事件循环引用（用于线程间通信）
+        self.event_loop = None
+        
+        # 停止标记（用于优雅退出）
+        self._stop_flag = False
+        
         # 缓存
         self.tokens01_cache: Dict[str, Tuple[str, str]] = {}  # pair -> (token0, token1)
         self.decimals_cache: Dict[str, int] = {}  # token -> decimals
@@ -625,9 +631,10 @@ class BSCBlockCollector:
             logger.error(f"处理区块 {block_number} 失败: {e}")
             return []
     
-    async def collect(self):
+    def collect(self):
         """
         主监控循环（实现 BaseCollector 抽象方法）
+        注意：此方法是同步的，应该在独立线程中运行（通过 asyncio.to_thread）
         """
         logger.info("🚀 BSC 区块监控已启动...")
         
@@ -638,7 +645,7 @@ class BSCBlockCollector:
                 self.last_block = self.get_latest_safe_block()
                 logger.info(f"✅ 从区块 {self.last_block} 开始监控")
             
-            while True:
+            while not self._stop_flag:
                 try:
                     safe_block = self.get_latest_safe_block()
                     
@@ -648,12 +655,34 @@ class BSCBlockCollector:
                         
                         # 如果有交易事件，调用回调处理
                         if events:
-                            # 如果回调是协程，使用 await；否则直接调用
-                            import asyncio
                             import inspect
+                            import asyncio
+                            
                             if inspect.iscoroutinefunction(self.on_data_received):
-                                await self.on_data_received(events)
+                                # 协程回调：需要提交到主事件循环
+                                if self.event_loop:
+                                    try:
+                                        # 提交协程到事件循环，保存 future 以便捕获回调异常
+                                        future = asyncio.run_coroutine_threadsafe(
+                                            self.on_data_received(events), self.event_loop
+                                        )
+                                        # 添加异常回调，记录回调执行中的错误
+                                        def log_callback_exception(fut):
+                                            try:
+                                                fut.result()  # 触发异常（如果有）
+                                            except Exception as e:
+                                                logger.error(f"❌ 回调执行异常: {e}")
+                                                import traceback
+                                                logger.error(traceback.format_exc())
+                                        future.add_done_callback(log_callback_exception)
+                                    except Exception as e:
+                                        logger.error(f"❌ 提交回调任务失败: {e}")
+                                        import traceback
+                                        logger.error(traceback.format_exc())
+                                else:
+                                    logger.error("❌ 事件循环未设置，无法调用协程回调")
                             else:
+                                # 同步回调，直接调用
                                 self.on_data_received(events)
                         
                         self.last_block += 1
@@ -671,6 +700,13 @@ class BSCBlockCollector:
         
         except KeyboardInterrupt:
             logger.info("⏹️  BSC 区块监控已停止")
+        finally:
+            logger.info("🛑 BSC 区块监控线程退出")
+    
+    def stop(self):
+        """停止监控（设置停止标记）"""
+        logger.info("🛑 收到停止信号，设置停止标记...")
+        self._stop_flag = True
     
     def on_data_received(self, events: List[Dict]):
         """

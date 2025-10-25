@@ -124,6 +124,14 @@ class BSCMonitor:
         self.collector = BSCBlockCollector(config)
         self.collector.on_data_received = self.handle_block_events
         
+        # 设置事件循环引用（用于线程间通信）
+        try:
+            import asyncio
+            self.collector.event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 如果还没有运行循环，在 start() 时再设置
+            pass
+        
         # 初始化完成（详细配置已在 start.py 显示）
         logger.debug(f"BSC Monitor 已就绪")
     
@@ -365,8 +373,10 @@ class BSCMonitor:
                     }
                     filter_stats['fourmeme_found'] += 1
                 else:
-                    # 外盘：调用 API 验证平台
-                    launchpad_info = self.dbotx_api.get_token_launchpad_info('bsc', token_address)
+                    # 外盘：调用 API 验证平台（放到线程池避免阻塞）
+                    launchpad_info = await asyncio.to_thread(
+                        self.dbotx_api.get_token_launchpad_info, 'bsc', token_address
+                    )
                     
                     if launchpad_info is None:
                         filter_stats['non_launchpad'] += 1
@@ -453,8 +463,10 @@ class BSCMonitor:
                 logger.debug(f"⏭️  跳过 {token_address[:10]}... (无交易对地址)")
                 return
             
-            # 2. 调用 DBotX API 获取代币数据
-            raw_data = self.dbotx_api.get_pair_info('bsc', api_pair_address)
+            # 2. 调用 DBotX API 获取代币数据（放到线程池避免阻塞）
+            raw_data = await asyncio.to_thread(
+                self.dbotx_api.get_pair_info, 'bsc', api_pair_address
+            )
             
             if not raw_data:
                 logger.debug(f"⏭️  跳过 {token_address[:10]}... (无DBotX数据)")
@@ -761,8 +773,9 @@ class BSCMonitor:
             market_cap = token_data.get('market_cap', 0)
             logo = token_data.get('logo', '')
             
-            # 1. 数据库写入 + WebSocket 推送
-            success = self.alert_recorder.write_bsc_alert(
+            # 1. 数据库写入 + WebSocket 推送（放到线程池避免阻塞事件循环）
+            success = await asyncio.to_thread(
+                self.alert_recorder.write_bsc_alert,
                 ca=token_address,
                 token_name=name,
                 token_symbol=symbol,
@@ -932,12 +945,23 @@ class BSCMonitor:
         return message
     
     async def start(self):
-        """启动监控"""
+        """启动监控（BSC采集器在独立线程运行，避免阻塞事件循环）"""
         logger.info("🚀 BSC 监控器启动中...")
-        await self.collector.collect()
+        logger.info("⚙️  BSC区块采集器将在独立线程运行（避免阻塞主事件循环）")
+        
+        # 确保设置事件循环引用（用于线程间通信）
+        if not self.collector.event_loop:
+            import asyncio
+            self.collector.event_loop = asyncio.get_running_loop()
+            logger.info("✅ 事件循环引用已设置")
+        
+        # 在独立线程中运行同步的 collect() 方法
+        await asyncio.to_thread(self.collector.collect)
     
     async def stop(self):
         """停止监控"""
         logger.info("⏹️  BSC 监控器停止中...")
-        await self.collector.stop()
+        # collector.stop() 现在是同步方法，直接调用
+        self.collector.stop()
+        logger.info("✅ BSC 监控器已停止")
 
