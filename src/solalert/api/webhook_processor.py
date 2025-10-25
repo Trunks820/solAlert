@@ -674,7 +674,7 @@ class AlchemyWebhookProcessor:
                         events.append(out)
             
             # 打印详细统计
-            logger.info(f"📊 [Processor] 区块 #{block_number} 处理结果:")
+            logger.info(f"📊 [Webhook] 区块 #{block_number} 处理结果:")
             logger.info(f"   └─ 总 Logs: {stats['total_logs']} | 交易数: {stats['total_txs']}")
             if stats['fourmeme_internal'] > 0:
                 logger.info(f"   └─ 🟡 Fourmeme 内盘: {stats['fourmeme_internal']} 笔")

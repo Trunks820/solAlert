@@ -87,7 +87,7 @@ class AlchemyWebhookHandler:
             swap_events = []
             
             # 简化日志：单行显示关键信息
-            logger.info(f"📦 Webhook #{self.received_count} | 区块 #{block_number} | Logs: {len(logs)}")
+            logger.info(f"📦 [Webhook] #{self.received_count} | 区块 #{block_number} | Logs: {len(logs)}")
             
             # 4. 解析每个 log（Swap 事件）
             for log in logs:
@@ -146,7 +146,7 @@ class AlchemyWebhookHandler:
                     filtered_events = self.processor.process_webhook_data(data)
                     
                     if filtered_events:
-                        logger.info(f"✅ 目标交易: {len(filtered_events)} 个 → 进入金额/平台/指标过滤...")
+                        logger.info(f"✅ [Webhook] 目标交易: {len(filtered_events)} 个 → 进入金额/平台/指标过滤...")
                         
                         # 转发给 BSC Monitor 进行后续处理
                         if self.bsc_monitor:
@@ -234,7 +234,8 @@ async def process_webhook_background(data: dict):
                             'data': data
                         }
                         f.write(json.dumps(data_with_meta, ensure_ascii=False) + '\n')
-                    print(f"💾 数据已追加到: {filename}")
+                    # 移除文件追加日志（用户反馈：影响阅读）
+                    # print(f"💾 数据已追加到: {filename}")
                 except Exception as e:
                     logger.error(f"保存文件失败: {e}")
             
