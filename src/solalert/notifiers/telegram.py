@@ -5,9 +5,13 @@ Telegram 通知器
 """
 import asyncio
 import logging
+import time
+import traceback
 from typing import Optional
+import httpx
 from telegram import Bot, InlineKeyboardMarkup
-from telegram.error import TelegramError
+from telegram.request import HTTPXRequest
+from telegram.error import TelegramError, BadRequest, Forbidden, TimedOut, NetworkError, RetryAfter
 
 from .base import BaseNotifier
 from ..core.config import TELEGRAM_CONFIG
@@ -68,15 +72,11 @@ class TelegramQueue:
                 
                 # 诊断：打印当前所有任务
                 try:
-                    import asyncio
                     all_tasks = asyncio.all_tasks()
                     running_count = len([t for t in all_tasks if not t.done()])
                     logger.info(f"🔍 [诊断] 当前运行中的异步任务数: {running_count}/{len(all_tasks)}")
                 except Exception as e:
                     logger.debug(f"任务统计失败: {e}")
-                
-                import time
-                from telegram.error import BadRequest, Forbidden, TimedOut, NetworkError
                 
                 send_start = time.monotonic()
                 max_retries = 2  # 最多重试2次
@@ -208,8 +208,6 @@ class TelegramNotifier(BaseNotifier):
         
         # 创建 Bot 实例，参考成功项目的配置
         if self.bot_token:
-            from telegram.request import HTTPXRequest
-            import httpx
             
             # 优化连接池配置（参考成功项目） - 使用更激进的超时避免卡住
             request = HTTPXRequest(
@@ -266,11 +264,13 @@ class TelegramNotifier(BaseNotifier):
         try:
             # 确保队列工作线程已启动
             if not self.queue._running:
+                logger.info(f"🔧 [TelegramNotifier] 队列未运行，准备启动... (_running={self.queue._running})")
                 await self.queue.start_worker()
+                logger.info(f"✅ [TelegramNotifier] 队列启动完成 (_running={self.queue._running})")
+            else:
+                logger.debug(f"✓ [TelegramNotifier] 队列已在运行 (_running={self.queue._running})")
             
             # 直接调用 Bot API 发送消息（通过队列）
-            import time
-            from telegram.error import RetryAfter, TimedOut, NetworkError
             
             logger.info(f"🚀 [TelegramNotifier] 准备发送消息 -> {target} | 消息长度={len(message)}")
             
@@ -334,7 +334,6 @@ class TelegramNotifier(BaseNotifier):
             )
             return False
         except Exception as e:
-            import traceback
             logger.error(
                 f"❌ [TelegramNotifier] 发送异常 -> {target} | "
                 f"错误类型: {type(e).__name__} | 详情: {e}"

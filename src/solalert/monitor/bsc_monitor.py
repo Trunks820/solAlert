@@ -617,7 +617,9 @@ class BSCMonitor:
             WHERE ca = %s AND is_active = 1
             LIMIT 1
             """
-            result = self.db.execute_query(sql, (token_address,), fetch_one=True)
+            result = await asyncio.to_thread(
+                self.db.execute_query, sql, (token_address,), fetch_one=True
+            )
             return result
         except Exception as e:
             logger.warning(f"查询代币监控配置失败: {e}")
@@ -638,7 +640,9 @@ class BSCMonitor:
         redis_key = f"bsc:alert:last:{token_address.lower()}"
         
         try:
-            last_alert_data = self.redis_client.get(redis_key)
+            last_alert_data = await asyncio.to_thread(
+                self.redis_client.get, redis_key
+            )
             
             if not last_alert_data:
                 return True  # 首次推送
@@ -674,7 +678,9 @@ class BSCMonitor:
         
         try:
             # 读取历史记录
-            last_alert_data = self.redis_client.get(redis_key)
+            last_alert_data = await asyncio.to_thread(
+                self.redis_client.get, redis_key
+            )
             alert_count = 1
             
             if last_alert_data:
@@ -692,7 +698,8 @@ class BSCMonitor:
             }
             
             # 保存到 Redis，TTL 10 分钟
-            self.redis_client.set(
+            await asyncio.to_thread(
+                self.redis_client.set,
                 redis_key,
                 json.dumps(alert_data),
                 ex=600  # 10 分钟
