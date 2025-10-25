@@ -10,6 +10,7 @@ BSC 监控主逻辑
 - 1分钟实时数据（比 GMGN 5分钟数据快5倍）
 - 单次 API 调用获取所有信息（launchpad + 价格 + 交易量）
 """
+import asyncio
 import logging
 import time
 import json
@@ -126,7 +127,6 @@ class BSCMonitor:
         
         # 设置事件循环引用（用于线程间通信）
         try:
-            import asyncio
             self.collector.event_loop = asyncio.get_running_loop()
         except RuntimeError:
             # 如果还没有运行循环，在 start() 时再设置
@@ -951,7 +951,6 @@ class BSCMonitor:
         
         # 确保设置事件循环引用（用于线程间通信）
         if not self.collector.event_loop:
-            import asyncio
             self.collector.event_loop = asyncio.get_running_loop()
             logger.info("✅ 事件循环引用已设置")
         
