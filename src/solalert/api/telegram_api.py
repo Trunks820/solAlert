@@ -221,13 +221,14 @@ class TelegramAPI:
                             }
                     
                     except httpx.TimeoutException as e:
+                        error_detail = f"URL={url}, 超时={type(e).__name__}"
                         if attempt < max_retries - 1:
                             wait_time = 2 * (2 ** attempt)
-                            logger.warning(f"⚠️ [HTTP API] 超时，{wait_time}秒后重试: {e}")
+                            logger.warning(f"⚠️ [HTTP API] 超时，{wait_time}秒后重试 ({error_detail})")
                             await asyncio.sleep(wait_time)
                         else:
-                            logger.error(f"❌ [HTTP API] 超时，已重试{max_retries}次: {e}")
-                            return {'success': False, 'chat_id': resolved_chat_id, 'error': f'timeout: {e}'}
+                            logger.error(f"❌ [HTTP API] 超时，已重试{max_retries}次 ({error_detail})")
+                            return {'success': False, 'chat_id': resolved_chat_id, 'error': f'timeout after {max_retries} retries: {error_detail}'}
                     
                     except httpx.HTTPStatusError as e:
                         logger.error(f"❌ [HTTP API] HTTP错误 {e.response.status_code}: {e}")

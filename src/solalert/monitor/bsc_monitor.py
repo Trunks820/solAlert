@@ -62,9 +62,21 @@ class BSCMonitor:
         # 全局监控配置（从数据库或 Redis 读取）
         self.global_config = self.load_global_config()
         
-        # 第一层过滤：交易金额阈值
-        self.single_max_usdt = self.global_config.get('min_transaction_usd', 400) if self.global_config else 400
-        self.block_accumulate_usdt = 1000  # 区块累计阈值
+        # 第一层过滤：交易金额阈值（读取内外盘配置，取最小值避免遗漏）
+        # 注：内外盘的精确阈值会在第二层根据 launchpad_status 动态判断
+        internal_config = self.load_global_config(market_type='internal')
+        external_config = self.load_global_config(market_type='external')
+        
+        # 使用两个配置中的最小值作为第一层过滤阈值
+        internal_min = internal_config.get('min_transaction_usd', 200) if internal_config else 200
+        internal_cumulative = internal_config.get('cumulative_min_amount_usd', 500) if internal_config else 500
+        external_min = external_config.get('min_transaction_usd', 400) if external_config else 400
+        external_cumulative = external_config.get('cumulative_min_amount_usd', 1000) if external_config else 1000
+        
+        self.single_max_usdt = min(internal_min, external_min)
+        self.block_accumulate_usdt = min(internal_cumulative, external_cumulative)
+        
+        logger.info(f"📊 第一层过滤阈值（取内外盘最小值）: 单笔>={self.single_max_usdt}U, 累计>={self.block_accumulate_usdt}U")
         
         # 第二层过滤：events_config（从配置解析）
         self.events_config = self.parse_events_config(
@@ -78,8 +90,6 @@ class BSCMonitor:
         # 通知配置
         self.enable_telegram = config.get('notification', {}).get('enable_telegram', True)
         self.enable_wechat = config.get('notification', {}).get('enable_wechat', True)
-        
-        logger.info(f"🔧 [初始化] enable_telegram={self.enable_telegram}, enable_wechat={self.enable_wechat}")
         
         # Redis 客户端（用于冷却期控制）
         self.redis_client = get_redis()
@@ -103,15 +113,23 @@ class BSCMonitor:
         # 初始化完成（详细配置已在 start.py 显示）
         logger.debug(f"BSC Monitor 已就绪")
     
-    def load_global_config(self) -> Optional[Dict]:
+    def load_global_config(self, market_type: str = None) -> Optional[Dict]:
         """
         加载全局监控配置（优先从 Redis 读取）
+        
+        Args:
+            market_type: 市场类型 ('internal' 内盘 或 'external' 外盘)
         
         Returns:
             配置字典或 None
         """
         chain_type = 'bsc'
-        redis_key = f"global_monitor:config:{chain_type}"
+        # 如果指定了 market_type，则使用分类配置
+        if market_type:
+            redis_key = f"global_monitor:config:{chain_type}:{market_type}"
+        else:
+            # 兼容旧配置（没有 market_type）
+            redis_key = f"global_monitor:config:{chain_type}"
         
         try:
             # 1. 优先从 Redis 读取
@@ -157,8 +175,10 @@ class BSCMonitor:
                     'id': cached_config.get('id'),
                     'config_name': cached_config.get('configName'),
                     'chain_type': cached_config.get('chainType'),
+                    'market_type': cached_config.get('marketType'),
                     'source': cached_config.get('source'),
                     'min_transaction_usd': cached_config.get('minTransactionUsd'),
+                    'cumulative_min_amount_usd': cached_config.get('cumulativeMinAmountUsd'),
                     'events_config': cached_config.get('eventsConfig'),
                     'trigger_logic': cached_config.get('triggerLogic'),
                     'notify_methods': cached_config.get('notifyMethods'),
@@ -169,14 +189,26 @@ class BSCMonitor:
             # 2. Redis 没有，从数据库读取
             logger.debug("Redis 中未找到配置，从数据库加载...")
             db = get_db()
-            sql = """
-            SELECT id, config_name, chain_type, source, min_transaction_usd,
-                   events_config, trigger_logic, notify_methods, status
-            FROM global_monitor_config
-            WHERE chain_type = %s AND status = '1'
-            LIMIT 1
-            """
-            result = db.execute_query(sql, (chain_type,), fetch_one=True)
+            
+            # 构建查询条件
+            if market_type:
+                sql = """
+                SELECT id, config_name, chain_type, market_type, source, min_transaction_usd,
+                       cumulative_min_amount_usd, events_config, trigger_logic, notify_methods, status
+                FROM global_monitor_config
+                WHERE chain_type = %s AND market_type = %s AND status = '1'
+                LIMIT 1
+                """
+                result = db.execute_query(sql, (chain_type, market_type), fetch_one=True)
+            else:
+                sql = """
+                SELECT id, config_name, chain_type, market_type, source, min_transaction_usd,
+                       cumulative_min_amount_usd, events_config, trigger_logic, notify_methods, status
+                FROM global_monitor_config
+                WHERE chain_type = %s AND status = '1'
+                LIMIT 1
+                """
+                result = db.execute_query(sql, (chain_type,), fetch_one=True)
             
             if result:
                 logger.info(f"✅ 从数据库加载全局配置: {result.get('config_name')}")
@@ -187,8 +219,10 @@ class BSCMonitor:
                         'id': result.get('id'),
                         'configName': result.get('config_name'),
                         'chainType': result.get('chain_type'),
+                        'marketType': result.get('market_type'),
                         'source': result.get('source'),
                         'minTransactionUsd': float(result.get('min_transaction_usd', 0)),
+                        'cumulativeMinAmountUsd': float(result.get('cumulative_min_amount_usd', 0)),
                         'eventsConfig': result.get('events_config'),
                         'triggerLogic': result.get('trigger_logic'),
                         'notifyMethods': result.get('notify_methods'),
@@ -358,6 +392,29 @@ class BSCMonitor:
             in_cooldown: 是否在冷静期内
         """
         try:
+            # 0. 判断内外盘，动态加载配置
+            launchpad_status = launchpad_info.get('launchpad_status', 0)
+            market_type = 'internal' if launchpad_status == 0 else 'external'
+            pool_name = "内盘" if market_type == 'internal' else "外盘"
+            
+            # 动态加载该市场类型的配置
+            market_config = self.load_global_config(market_type=market_type)
+            if not market_config:
+                logger.warning(f"⚠️  未找到 {market_type} 配置，使用默认配置")
+                market_config = self.global_config
+            
+            # 使用该配置的阈值
+            market_events_config = self.parse_events_config(market_config.get('events_config'))
+            market_min_transaction = market_config.get('min_transaction_usd', 400)
+            market_cumulative_min = market_config.get('cumulative_min_amount_usd', 1000)
+            
+            logger.debug(f"🔧 [{market_type.upper()}] 阈值: 单笔>={market_min_transaction}U, 累计>={market_cumulative_min}U")
+            
+            # 复查金额是否达到该市场类型的阈值
+            if single_max < market_min_transaction and total_sum < market_cumulative_min:
+                logger.debug(f"⏭️  跳过 {token_address[:10]}... ({pool_name}金额未达标: 单笔{single_max:.0f}<{market_min_transaction} 且 累计{total_sum:.0f}<{market_cumulative_min})")
+                return
+            
             # 1. 使用 launchpad_info 中返回的交易对地址获取详细数据
             api_pair_address = launchpad_info.get('pair_address')
             if not api_pair_address:
@@ -390,21 +447,22 @@ class BSCMonitor:
             }
             
             # 4. 判断是否满足 events_config
-            if not self.events_config:
+            if not market_events_config:
                 logger.debug("⏭️  跳过 (无events_config)")
                 return
             
             symbol = token_data.get('symbol', 'Unknown')
+            pool_emoji = "🔴" if market_type == 'internal' else "🟢"
             logger.info(f"")
-            logger.info(f"🔎 [DBotX 指标检查] {symbol} ({token_address[:10]}...)")
+            logger.info(f"🔎 [DBotX 指标检查] {pool_emoji}{pool_name} {symbol} ({token_address[:10]}...)")
             logger.info(f"   ├─ 1分钟涨幅: {price_change_1m:+.2f}%")
             logger.info(f"   ├─ 1分钟交易量: ${volume_1m:,.2f}")
             logger.info(f"   └─ 5分钟涨幅: {token_data.get('price_5m', 0):+.2f}% (参考)")
             
-            # 使用 TriggerLogic 评估触发条件
-            trigger_logic = self.global_config.get('trigger_logic', 'any') if self.global_config else 'any'
+            # 使用 TriggerLogic 评估触发条件（使用该市场类型的配置）
+            trigger_logic = market_config.get('trigger_logic', 'any') if market_config else 'any'
             should_trigger, triggered_events = TriggerLogic.evaluate_trigger(
-                stats, self.events_config, trigger_logic
+                stats, market_events_config, trigger_logic
             )
             
             if not should_trigger:
@@ -699,8 +757,6 @@ class BSCMonitor:
             else:
                 logger.info(f"✅ [数据库] 写入成功 | WebSocket 已推送")
             
-            logger.info(f"🔍 [配置检查] enable_telegram={self.enable_telegram}, enable_wechat={self.enable_wechat}, in_cooldown={in_cooldown}")
-            
             # 设置 Redis 冷却期（添加随机抖动）
             if not in_cooldown:  # 只在第一次推送时设置冷却期
                 self.update_alert_history(token_address)
@@ -711,9 +767,7 @@ class BSCMonitor:
                 logger.info(f"🔒 [冷却期] 已设置 {cooldown_minutes:.1f}分钟冷却期 (基础{self.min_interval_seconds//60}分 + 抖动{jitter}秒)")
             
             # 2. Telegram 推送（仅在非冷静期时推送）
-            logger.info(f"📤 [TG检查] enable_telegram={self.enable_telegram}, in_cooldown={in_cooldown}")
             if self.enable_telegram and not in_cooldown:
-                logger.info(f"📤 [Telegram] 开始准备发送消息...")
                 message = self.format_bsc_tg_message(
                     token_address=token_address,
                     symbol=symbol,
@@ -735,7 +789,6 @@ class BSCMonitor:
                 try:
                     from ..core.config import TELEGRAM_CONFIG
                     target_channel = str(TELEGRAM_CONFIG.get('bsc_channel_id'))
-                    logger.info(f"📤 [Telegram] 目标频道: {target_channel}")
                 
                     tg_success = await self.notification_manager.send_telegram(
                         target=target_channel,
@@ -743,16 +796,10 @@ class BSCMonitor:
                         reply_markup=buttons
                     )
                     
-                    logger.info(f"📤 [Telegram] 发送结果: {tg_success}")
-                    
                     if tg_success:
-                        logger.info(f"✅ [Telegram] 推送成功 -> BSC 频道")
-                        logger.info(f"")
-                        logger.info(f"🎉 [完成] {symbol} 推送流程已全部完成！")
-                        logger.info("=" * 80)
-                        logger.info("")
+                        logger.info(f"✅ [Telegram] {symbol} 推送成功（含GMGN+OKX按钮）")
                     else:
-                        logger.warning(f"⚠️  [Telegram] 推送失败")
+                        logger.warning(f"⚠️ [Telegram] 推送失败")
                 except Exception as e:
                     logger.warning(f"⚠️  [Telegram] 推送异常: {e}")
                     import traceback

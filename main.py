@@ -196,7 +196,11 @@ def run_bsc_monitor():
     
     try:
         # 1. 初始化监控器
-        from solalert.api.alchemy_webhook import webhook_handler, start_webhook_server
+        try:
+            from solalert.api.alchemy_webhook import webhook_handler, start_webhook_server
+        except ImportError as e:
+            logger.error(f"❌ 无法导入 alchemy_webhook: {e}")
+            return
         
         monitor = BSCMonitor(config=BSC_MONITOR_CONFIG)
         webhook_handler.set_monitor(monitor)
@@ -244,26 +248,36 @@ async def run_all_services():
     token_monitor = TokenMonitorEngine()
     
     # 初始化 BSC Webhook 监控
-    from solalert.api.alchemy_webhook import webhook_handler, start_webhook_server_async
-    bsc_monitor = BSCMonitor(config=BSC_MONITOR_CONFIG)
-    webhook_handler.set_monitor(bsc_monitor)
-    
-    logger.info("=" * 80)
-    logger.info("📊 BSC监控配置:")
-    logger.info(f"   单笔阈值: {bsc_monitor.single_max_usdt} USDT | 累计阈值: {bsc_monitor.block_accumulate_usdt} USDT")
-    logger.info(f"   Webhook: http://0.0.0.0:8001/webhook/alchemy/bsc")
-    logger.info("=" * 80)
-    
-    # 并发运行所有服务（包括 BSC Webhook）
+    bsc_webhook_enabled = False
     try:
-        await asyncio.gather(
-            pump_listener.start(),
-            bonk_collector.start(),
-            fourmeme_listener.start(),
-            token_monitor.run_monitor_schedule(interval_minutes=1),  # 1分钟间隔监控
-            start_webhook_server_async(host="0.0.0.0", port=8001),  # BSC Webhook 监控
-            return_exceptions=True
-        )
+        from solalert.api.alchemy_webhook import webhook_handler, start_webhook_server_async
+        bsc_monitor = BSCMonitor(config=BSC_MONITOR_CONFIG)
+        webhook_handler.set_monitor(bsc_monitor)
+        bsc_webhook_enabled = True
+        
+        logger.info("=" * 80)
+        logger.info("📊 BSC监控配置:")
+        logger.info(f"   单笔阈值: {bsc_monitor.single_max_usdt} USDT | 累计阈值: {bsc_monitor.block_accumulate_usdt} USDT")
+        logger.info(f"   Webhook: http://0.0.0.0:8001/webhook/alchemy/bsc")
+        logger.info("=" * 80)
+    except ImportError as e:
+        logger.warning(f"⚠️ BSC Webhook 监控未启用（缺少依赖: {e}）")
+        logger.info("   提示: 运行 'pip install fastapi uvicorn' 启用 BSC 监控")
+    
+    # 并发运行所有服务
+    services = [
+        pump_listener.start(),
+        bonk_collector.start(),
+        fourmeme_listener.start(),
+        token_monitor.run_monitor_schedule(interval_minutes=1),  # 1分钟间隔监控
+    ]
+    
+    # 如果 BSC Webhook 可用，添加到服务列表
+    if bsc_webhook_enabled:
+        services.append(start_webhook_server_async(host="0.0.0.0", port=8001))
+    
+    try:
+        await asyncio.gather(*services, return_exceptions=True)
     except KeyboardInterrupt:
         logger.info("⏹️  用户停止所有服务")
     except Exception as e:
