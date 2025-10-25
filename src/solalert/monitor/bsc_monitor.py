@@ -59,24 +59,35 @@ class BSCMonitor:
         """
         self.config = config
         
-        # 全局监控配置（从数据库或 Redis 读取）
+        # 全局监控配置（从数据库或 Redis 读取，缓存起来）
         self.global_config = self.load_global_config()
         
-        # 第一层过滤：交易金额阈值（读取内外盘配置，取最小值避免遗漏）
-        # 注：内外盘的精确阈值会在第二层根据 launchpad_status 动态判断
-        internal_config = self.load_global_config(market_type='internal')
-        external_config = self.load_global_config(market_type='external')
+        # 加载并缓存内外盘配置
+        self.internal_config = self.load_global_config(market_type='internal')
+        self.external_config = self.load_global_config(market_type='external')
         
-        # 使用两个配置中的最小值作为第一层过滤阈值
-        internal_min = internal_config.get('min_transaction_usd', 200) if internal_config else 200
-        internal_cumulative = internal_config.get('cumulative_min_amount_usd', 500) if internal_config else 500
-        external_min = external_config.get('min_transaction_usd', 400) if external_config else 400
-        external_cumulative = external_config.get('cumulative_min_amount_usd', 1000) if external_config else 1000
+        # 解析内外盘的 events_config
+        self.internal_events_config = self.parse_events_config(
+            self.internal_config.get('events_config') if self.internal_config else None
+        )
+        self.external_events_config = self.parse_events_config(
+            self.external_config.get('events_config') if self.external_config else None
+        )
+        
+        # 记录配置信息
+        if self.internal_config:
+            logger.info(f"📊 内盘配置: 单笔>={self.internal_config.get('min_transaction_usd')}U, 累计>={self.internal_config.get('cumulative_min_amount_usd')}U, 涨幅>={self.internal_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.internal_events_config.get('volume', {}).get('threshold')}")
+        if self.external_config:
+            logger.info(f"📊 外盘配置: 单笔>={self.external_config.get('min_transaction_usd')}U, 累计>={self.external_config.get('cumulative_min_amount_usd')}U, 涨幅>={self.external_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.external_events_config.get('volume', {}).get('threshold')}")
+        
+        # 用于第一层快速过滤的宽松阈值（取最小值）
+        internal_min = self.internal_config.get('min_transaction_usd', 200) if self.internal_config else 200
+        internal_cumulative = self.internal_config.get('cumulative_min_amount_usd', 500) if self.internal_config else 500
+        external_min = self.external_config.get('min_transaction_usd', 400) if self.external_config else 400
+        external_cumulative = self.external_config.get('cumulative_min_amount_usd', 1000) if self.external_config else 1000
         
         self.single_max_usdt = min(internal_min, external_min)
         self.block_accumulate_usdt = min(internal_cumulative, external_cumulative)
-        
-        logger.info(f"📊 第一层过滤阈值（取内外盘最小值）: 单笔>={self.single_max_usdt}U, 累计>={self.block_accumulate_usdt}U")
         
         # 第二层过滤：events_config（从配置解析）
         self.events_config = self.parse_events_config(
@@ -325,8 +336,8 @@ class BSCMonitor:
             market_type = 'internal' if is_internal else 'external'
             pool_name = "内盘" if is_internal else "外盘"
             
-            # 加载该市场类型的配置
-            market_config = self.load_global_config(market_type=market_type)
+            # 使用缓存的配置
+            market_config = self.internal_config if is_internal else self.external_config
             if not market_config:
                 logger.warning(f"⚠️  未找到 {market_type} 配置，跳过")
                 continue
@@ -339,21 +350,33 @@ class BSCMonitor:
             if single_max >= market_min_transaction or total_sum >= market_cumulative_min:
                 filter_stats['passed_amount'] += 1
                 
-                # 第一层后立即检查：判断是否是 fourmeme 平台
-                launchpad_info = self.dbotx_api.get_token_launchpad_info('bsc', token_address)
-                
-                if launchpad_info is None:
-                    filter_stats['non_launchpad'] += 1
-                    logger.debug(f"⏭️  {token_address[:10]}... 非Launchpad")
-                    continue
-                
-                launchpad_platform = launchpad_info.get('launchpad')
-                if launchpad_platform != 'fourmeme':
-                    filter_stats['other_platform'] += 1
-                    logger.debug(f"⏭️  {token_address[:10]}... 平台:{launchpad_platform}")
-                    continue
-                
-                filter_stats['fourmeme_found'] += 1
+                # 获取 launchpad_info（用于第二层过滤）
+                # 内盘：webhook_processor 已判断，直接构造 launchpad_info
+                # 外盘：需要调用 API 验证平台
+                if is_internal:
+                    # 内盘：直接构造 launchpad_info
+                    launchpad_info = {
+                        'launchpad': 'fourmeme',
+                        'launchpad_status': 0,  # 0 = 内盘
+                        'pair_address': trades[0]['pair_address']
+                    }
+                    filter_stats['fourmeme_found'] += 1
+                else:
+                    # 外盘：调用 API 验证平台
+                    launchpad_info = self.dbotx_api.get_token_launchpad_info('bsc', token_address)
+                    
+                    if launchpad_info is None:
+                        filter_stats['non_launchpad'] += 1
+                        logger.debug(f"⏭️  {token_address[:10]}... 非Launchpad")
+                        continue
+                    
+                    launchpad_platform = launchpad_info.get('launchpad')
+                    if launchpad_platform != 'fourmeme':
+                        filter_stats['other_platform'] += 1
+                        logger.debug(f"⏭️  {token_address[:10]}... 平台:{launchpad_platform}")
+                        continue
+                    
+                    filter_stats['fourmeme_found'] += 1
                 
                 # 通过 fourmeme 验证，记录详细信息
                 logger.info(f"   🎯 [{pool_name}] {token_address[:10]}... | 单笔{single_max:.0f}U 累计{total_sum:.0f}U")
@@ -407,27 +430,18 @@ class BSCMonitor:
             in_cooldown: 是否在冷静期内
         """
         try:
-            # 0. 判断内外盘，动态加载配置
+            # 0. 判断内外盘，使用缓存的配置
             launchpad_status = launchpad_info.get('launchpad_status', 0)
-            market_type = 'internal' if launchpad_status == 0 else 'external'
-            pool_name = "内盘" if market_type == 'internal' else "外盘"
+            is_internal = (launchpad_status == 0)
+            market_type = 'internal' if is_internal else 'external'
+            pool_name = "内盘" if is_internal else "外盘"
             
-            # 动态加载该市场类型的配置
-            market_config = self.load_global_config(market_type=market_type)
-            if not market_config:
-                logger.warning(f"⚠️  未找到 {market_type} 配置，使用默认配置")
-                market_config = self.global_config
+            # 使用缓存的配置和 events_config
+            market_config = self.internal_config if is_internal else self.external_config
+            market_events_config = self.internal_events_config if is_internal else self.external_events_config
             
-            # 使用该配置的阈值
-            market_events_config = self.parse_events_config(market_config.get('events_config'))
-            market_min_transaction = market_config.get('min_transaction_usd', 400)
-            market_cumulative_min = market_config.get('cumulative_min_amount_usd', 1000)
-            
-            logger.debug(f"🔧 [{market_type.upper()}] 阈值: 单笔>={market_min_transaction}U, 累计>={market_cumulative_min}U")
-            
-            # 复查金额是否达到该市场类型的阈值
-            if single_max < market_min_transaction and total_sum < market_cumulative_min:
-                logger.debug(f"⏭️  跳过 {token_address[:10]}... ({pool_name}金额未达标: 单笔{single_max:.0f}<{market_min_transaction} 且 累计{total_sum:.0f}<{market_cumulative_min})")
+            if not market_config or not market_events_config:
+                logger.warning(f"⚠️  未找到 {market_type} 配置，跳过")
                 return
             
             # 1. 使用 launchpad_info 中返回的交易对地址获取详细数据

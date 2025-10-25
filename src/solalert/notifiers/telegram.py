@@ -27,7 +27,22 @@ class TelegramNotifier(BaseNotifier):
         """
         super().__init__(enabled)
         self.bot_token = bot_token or TELEGRAM_CONFIG.get('bot_token')
-        self.bot = Bot(token=self.bot_token) if self.bot_token else None
+        
+        # 创建 Bot 实例，配置更大的连接池和超时
+        if self.bot_token:
+            from telegram.request import HTTPXRequest
+            # 配置 HTTPXRequest：更大的连接池，更长的超时
+            request = HTTPXRequest(
+                connection_pool_size=20,  # 连接池大小
+                connect_timeout=30.0,      # 连接超时
+                read_timeout=30.0,         # 读取超时
+                write_timeout=30.0,        # 写入超时
+                pool_timeout=10.0          # 池超时
+            )
+            self.bot = Bot(token=self.bot_token, request=request)
+        else:
+            self.bot = None
+            
         logger.info("✅ Telegram通知器初始化成功（Bot API 模式）")
         logger.info(f"   Bot Token: {self.bot_token[:20]}..." if self.bot_token else "   ⚠️ 未配置 Bot Token")
     
