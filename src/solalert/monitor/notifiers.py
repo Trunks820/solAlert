@@ -1,5 +1,5 @@
 """
-通知服务
+通知服务（已废弃，请使用 src/solalert/notifiers/manager.py）
 支持Telegram和微信通知
 """
 import asyncio
@@ -8,7 +8,8 @@ from typing import List, Dict, Any, Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from ..core.logger import get_logger
 from ..core.config import TELEGRAM_CONFIG, WECHAT_CONFIG
-from ..api.telegram_api import TelegramAPI
+# 使用新的 NotificationManager
+from ..notifiers.manager import get_notification_manager
 
 logger = get_logger(__name__)
 
@@ -77,18 +78,20 @@ class NotificationMessage:
 
 
 class TelegramNotifier:
-    """Telegram通知服务（基于 HTTP API）"""
+    """Telegram通知服务（已重构为使用 Bot API）"""
     
     def __init__(self, bot_token: str, chat_id: int):
         """
         初始化Telegram通知器
         
         Args:
-            bot_token: Telegram Bot Token（保留参数以兼容旧代码，但不再使用）
+            bot_token: Telegram Bot Token（保留兼容性）
             chat_id: 目标聊天ID
         """
         self.chat_id = chat_id
-        logger.info(f"✅ TelegramNotifier 初始化成功（HTTP API 模式），Chat ID: {chat_id}")
+        # 使用新的 NotificationManager
+        self._notification_manager = get_notification_manager()
+        logger.info(f"✅ TelegramNotifier 初始化成功（Bot API 模式），Chat ID: {chat_id}")
     
     def create_buttons(self, ca: str) -> InlineKeyboardMarkup:
         """
@@ -115,35 +118,33 @@ class TelegramNotifier:
         max_retries: int = 3
     ) -> bool:
         """
-        发送Telegram消息（通过 HTTP API）
+        发送Telegram消息（通过 Bot API）
         
         Args:
             message: 消息文本（支持HTML格式）
-            ca: Token合约地址（用于生成按钮，HTTP API 暂不支持）
-            max_retries: 最大重试次数
+            ca: Token合约地址（用于生成按钮）
+            max_retries: 最大重试次数（保留兼容性，实际由 NotificationManager 处理）
             
         Returns:
             是否发送成功
         """
         try:
-            # 准备按钮（HTTP API 暂不支持，会在 TelegramAPI 内部记录警告）
+            # 准备按钮
             reply_markup = self.create_buttons(ca) if ca else None
             
-            # 调用 HTTP API 发送消息
-            result = await TelegramAPI.send_message(
-                chat_id=self.chat_id,
+            # 使用新的 NotificationManager 发送消息
+            result = await self._notification_manager.send_telegram(
+                target=str(self.chat_id),
                 message=message,
                 parse_mode="HTML",
-                reply_markup=reply_markup,
-                max_retries=max_retries
+                reply_markup=reply_markup
             )
             
-            if result.get('success'):
-                logger.info(f"✅ Telegram消息发送成功")
+            if result:
+                logger.info(f"✅ Telegram消息发送成功 (Bot API)")
                 return True
             else:
-                error_msg = result.get('error', 'unknown')
-                logger.error(f"❌ Telegram发送失败: {error_msg}")
+                logger.error(f"❌ Telegram发送失败")
                 return False
                 
         except Exception as e:
