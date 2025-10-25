@@ -1,6 +1,7 @@
 """
 Telegram 通知器
 基于 python-telegram-bot 库直接调用 Bot API
+支持消息队列，串行化发送避免并发冲突
 """
 import asyncio
 import logging
@@ -14,8 +15,97 @@ from ..core.config import TELEGRAM_CONFIG
 logger = logging.getLogger(__name__)
 
 
+class TelegramQueue:
+    """Telegram 消息队列（单例模式）"""
+    _instance = None
+    _lock = asyncio.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self.queue = asyncio.Queue()
+        self.worker_task = None
+        self._running = False
+        logger.info("🔧 [TelegramQueue] 消息队列已初始化")
+    
+    async def start_worker(self):
+        """启动队列工作线程"""
+        if self._running:
+            return
+        self._running = True
+        self.worker_task = asyncio.create_task(self._process_queue())
+        logger.info("🚀 [TelegramQueue] 队列工作线程已启动")
+    
+    async def stop_worker(self):
+        """停止队列工作线程"""
+        self._running = False
+        if self.worker_task:
+            self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("🛑 [TelegramQueue] 队列工作线程已停止")
+    
+    async def _process_queue(self):
+        """处理队列中的消息"""
+        logger.info("👷 [TelegramQueue] 开始处理消息队列...")
+        while self._running:
+            try:
+                # 从队列中取出一个任务
+                task_data = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                
+                bot, target, message, parse_mode, topic_id, reply_markup, future = task_data
+                
+                logger.info(f"📨 [TelegramQueue] 从队列取出消息 -> {target} | 队列剩余: {self.queue.qsize()}")
+                
+                try:
+                    # 执行发送
+                    result = await bot.send_message(
+                        chat_id=target,
+                        text=message,
+                        parse_mode=parse_mode,
+                        message_thread_id=topic_id,
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True
+                    )
+                    # 设置结果
+                    if not future.done():
+                        future.set_result(result)
+                except Exception as e:
+                    # 设置异常
+                    if not future.done():
+                        future.set_exception(e)
+                finally:
+                    self.queue.task_done()
+                    # 发送完一条后，稍微等待一下，避免过快
+                    await asyncio.sleep(0.1)
+                    
+            except asyncio.TimeoutError:
+                # 队列空闲，继续等待
+                continue
+            except Exception as e:
+                logger.error(f"❌ [TelegramQueue] 队列处理异常: {e}")
+                await asyncio.sleep(1.0)
+    
+    async def enqueue(self, bot, target, message, parse_mode, topic_id, reply_markup):
+        """将消息加入队列"""
+        future = asyncio.Future()
+        await self.queue.put((bot, target, message, parse_mode, topic_id, reply_markup, future))
+        queue_size = self.queue.qsize()
+        logger.info(f"➕ [TelegramQueue] 消息已加入队列 -> {target} | 队列长度: {queue_size}")
+        return future
+
+
 class TelegramNotifier(BaseNotifier):
-    """Telegram通知器（基于 Bot API）"""
+    """Telegram通知器（基于 Bot API + 消息队列）"""
     
     def __init__(self, bot_token: str = None, enabled: bool = True):
         """
@@ -42,8 +132,18 @@ class TelegramNotifier(BaseNotifier):
             self.bot = Bot(token=self.bot_token, request=request)
         else:
             self.bot = None
+        
+        # 初始化消息队列
+        self.queue = TelegramQueue()
+        
+        # 启动队列工作线程（在事件循环中）
+        try:
+            asyncio.create_task(self.queue.start_worker())
+        except RuntimeError:
+            # 如果还没有事件循环，稍后启动
+            logger.warning("⚠️ [TelegramNotifier] 事件循环未就绪，队列将在首次使用时启动")
             
-        logger.info("✅ Telegram通知器初始化成功（Bot API 模式）")
+        logger.info("✅ Telegram通知器初始化成功（Bot API + 消息队列模式）")
         logger.info(f"   Bot Token: {self.bot_token[:20]}..." if self.bot_token else "   ⚠️ 未配置 Bot Token")
     
     async def send(
@@ -77,21 +177,32 @@ class TelegramNotifier(BaseNotifier):
             return False
         
         try:
-            # 直接调用 Bot API 发送消息
+            # 确保队列工作线程已启动
+            if not self.queue._running:
+                await self.queue.start_worker()
+            
+            # 直接调用 Bot API 发送消息（通过队列）
             import time
             from telegram.error import RetryAfter, TimedOut, NetworkError
             
-            logger.debug(f"📤 [Bot API] 发送消息 -> {target}")
+            logger.info(f"🚀 [TelegramNotifier] 准备发送消息 -> {target} | 消息长度={len(message)}")
             
             start = time.monotonic()
-            result = await self.bot.send_message(
-                chat_id=target,
-                text=message,
-                parse_mode=parse_mode,
-                message_thread_id=topic_id,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
-            )
+            
+            # 将消息加入队列，等待队列处理完成
+            try:
+                future = await self.queue.enqueue(
+                    self.bot, target, message, parse_mode, topic_id, reply_markup
+                )
+                
+                # 等待队列处理完成（带超时）
+                result = await asyncio.wait_for(future, timeout=90.0)
+                
+            except asyncio.TimeoutError:
+                cost = time.monotonic() - start
+                logger.error(f"⏱️ [TelegramNotifier] 队列处理超时 -> {target} | 耗时={cost:.2f}s (超过90秒)")
+                return False
+            
             cost = time.monotonic() - start
             
             if result:

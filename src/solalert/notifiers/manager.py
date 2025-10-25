@@ -52,13 +52,22 @@ class NotificationManager:
             f"文本长度={len(message)} | buttons={bool(reply_markup)} | topic={topic_id}"
         )
         
-        return await self.telegram.send(
-            target=target,
-            message=message,
-            parse_mode=parse_mode,
-            topic_id=topic_id,
-            reply_markup=reply_markup
-        )
+        try:
+            logger.info(f"🔄 [NotificationManager] 调用 telegram.send() ...")
+            result = await self.telegram.send(
+                target=target,
+                message=message,
+                parse_mode=parse_mode,
+                topic_id=topic_id,
+                reply_markup=reply_markup
+            )
+            logger.info(f"🔄 [NotificationManager] telegram.send() 返回: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"❌ [NotificationManager] telegram.send() 异常: {type(e).__name__} - {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
     async def send_wechat(self, target: str, message: str) -> bool:
         """发送微信消息"""
