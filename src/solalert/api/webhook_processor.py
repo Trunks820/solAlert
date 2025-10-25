@@ -384,7 +384,8 @@ class AlchemyWebhookProcessor:
                 'quote_token': quote_token,
                 'usdt_value': usdt_value,
                 'timestamp': timestamp,
-                'is_buy': True
+                'is_buy': True,
+                'is_fourmeme_internal': False  # 标记为外盘
             }
         
         except Exception as e:

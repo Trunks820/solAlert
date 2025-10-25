@@ -313,15 +313,30 @@ class BSCMonitor:
             'triggered': 0
         }
         
-        # 对每个代币进行第一层过滤
+        # 对每个代币进行过滤（根据内外盘使用不同配置）
         for token_address, trades in token_trades.items():
             # 计算单笔最大和累计
             usdt_amounts = [t['usdt_value'] for t in trades]
             single_max = max(usdt_amounts)
             total_sum = sum(usdt_amounts)
             
-            # 第一层：判断是否触发金额条件
-            if single_max >= self.single_max_usdt or total_sum >= self.block_accumulate_usdt:
+            # 判断内外盘（从 webhook_processor 的标记）
+            is_internal = trades[0].get('is_fourmeme_internal', False)
+            market_type = 'internal' if is_internal else 'external'
+            pool_name = "内盘" if is_internal else "外盘"
+            
+            # 加载该市场类型的配置
+            market_config = self.load_global_config(market_type=market_type)
+            if not market_config:
+                logger.warning(f"⚠️  未找到 {market_type} 配置，跳过")
+                continue
+            
+            # 获取该配置的金额阈值
+            market_min_transaction = market_config.get('min_transaction_usd', 400)
+            market_cumulative_min = market_config.get('cumulative_min_amount_usd', 1000)
+            
+            # 第一层：使用该配置的阈值判断金额是否达标
+            if single_max >= market_min_transaction or total_sum >= market_cumulative_min:
                 filter_stats['passed_amount'] += 1
                 
                 # 第一层后立即检查：判断是否是 fourmeme 平台
@@ -341,7 +356,7 @@ class BSCMonitor:
                 filter_stats['fourmeme_found'] += 1
                 
                 # 通过 fourmeme 验证，记录详细信息
-                logger.info(f"   🎯 {token_address[:10]}... | 单笔{single_max:.0f}U 累计{total_sum:.0f}U")
+                logger.info(f"   🎯 [{pool_name}] {token_address[:10]}... | 单笔{single_max:.0f}U 累计{total_sum:.0f}U")
                 
                 # 检查 Redis 冷却期（但不跳过，继续处理）
                 cooldown_minutes = self.min_interval_seconds / 60
