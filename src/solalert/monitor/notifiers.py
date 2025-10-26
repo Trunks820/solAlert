@@ -38,31 +38,64 @@ class NotificationMessage:
         lines = [
             "<b>🚨 监控触发提醒</b>",
             "",
-            f"💰 代币: {self.token_name} ({self.token_symbol})",
-            f"合约地址: <code>{self.ca}</code>",
+            f"💰 <b>代币</b>: {self.token_name} ({self.token_symbol})",
+            f"📝 <b>合约地址</b>: <code>{self.ca}</code>",
             ""
         ]
         
-        # 添加Token当前信息
+        # 添加Token当前信息（优化显示）
         if self.token_data:
-            price = self.token_data.get('usdPrice')
-            mcap = self.token_data.get('mcap')
-            holders = self.token_data.get('holderCount')
+            price = self.token_data.get('usdPrice') or self.token_data.get('price')
+            mcap = self.token_data.get('mcap') or self.token_data.get('marketCap')
+            holders = self.token_data.get('holderCount') or self.token_data.get('holders')
             liquidity = self.token_data.get('liquidity')
+            volume_24h = self.token_data.get('volume24h') or self.token_data.get('volume_24h')
+            price_change_24h = self.token_data.get('priceChange24h') or self.token_data.get('price_24h')
             
-            if price:
-                lines.append(f"💵 当前价格: ${price:.10f}")
+            # 价格和涨跌幅
+            if price is not None:
+                price_str = f"${price:.10f}" if price < 0.0001 else f"${price:.6f}"
+                if price_change_24h is not None:
+                    change_emoji = "📈" if price_change_24h > 0 else "📉" if price_change_24h < 0 else "➡️"
+                    lines.append(f"💵 <b>当前价格</b>: {price_str} {change_emoji} {price_change_24h:+.2f}%")
+                else:
+                    lines.append(f"💵 <b>当前价格</b>: {price_str}")
+            
+            # 市值
             if mcap:
-                lines.append(f"📊 市值: ${mcap:,.2f}")
+                if mcap >= 1_000_000:
+                    lines.append(f"📊 <b>市值</b>: ${mcap / 1_000_000:.2f}M")
+                elif mcap >= 1_000:
+                    lines.append(f"📊 <b>市值</b>: ${mcap / 1_000:.2f}K")
+                else:
+                    lines.append(f"📊 <b>市值</b>: ${mcap:,.2f}")
+            
+            # 24小时交易量
+            if volume_24h:
+                if volume_24h >= 1_000_000:
+                    lines.append(f"📈 <b>24H交易量</b>: ${volume_24h / 1_000_000:.2f}M")
+                elif volume_24h >= 1_000:
+                    lines.append(f"📈 <b>24H交易量</b>: ${volume_24h / 1_000:.2f}K")
+                else:
+                    lines.append(f"📈 <b>24H交易量</b>: ${volume_24h:,.2f}")
+            
+            # 持币人数
             if holders:
-                lines.append(f"👥 持币人数: {holders:,}")
+                lines.append(f"👥 <b>持币人数</b>: {holders:,}")
+            
+            # 流动性
             if liquidity:
-                lines.append(f"💧 流动性: ${liquidity:,.2f}")
+                if liquidity >= 1_000_000:
+                    lines.append(f"💧 <b>流动性</b>: ${liquidity / 1_000_000:.2f}M")
+                elif liquidity >= 1_000:
+                    lines.append(f"💧 <b>流动性</b>: ${liquidity / 1_000:.2f}K")
+                else:
+                    lines.append(f"💧 <b>流动性</b>: ${liquidity:,.2f}")
             
             lines.append("")
         
         # 构建触发事件描述
-        lines.append("<b>🎯 触发原因:</b>")
+        lines.append("<b>🎯 触发原因</b>:")
         for event in self.triggered_events:
             # event 是 TriggerEvent 对象
             lines.append(f"  {event.description}")
@@ -70,9 +103,10 @@ class NotificationMessage:
         lines.append("")
         
         if self.remark:
-            lines.append(f"💡 备注: {self.remark}")
+            lines.append(f"💡 <b>备注</b>: {self.remark}")
+            lines.append("")
         
-        lines.append(f"📡 触发时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"📡 <b>触发时间</b>: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         return "\n".join(lines)
 
