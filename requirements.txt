@@ -17,6 +17,9 @@ requests==2.31.0
 httpx[socks]==0.25.2
 brotli==1.1.0  # 用于解压 Brotli 压缩的响应
 
+# WebSocket Client
+websocket-client==1.7.0
+
 # Web Framework (for Webhook)
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
