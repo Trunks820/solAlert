@@ -21,6 +21,7 @@ from ..api.dbotx_api import DBotXAPI
 from ..core.redis_client import get_redis
 from ..core.config import TELEGRAM_CONFIG
 from .trigger_logic import TriggerLogic
+from ..notifiers.alert_recorder import get_alert_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,9 @@ class BSCWebSocketMonitor:
         
         # Redis
         self.redis_client = get_redis()
+        
+        # Alert Recorder（用于记录到数据库和推送WebSocket）
+        self.alert_recorder = get_alert_recorder()
         
         # 常量
         self.USDT = "0x55d398326f99059ff775485246999027b3197955"
@@ -708,6 +712,26 @@ class BSCWebSocketMonitor:
         await self.send_alert(message, base_token)
         print(f"✅ 已发送 Telegram 通知")
         
+        # 记录到数据库并推送WebSocket
+        await asyncio.to_thread(
+            self.alert_recorder.write_bsc_alert,
+            ca=base_token,
+            token_name=symbol,
+            token_symbol=symbol,
+            single_max=usd_value,
+            total_sum=usd_value,
+            alert_reasons=alert_reasons,
+            block_number=0,  # WebSocket不关心区块号
+            price_usdt=price,
+            pair_address=pair_address,
+            market_cap=market_cap,
+            price_change=price_change,
+            volume_24h=volume,
+            holders=0,
+            logo="",
+            notify_error=None
+        )
+        
         # 设置冷却期
         await self.update_alert_history(base_token)
     
@@ -912,6 +936,26 @@ class BSCWebSocketMonitor:
             # 发送推送
             await self.send_alert(message, target_token)
             print(f"✅ 已发送 Telegram 通知")
+            
+            # 记录到数据库并推送WebSocket
+            await asyncio.to_thread(
+                self.alert_recorder.write_bsc_alert,
+                ca=target_token,
+                token_name=symbol,
+                token_symbol=symbol,
+                single_max=usd_value,
+                total_sum=usd_value,
+                alert_reasons=alert_reasons,
+                block_number=0,  # WebSocket不关心区块号
+                price_usdt=price,
+                pair_address=pair_address,
+                market_cap=market_cap,
+                price_change=price_change,
+                volume_24h=volume,
+                holders=0,
+                logo="",
+                notify_error=None
+            )
             
             # 设置冷却期
             await self.update_alert_history(target_token)
