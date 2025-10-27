@@ -19,7 +19,10 @@ USDT = "0x55d398326f99059ff775485246999027b3197955".lower()
 WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c".lower()
 
 # Fourmeme Proxy（内盘）
-FOURMEME_PROXY = "0x5c952063c7fc8610ffdb798152d69f0b9550762b".lower()
+FOURMEME_PROXY = [
+    "0x5c952063c7fc8610ffdb798152d69f0b9550762b".lower(),  # 主 AMAP/Create
+    "0xf251f83e40a78868fcfa3fa4599dad6494e46034".lower()   # Try Buy
+]
 
 # PancakeV2 Swap Topic
 TOPIC_V2_SWAP = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"

@@ -21,6 +21,7 @@ from solalert.collectors.bsc_collector import BSCBlockCollector
 from solalert.tasks.twitter_push_sync import TwitterPushSyncService
 from solalert.monitor.token_monitor import TokenMonitorEngine
 from solalert.monitor.bsc_monitor import BSCMonitor
+from solalert.monitor.bsc_websocket_monitor import BSCWebSocketMonitor
 
 # 设置日志
 logger = setup_logger()
@@ -178,57 +179,59 @@ async def run_token_monitor(interval: int = 1, once: bool = False):
         await monitor.run_monitor_schedule(interval_minutes=interval)
 
 
-def run_bsc_monitor():
+async def run_bsc_monitor():
     """
-    运行BSC链监控任务（Alchemy Webhook 实时推送 + 三层过滤）
+    运行BSC链监控任务（WebSocket 实时监听 + 三层过滤）
     """
-    logger.info("🚀 启动 BSC Webhook 监控服务")
+    logger.info("🚀 启动 BSC WebSocket 监控服务")
     
     # 优化第三方库日志
     logging.getLogger('urllib3').setLevel(logging.ERROR)
     logging.getLogger('web3').setLevel(logging.ERROR)
-    logging.getLogger('asyncio').setLevel(logging.CRITICAL)  # 禁用 asyncio 错误日志（Windows噪音）
+    logging.getLogger('asyncio').setLevel(logging.CRITICAL)
     logging.getLogger('httpx').setLevel(logging.ERROR)
     logging.getLogger('httpcore').setLevel(logging.ERROR)
     logging.getLogger('telegram').setLevel(logging.WARNING)
-    logging.getLogger('uvicorn.access').setLevel(logging.WARNING)
-    logging.getLogger('uvicorn.error').setLevel(logging.WARNING)
+    
+    # WebSocket 和 RPC 配置（Chainstack）
+    WS_URL = "wss://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    RPC_URL = "https://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
     
     try:
-        # 1. 初始化监控器
-        try:
-            from solalert.api.alchemy_webhook import webhook_handler, start_webhook_server
-        except ImportError as e:
-            logger.error(f"❌ 无法导入 alchemy_webhook: {e}")
-            return
+        # 创建监控器
+        monitor = BSCWebSocketMonitor(
+            ws_url=WS_URL,
+            rpc_url=RPC_URL,
+            enable_telegram=True
+        )
         
-        monitor = BSCMonitor(config=BSC_MONITOR_CONFIG)
-        webhook_handler.set_monitor(monitor)
-        
-        # 2. 显示配置
+        # 显示配置
         logger.info("=" * 80)
+        logger.info(f"📡 WebSocket 节点: {WS_URL[:50]}...")
+        logger.info(f"🔗 RPC 节点: {RPC_URL[:50]}...")
         logger.info(f"📊 监控配置:")
-        logger.info(f"   单笔阈值: {monitor.single_max_usdt} USDT | 累计阈值: {monitor.block_accumulate_usdt} USDT | 冷却: {monitor.min_interval_seconds}秒")
+        logger.info(f"   内盘: 单笔≥${monitor.min_amount_internal} 或 累计≥${monitor.cumulative_min_amount_internal}")
+        logger.info(f"   外盘: 单笔≥${monitor.min_amount_external}")
+        logger.info(f"   冷却期: {monitor.cooldown_minutes}分钟 (±{monitor.cooldown_jitter}分钟)")
         logger.info(f"   平台: fourmeme | 数据源: DBotX API (1分钟实时)")
-        logger.info(f"\n📡 服务地址:")
-        logger.info(f"   Webhook: http://0.0.0.0:8001/webhook/alchemy/bsc")
-        logger.info(f"   健康检查: http://0.0.0.0:8001/health")
-        logger.info(f"\n💡 过滤流程: 交易对 → 金额 → fourmeme → DBotX指标 → 冷却期")
+        logger.info(f"\n💡 过滤流程:")
+        logger.info(f"   第一层: 金额过滤")
+        logger.info(f"   第二层: fourmeme验证 + DBotX指标过滤")
+        logger.info(f"   第三层: 冷却期控制")
         logger.info("=" * 80)
-        logger.info("✅ 服务已启动，等待 Alchemy Webhook 推送...")
         
-        # 3. 启动 Webhook 服务器
-        start_webhook_server(host="0.0.0.0", port=8001)
+        # 启动监控
+        await monitor.start()
         
     except KeyboardInterrupt:
         logger.info("\n⏹️  用户停止服务")
     except Exception as e:
-        logger.error(f"❌ BSC Webhook 监控运行失败: {e}", exc_info=True)
+        logger.error(f"❌ BSC WebSocket 监控运行失败: {e}", exc_info=True)
         raise
 
 
 async def run_all_services():
-    """运行所有服务（数据采集器 + Token监控 + BSC Webhook监控）"""
+    """运行所有服务（数据采集器 + Token监控 + BSC WebSocket监控）"""
     logger.info("🚀 启动所有服务...")
     
     # 优化第三方库日志
@@ -238,8 +241,6 @@ async def run_all_services():
     logging.getLogger('httpx').setLevel(logging.ERROR)
     logging.getLogger('httpcore').setLevel(logging.ERROR)
     logging.getLogger('telegram').setLevel(logging.WARNING)
-    logging.getLogger('uvicorn.access').setLevel(logging.WARNING)
-    logging.getLogger('uvicorn.error').setLevel(logging.WARNING)
     
     # 创建采集器和监控实例
     pump_listener = PumpListener()
@@ -247,22 +248,22 @@ async def run_all_services():
     fourmeme_listener = FourMemeListener()
     token_monitor = TokenMonitorEngine()
     
-    # 初始化 BSC Webhook 监控
-    bsc_webhook_enabled = False
-    try:
-        from solalert.api.alchemy_webhook import webhook_handler, start_webhook_server_async
-        bsc_monitor = BSCMonitor(config=BSC_MONITOR_CONFIG)
-        webhook_handler.set_monitor(bsc_monitor)
-        bsc_webhook_enabled = True
-        
-        logger.info("=" * 80)
-        logger.info("📊 BSC监控配置:")
-        logger.info(f"   单笔阈值: {bsc_monitor.single_max_usdt} USDT | 累计阈值: {bsc_monitor.block_accumulate_usdt} USDT")
-        logger.info(f"   Webhook: http://0.0.0.0:8001/webhook/alchemy/bsc")
-        logger.info("=" * 80)
-    except ImportError as e:
-        logger.warning(f"⚠️ BSC Webhook 监控未启用（缺少依赖: {e}）")
-        logger.info("   提示: 运行 'pip install fastapi uvicorn' 启用 BSC 监控")
+    # 初始化 BSC WebSocket 监控
+    WS_URL = "wss://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    RPC_URL = "https://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    
+    bsc_monitor = BSCWebSocketMonitor(
+        ws_url=WS_URL,
+        rpc_url=RPC_URL,
+        enable_telegram=True
+    )
+    
+    logger.info("=" * 80)
+    logger.info("📊 BSC WebSocket 监控配置:")
+    logger.info(f"   内盘: 单笔≥${bsc_monitor.min_amount_internal} 或 累计≥${bsc_monitor.cumulative_min_amount_internal}")
+    logger.info(f"   外盘: 单笔≥${bsc_monitor.min_amount_external}")
+    logger.info(f"   冷却期: {bsc_monitor.cooldown_minutes}分钟")
+    logger.info("=" * 80)
     
     # 并发运行所有服务
     services = [
@@ -270,11 +271,8 @@ async def run_all_services():
         bonk_collector.start(),
         fourmeme_listener.start(),
         token_monitor.run_monitor_schedule(interval_minutes=1),  # 1分钟间隔监控
+        bsc_monitor.start(),  # BSC WebSocket 监控
     ]
-    
-    # 如果 BSC Webhook 可用，添加到服务列表
-    if bsc_webhook_enabled:
-        services.append(start_webhook_server_async(host="0.0.0.0", port=8001))
     
     try:
         await asyncio.gather(*services, return_exceptions=True)
@@ -353,8 +351,8 @@ def main():
             interval = args.interval if args.interval != 60 else 1
             asyncio.run(run_token_monitor(interval, once=args.once))
         elif args.module == "bsc_monitor":
-            # BSC Webhook 监控任务（Alchemy 实时推送）
-            run_bsc_monitor()
+            # BSC WebSocket 监控任务（实时监听链上事件）
+            asyncio.run(run_bsc_monitor())
         elif args.module == "all":
             asyncio.run(run_all_services())
     except KeyboardInterrupt:
