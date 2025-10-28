@@ -264,24 +264,34 @@ class DBotXAPI:
             logger.debug(f"解析 Launchpad 信息失败: {e}")
             return None
     
-    def parse_token_data(self, raw_data: Dict) -> Optional[Dict]:
+    def parse_token_data(self, raw_data: Dict, time_interval: str = '1m') -> Optional[Dict]:
         """
         解析 DBotX API 返回的代币数据（同步，仅解析不涉及 I/O）
         
         Args:
             raw_data: API 返回的原始数据
+            time_interval: 时间间隔 ('1m', '5m', '1h'), 默认 '1m'
         
         Returns:
             标准化的代币数据字典
         """
         try:
-            # 使用1分钟数据（更实时）
+            # 解析各时间段数据
             price_change_1m = raw_data.get('priceChange1m', 0) * 100  # 转换为百分比
-            volume_1m = raw_data.get('buyAndSellVolume1m', 0)
-            
-            # 也保留其他时间段数据作为参考
             price_change_5m = raw_data.get('priceChange5m', 0) * 100
+            price_change_1h = raw_data.get('priceChange1h', 0) * 100
+            
+            volume_1m = raw_data.get('buyAndSellVolume1m', 0)
             volume_5m = raw_data.get('buyAndSellVolume5m', 0)
+            volume_1h = raw_data.get('buyAndSellVolume1h', 0)
+            
+            # 根据 time_interval 选择使用的数据
+            interval_map = {
+                '1m': (price_change_1m, volume_1m),
+                '5m': (price_change_5m, volume_5m),
+                '1h': (price_change_1h, volume_1h),
+            }
+            price_change, volume = interval_map.get(time_interval.lower(), (price_change_1m, volume_1m))
             
             return {
                 'address': raw_data.get('token', ''),
@@ -289,9 +299,9 @@ class DBotXAPI:
                 'name': raw_data.get('name', 'Unknown'),
                 'price': raw_data.get('tokenPriceUsd', 0),
                 
-                # 主要使用1分钟数据
-                'price_change': price_change_1m,
-                'volume': volume_1m,
+                # 使用选定时间间隔的数据
+                'price_change': price_change,
+                'volume': volume,
                 
                 # 保留各时间段数据
                 'price_1m': price_change_1m,

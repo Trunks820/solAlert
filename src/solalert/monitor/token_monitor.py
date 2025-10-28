@@ -13,7 +13,7 @@ from .notifiers import NotificationService, NotificationMessage
 from ..core.database import get_db
 from ..core.logger import get_logger
 from ..core.config import REDIS_CONFIG
-from ..api.gmgn_api import get_gmgn_api
+from ..api.dbotx_api import DBotXAPI
 from ..notifiers.alert_recorder import AlertRecorder
 import redis.asyncio as aioredis
 
@@ -27,7 +27,7 @@ class TokenMonitorEngine:
         """初始化监控引擎"""
         self.db = get_db()
         self.jupiter_api = JupiterAPI(timeout=10, max_retries=3)
-        self.gmgn_api = get_gmgn_api()  # 添加 GMGN API
+        self.dbotx_api = DBotXAPI()  # 使用 DBotX API 替代 GMGN API
         self.notification_service = NotificationService(
             telegram_enabled=True,
             telegram_chat_id=-1002569554228,
@@ -52,36 +52,26 @@ class TokenMonitorEngine:
             self.redis_client = None
             logger.info("🔒 Redis连接已关闭")
     
-    async def convert_gmgn_to_stats5m(self, gmgn_data: Dict[str, Any], ca: str) -> Optional[Dict[str, Any]]:
+    async def convert_dbotx_to_stats5m(self, dbotx_data: Dict[str, Any], ca: str) -> Optional[Dict[str, Any]]:
         """
-        将 GMGN API 数据转换为 stats5m 格式
+        将 DBotX API 数据转换为 stats5m 格式
         
         Args:
-            gmgn_data: GMGN API 解析后的数据
+            dbotx_data: DBotX API 解析后的数据
             ca: Token 地址（用于 Redis 缓存）
             
         Returns:
             stats5m 格式的数据
         """
         try:
-            price = gmgn_data['price']
-            price_5m = gmgn_data['price_5m']
-            price_1h = gmgn_data['price_1h']
-            
-            # 计算价格变化百分比
-            price_5m_change = 0
-            price_1h_change = 0
-            
-            if price_5m and price_5m > 0:
-                price_5m_change = ((price - price_5m) / price_5m) * 100
-            
-            if price_1h and price_1h > 0:
-                price_1h_change = ((price - price_1h) / price_1h) * 100
+            # DBotX API 已经提供了百分比格式的价格变化
+            price_5m_change = dbotx_data.get('price_5m', 0)  # 已经是百分比
+            price_1h_change = dbotx_data.get('price_1h', 0)  # 已经是百分比
             
             # 获取当前数据
-            current_holder = gmgn_data['holder_count']
-            current_volume_5m = gmgn_data['volume_5m']
-            current_volume_1h = gmgn_data['volume_1h']
+            current_holder = dbotx_data.get('holder_count', 0)
+            current_volume_5m = dbotx_data.get('volume_5m', 0)
+            current_volume_1h = dbotx_data.get('volume_1h', 0)
             
             # 从 Redis 获取历史数据
             holder_5m_ago = await self.redis_client.get(f"holder:5m:{ca}")
@@ -140,7 +130,7 @@ class TokenMonitorEngine:
             
             # 构造 stats5m 格式（字段名需要与 TriggerLogic 保持一致）
             stats5m = {
-                'price': price,
+                'price': dbotx_data.get('price', 0),
                 'price_5m_change_percent': price_5m_change,
                 'price_1h_change_percent': price_1h_change,
                 'priceChange': price_5m_change,  # TriggerLogic 使用这个字段
@@ -150,10 +140,10 @@ class TokenMonitorEngine:
                 'volume_5m_change_percent': volume_5m_change,
                 'volume_1h_change_percent': volume_1h_change,
                 'volumeChange': volume_5m_change,  # TriggerLogic 使用这个字段（百分比）
-                'buys_5m': gmgn_data['buys_5m'],
-                'sells_5m': gmgn_data['sells_5m'],
-                'swaps_5m': gmgn_data['swaps_5m'],
-                'liquidity': gmgn_data['liquidity'],
+                'buys_5m': dbotx_data.get('buy_count_1m', 0),  # DBotX 用 1m 数据
+                'sells_5m': dbotx_data.get('sell_count_1m', 0),
+                'swaps_5m': dbotx_data.get('buy_count_1m', 0) + dbotx_data.get('sell_count_1m', 0),
+                'liquidity': dbotx_data.get('liquidity', 0),
                 'holder_count': current_holder,
                 'holder_5m_change': holder_5m_change,
                 'holder_1h_change': holder_1h_change,
@@ -163,7 +153,7 @@ class TokenMonitorEngine:
             return stats5m
             
         except Exception as e:
-            logger.error(f"❌ 转换 GMGN 数据失败: {e}")
+            logger.error(f"❌ 转换 DBotX 数据失败: {e}")
             return None
     
     def get_monitor_configs(self) -> List[Dict[str, Any]]:
@@ -423,7 +413,7 @@ class TokenMonitorEngine:
             
             logger.info(f"   💰 当前价格: ${price:.8f}")
             logger.info(f"   📈 价格变化: 5分钟 {price_5m_change:+.2f}% | 1小时 {price_1h_change:+.2f}%")
-            # 交易量和持有人的详细变化已经在 convert_gmgn_to_stats5m 中打印了
+            # 交易量和持有人的详细变化已经在 convert_dbotx_to_stats5m 中打印了
         except Exception as e:
             logger.debug(f"   ⚠️  打印实时数据失败: {e}")
         
@@ -557,75 +547,74 @@ class TokenMonitorEngine:
         
         logger.info(f"📊 Token分布: SOL={len(sol_tokens)}, BSC={len(bsc_tokens)}")
         
-        # 批量获取Token数据
+        # 批量获取Token数据（使用 DBotX API）
         tokens_data = {}
         
-        # 统一使用 GMGN API 获取所有链的数据
-        # 1. 获取 Solana 链数据
-        if sol_tokens:
-            logger.info(f"🔍 使用 GMGN API 查询 {len(sol_tokens)} 个 Solana Token...")
-            batch_size = 5  # 每批 5 个
-            for i in range(0, len(sol_tokens), batch_size):
-                batch = sol_tokens[i:i + batch_size]
-                gmgn_data_list = self.gmgn_api.get_token_info_batch('sol', batch)
+        # 辅助函数：查询单个 token
+        async def fetch_single_token(ca: str, chain: str) -> Optional[tuple]:
+            """查询单个 token 的数据"""
+            try:
+                # 1. 搜索 pair
+                pair_info = await self.dbotx_api.search_pairs(ca)
+                if not pair_info:
+                    logger.debug(f"⚠️  {chain.upper()} Token {ca[:10]}... 未找到交易对")
+                    return None
                 
-                if gmgn_data_list:
-                    for token_data in gmgn_data_list:
-                        parsed_data = self.gmgn_api.parse_token_data(token_data)
-                        if parsed_data:
-                            ca = parsed_data['address']
-                            # 转换为 stats5m 格式（传入 ca 用于 Redis 缓存）
-                            stats5m = await self.convert_gmgn_to_stats5m(parsed_data, ca)
-                            if stats5m:
-                                # 构造与 Jupiter API 相同的数据结构
-                                tokens_data[ca] = {
-                                    'address': ca,
-                                    'symbol': parsed_data['symbol'],
-                                    'name': parsed_data['name'],
-                                    'stats5m': stats5m,
-                                    'source': 'gmgn'
-                                }
+                # 2. 获取详细数据
+                pair_address = pair_info.get('pair_address')
+                raw_data = await self.dbotx_api.get_pair_info(chain, pair_address)
+                if not raw_data:
+                    logger.debug(f"⚠️  {chain.upper()} Token {ca[:10]}... 获取详情失败")
+                    return None
                 
-                await asyncio.sleep(0.5)  # 避免请求过快
+                # 3. 解析数据
+                parsed_data = self.dbotx_api.parse_token_data(raw_data)
+                if not parsed_data:
+                    logger.debug(f"⚠️  {chain.upper()} Token {ca[:10]}... 解析数据失败")
+                    return None
+                
+                # 4. 转换为 stats5m 格式
+                stats5m = await self.convert_dbotx_to_stats5m(parsed_data, ca)
+                if not stats5m:
+                    return None
+                
+                return (ca, {
+                    'address': ca,
+                    'symbol': parsed_data['symbol'],
+                    'name': parsed_data['name'],
+                    'stats5m': stats5m,
+                    'source': 'dbotx'
+                })
+            except Exception as e:
+                logger.debug(f"⚠️  查询 {ca[:10]}... 失败: {e}")
+                return None
         
-        # 2. 获取 BSC 链数据
+        # 1. 获取 Solana 链数据（并发查询）
+        if sol_tokens:
+            logger.info(f"🔍 使用 DBotX API 查询 {len(sol_tokens)} 个 Solana Token...")
+            tasks = [fetch_single_token(ca, 'sol') for ca in sol_tokens]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for result in results:
+                if result and not isinstance(result, Exception):
+                    ca, data = result
+                    tokens_data[ca] = data
+            
+            logger.info(f"   ✅ 成功获取 {len([r for r in results if r and not isinstance(r, Exception)])}/{len(sol_tokens)} 个 SOL Token")
+        
+        # 2. 获取 BSC 链数据（并发查询）
         if bsc_tokens:
-            logger.info(f"🔍 使用 GMGN API 查询 {len(bsc_tokens)} 个 BSC Token...")
-            batch_size = 5  # 每批 5 个
-            for i in range(0, len(bsc_tokens), batch_size):
-                batch = bsc_tokens[i:i + batch_size]
-                gmgn_data_list = self.gmgn_api.get_token_info_batch('bsc', batch)
-                
-                if gmgn_data_list:
-                    # 记录返回的地址
-                    returned_addresses = set(token_data.get('address') for token_data in gmgn_data_list)
-                    
-                    # 检查哪些地址没有返回数据
-                    for ca in batch:
-                        if ca.lower() not in [addr.lower() for addr in returned_addresses]:
-                            logger.warning(f"⚠️  BSC Token {ca[:10]}... 在 GMGN 中查询不到数据（可能已过期或不存在）")
-                    
-                    for token_data in gmgn_data_list:
-                        parsed_data = self.gmgn_api.parse_token_data(token_data)
-                        if parsed_data:
-                            ca = parsed_data['address']
-                            # 转换为 stats5m 格式（传入 ca 用于 Redis 缓存）
-                            stats5m = await self.convert_gmgn_to_stats5m(parsed_data, ca)
-                            if stats5m:
-                                # 构造与 Jupiter API 相同的数据结构
-                                tokens_data[ca] = {
-                                    'address': ca,
-                                    'symbol': parsed_data['symbol'],
-                                    'name': parsed_data['name'],
-                                    'stats5m': stats5m,
-                                    'source': 'gmgn'
-                                }
-                else:
-                    # API 返回空或失败
-                    for ca in batch:
-                        logger.warning(f"⚠️  BSC Token {ca[:10]}... API查询失败或返回空数据")
-                
-                await asyncio.sleep(0.5)  # 避免请求过快
+            logger.info(f"🔍 使用 DBotX API 查询 {len(bsc_tokens)} 个 BSC Token...")
+            tasks = [fetch_single_token(ca, 'bsc') for ca in bsc_tokens]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for result in results:
+                if result and not isinstance(result, Exception):
+                    ca, data = result
+                    # BSC 地址统一小写存储
+                    tokens_data[ca.lower()] = data
+            
+            logger.info(f"   ✅ 成功获取 {len([r for r in results if r and not isinstance(r, Exception)])}/{len(bsc_tokens)} 个 BSC Token")
         
         # 逐个判断触发
         triggered_count = 0

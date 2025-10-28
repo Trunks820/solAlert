@@ -11,6 +11,8 @@ import random
 import re
 import websocket
 import requests
+import traceback
+import urllib3
 import threading
 import os
 from decimal import Decimal
@@ -102,6 +104,12 @@ class BSCWebSocketMonitor:
         self.cumulative_min_amount_internal = 500
         self.cumulative_min_amount_external = 1000  # 外盘累计1000
         
+        # 时间间隔和Top持有者阈值（从 Redis 加载）
+        self.time_interval_internal = '1m'  # 内盘默认1分钟
+        self.time_interval_external = '5m'  # 外盘默认5分钟
+        self.top_holders_threshold_internal = None  # 内盘Top持有者阈值（None表示不检查）
+        self.top_holders_threshold_external = None  # 外盘Top持有者阈值（None表示不检查）
+        
         # 默认 events_config（后备配置）
         self.internal_events_config = {
             'priceChange': {'enabled': True, 'risePercent': 30},  # 默认：内盘涨幅 >= 30%
@@ -156,6 +164,10 @@ class BSCWebSocketMonitor:
                 config = json.loads(internal_data)
                 self.min_amount_internal = config.get('min_transaction_usd', 200)
                 self.cumulative_min_amount_internal = config.get('cumulative_min_amount_usd', 500)
+                self.time_interval_internal = config.get('timeInterval', '1m')  # 内盘时间间隔
+                # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
+                threshold = config.get('topHoldersThreshold')
+                self.top_holders_threshold_internal = float(threshold) if threshold is not None else None
                 
                 events_config_str = config.get('events_config', '{}')
                 if events_config_str:
@@ -192,6 +204,11 @@ class BSCWebSocketMonitor:
                 
                 config = json.loads(external_data)
                 self.min_amount_external = config.get('min_transaction_usd', 400)
+                self.cumulative_min_amount_external = config.get('cumulative_min_amount_usd', 1000)  
+                self.time_interval_external = config.get('timeInterval', '5m')  # 外盘时间间隔
+                # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
+                threshold = config.get('topHoldersThreshold')
+                self.top_holders_threshold_external = float(threshold) if threshold is not None else None  
                 
                 events_config_str = config.get('events_config', '{}')
                 if events_config_str:
@@ -217,8 +234,8 @@ class BSCWebSocketMonitor:
             logger.error(f"❌ 加载 Redis 配置失败: {e}")
         
         # 打印最终配置信息
-        logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 涨幅>={self.internal_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.internal_events_config.get('volume', {}).get('threshold')}")
-        logger.info(f"📊 外盘配置: 单笔>={self.min_amount_external}U, 涨幅>={self.external_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.external_events_config.get('volume', {}).get('threshold')}")
+        logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 累计>={self.cumulative_min_amount_internal}U, 涨幅>={self.internal_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.internal_events_config.get('volume', {}).get('threshold')}")
+        logger.info(f"📊 外盘配置: 单笔>={self.min_amount_external}U, 累计>={self.cumulative_min_amount_external}U, 涨幅>={self.external_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.external_events_config.get('volume', {}).get('threshold')}")
         
         # 性能优化说明
         logger.info("✨ 性能优化: 已启用三层缓存架构 (L1: 内存LRU / L2: Redis持久化 / L3: Multicall3批量查询)")
@@ -418,7 +435,6 @@ class BSCWebSocketMonitor:
             
         except Exception as e:
             logger.warning(f"⚠️ Multicall2 调用失败: {e}, 回退到逐个调用")
-            import traceback
             logger.debug(f"错误详情: {traceback.format_exc()}")
             return self._fallback_individual_calls(calls)
     
@@ -444,9 +460,13 @@ class BSCWebSocketMonitor:
             return self.wbnb_price
         
         try:
+            # 禁用 SSL 警告
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            
             resp = requests.get(
                 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BNB_USDT',
-                timeout=5
+                timeout=5,
+                verify=False  # 禁用 SSL 证书验证
             )
             data = resp.json()
             
@@ -979,41 +999,78 @@ class BSCWebSocketMonitor:
                 print(f"⏭️  [第二层] 无 DBotX 数据: {token_address}...")
                 return None
             
-            # 3. 解析数据
-            token_data = dbotx_api.parse_token_data(raw_data)
-            if not token_data:
-                logger.debug(f"⏭️  [第二层] 解析失败: {token_address}...")
-                return None
-            
-            # 4. 判断内外盘
+            # 3. 判断内外盘
             launchpad_status = launchpad_info.get('launchpad_status', 0)
             is_internal = (launchpad_status == 0)
             pool_type = "内盘" if is_internal else "外盘"
             pool_emoji = "🔴" if is_internal else "🟢"
             
-            # 5. 获取指标数据
-            price_change_1m = token_data.get('price_change', 0)
-            volume_1m = token_data.get('volume', 0)
+            # 4. 根据内外盘选择时间间隔
+            time_interval = self.time_interval_internal if is_internal else self.time_interval_external
+            
+            # 5. 解析数据（使用动态时间间隔）
+            token_data = dbotx_api.parse_token_data(raw_data, time_interval)
+            if not token_data:
+                logger.debug(f"⏭️  [第二层] 解析失败: {token_address}...")
+                return None
+            
+            # 6. Top持有者过滤（内盘和外盘都检查）
+            # 先判断 Redis 配置是否有 topHoldersThreshold
+            top_holders_threshold = self.top_holders_threshold_internal if is_internal else self.top_holders_threshold_external
+            top10_holder_check_passed = None  # 用于日志显示
+            if top_holders_threshold is not None:
+                # 再判断 API 返回数据是否有 top10_holder_rate
+                top10_holder_rate = token_data.get('top10_holder_rate')
+                if top10_holder_rate is not None:
+                    # API 返回的是小数（0-1），需要转成百分比（0-100）再比较
+                    top10_holder_percent = top10_holder_rate * 100
+                    top10_holder_check_passed = top10_holder_percent < top_holders_threshold
+                    # 两个都有，才进行校验
+                    if top10_holder_percent >= top_holders_threshold:
+                        symbol = token_data.get('symbol', 'Unknown')
+                        logger.info(f"⏭️  [第二层] Top10持有者比例过高: {symbol} ({top10_holder_percent:.1f}% >= {top_holders_threshold:.1f}%)")
+                        return None
+                else:
+                    top10_holder_check_passed = "N/A"  # API没返回数据，跳过检查
+            else:
+                top10_holder_check_passed = "未配置"  # Redis未配置，跳过检查
+            
+            # 7. 获取指标数据
+            price_change = token_data.get('price_change', 0)
+            volume = token_data.get('volume', 0)
             symbol = token_data.get('symbol', 'Unknown')
             
-            # 6. 构造 stats 数据（用于 TriggerLogic）
+            # 8. 构造 stats 数据（用于 TriggerLogic）
             stats = {
-                'priceChange': price_change_1m,
-                'volume': volume_1m,
-                'volume_1m': volume_1m,
+                'priceChange': price_change,
+                'volume': volume,
                 'holderChange': 0
             }
             
-            # 7. 选择对应的 events_config
+            # 9. 选择对应的 events_config
             events_config = self.internal_events_config if is_internal else self.external_events_config
             
             logger.info(f"🔎 [第二层指标检查] {pool_emoji}{pool_type} {symbol} ({token_address})")
-            logger.info(f"   ├─ 1分钟涨幅: {price_change_1m:+.2f}%")
-            logger.info(f"   └─ 1分钟交易量: ${volume_1m:,.2f}")
-            logger.debug(f"   配置: {events_config}")
-            logger.debug(f"   统计: {stats}")
+            logger.info(f"   ├─ {time_interval}涨幅: {price_change:+.2f}%")
+            logger.info(f"   ├─ {time_interval}交易量: ${volume:,.2f}")
             
-            # 8. 使用 TriggerLogic 评估
+            # 显示 Top10 持有者检查状态
+            if top10_holder_check_passed == "未配置":
+                logger.info(f"   ├─ Top10持有者: 未配置阈值（跳过此项）")
+            elif top10_holder_check_passed == "N/A":
+                logger.info(f"   ├─ Top10持有者: API未返回（跳过此项）")
+            elif top10_holder_check_passed is True:
+                top10_holder_rate = token_data.get('top10_holder_rate', 0)
+                logger.info(f"   ├─ Top10持有者: {top10_holder_rate * 100:.1f}% (✅ < {top_holders_threshold:.1f}%)")
+            elif top10_holder_check_passed is False:
+                # 这个分支不会执行，因为如果未通过已经return了
+                pass
+            
+            logger.info(f"   └─ 配置阈值: 涨幅>={events_config.get('priceChange', {}).get('risePercent')}% | 交易量>=${events_config.get('volume', {}).get('threshold')}")
+            logger.debug(f"   配置详情: {events_config}")
+            logger.debug(f"   统计数据: {stats}")
+            
+            # 10. 使用 TriggerLogic 评估
             should_trigger, triggered_events = TriggerLogic.evaluate_trigger(
                 stats, events_config, 'any'
             )
@@ -1024,7 +1081,7 @@ class BSCWebSocketMonitor:
                 logger.info(f"   ❌ 未达到触发条件")
                 return None
             
-            # 9. 通过筛选，返回数据
+            # 11. 通过筛选，返回数据
             logger.info(f"   ✅ 满足条件！触发 {len(triggered_events)} 个事件")
             
             token_data['pool_type'] = pool_type
@@ -1160,6 +1217,7 @@ class BSCWebSocketMonitor:
         
         pool_emoji = token_data['pool_emoji']
         pool_type = token_data['pool_type']
+        is_internal = token_data.get('is_internal', False)
         symbol = token_data.get('symbol', base_symbol)
         price_change = token_data.get('price_change', 0)
         volume = token_data.get('volume', 0)
@@ -1167,6 +1225,9 @@ class BSCWebSocketMonitor:
         buy_tax = token_data.get('buy_tax', 0)
         sell_tax = token_data.get('sell_tax', 0)
         price = token_data.get('price', 0)
+        
+        # 获取时间间隔（用于日志显示）
+        time_interval = self.time_interval_internal if is_internal else self.time_interval_external
         
         volume_str = self.format_number(volume)
         market_cap_str = self.format_number(market_cap)
@@ -1180,9 +1241,9 @@ class BSCWebSocketMonitor:
                 alert_reasons.append(event.description)
             elif isinstance(event, dict):
                 if event.get('event') == 'priceChange':
-                    alert_reasons.append(f"📈 1分钟涨幅 {price_change:+.2f}%")
+                    alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
                 elif event.get('event') == 'volume':
-                    alert_reasons.append(f"💹 1分钟交易量 ${volume_str}")
+                    alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
         
         if not alert_reasons:
             alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
@@ -1385,6 +1446,7 @@ class BSCWebSocketMonitor:
             
             pool_emoji = token_data['pool_emoji']
             pool_type = token_data['pool_type']
+            is_internal = token_data.get('is_internal', True)  # Proxy事件默认是内盘
             symbol = token_data.get('symbol', target_symbol)
             price_change = token_data.get('price_change', 0)
             volume = token_data.get('volume', 0)
@@ -1392,6 +1454,9 @@ class BSCWebSocketMonitor:
             buy_tax = token_data.get('buy_tax', 0)
             sell_tax = token_data.get('sell_tax', 0)
             price = token_data.get('price', 0)
+            
+            # 获取时间间隔（用于日志显示）
+            time_interval = self.time_interval_internal if is_internal else self.time_interval_external
             
             volume_str = self.format_number(volume)
             market_cap_str = self.format_number(market_cap)
@@ -1405,9 +1470,9 @@ class BSCWebSocketMonitor:
                     alert_reasons.append(event.description)
                 elif isinstance(event, dict):
                     if event.get('event') == 'priceChange':
-                        alert_reasons.append(f"📈 1分钟涨幅 {price_change:+.2f}%")
+                        alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
                     elif event.get('event') == 'volume':
-                        alert_reasons.append(f"💹 1分钟交易量 ${volume_str}")
+                        alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
             
             if not alert_reasons:
                 alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
@@ -1598,7 +1663,6 @@ class BSCWebSocketMonitor:
     def on_error(self, ws, error):
         """WebSocket 错误回调"""
         logger.error(f"❌ WebSocket 错误: {error}")
-        import traceback
         logger.error(f"错误堆栈: {traceback.format_exc()}")
     
     def on_close(self, ws, close_status_code, close_msg):
@@ -1669,7 +1733,6 @@ class BSCWebSocketMonitor:
                     
                 except Exception as e:
                     logger.error(f"❌ WebSocket 运行异常: {e}")
-                    import traceback
                     logger.error(f"异常堆栈: {traceback.format_exc()}")
                     
                     if not self.should_stop:
