@@ -118,6 +118,7 @@ class BSCWebSocketMonitor:
         self.reconnect_count = 0  # 重连计数
         self.last_message_time = time.time()  # 最后一次收到消息的时间
         self.message_count = 0  # 消息计数器
+        self.cache_hit_count = 0  # 非fourmeme缓存命中计数
         
         # 线程池
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="BSC-WS-Worker")
@@ -229,6 +230,15 @@ class BSCWebSocketMonitor:
         # 预加载 WBNB 价格（在线程池中执行，避免阻塞事件循环）
         self.wbnb_price = await asyncio.to_thread(self.get_wbnb_price)
         logger.info(f"💰 WBNB 价格: ${self.wbnb_price:.2f}")
+        
+        # 统计非fourmeme缓存大小
+        if self.redis_client:
+            try:
+                NON_FOURMEME_KEY = "bsc:non_fourmeme_tokens"
+                cache_size = self.redis_client.scard(NON_FOURMEME_KEY)
+                logger.info(f"📊 非fourmeme缓存: {cache_size} 个token (30天过期)")
+            except Exception as e:
+                logger.debug(f"获取缓存统计失败: {e}")
     
     def get_thread_dbotx_api(self) -> DBotXAPI:
         """获取当前线程的 DBotX API 实例"""
@@ -1105,9 +1115,28 @@ class BSCWebSocketMonitor:
         
         print(f"✅ [外盘] 通过第一层过滤: {base_symbol} (${usd_value:.2f})")
         
-        # fourmeme 验证
+        # 🚀 优化：先检查 Redis 缓存（非fourmeme token黑名单）
+        NON_FOURMEME_KEY = "bsc:non_fourmeme_tokens"
+        if self.redis_client:
+            try:
+                is_cached_non_fourmeme = self.redis_client.sismember(NON_FOURMEME_KEY, base_token)
+                if is_cached_non_fourmeme:
+                    self.cache_hit_count += 1
+                    print(f"⏭️  外盘非 fourmeme (缓存命中 #{self.cache_hit_count}): {base_symbol}：{base_token}")
+                    return
+            except Exception as e:
+                logger.warning(f"⚠️  Redis缓存查询失败: {e}")
+        
+        # fourmeme 验证（未命中缓存才调用API）
         launchpad_info = await self.check_external_is_fourmeme(base_token)
         if not launchpad_info:
+            # 不是fourmeme → 加入Redis缓存（30天过期）
+            if self.redis_client:
+                try:
+                    self.redis_client.sadd(NON_FOURMEME_KEY, base_token)
+                    self.redis_client.expire(NON_FOURMEME_KEY, 30 * 24 * 3600)  # 30天过期
+                except Exception as e:
+                    logger.warning(f"⚠️  Redis缓存写入失败: {e}")
             print(f"⏭️  外盘非 fourmeme: {base_symbol}：{base_token}")
             return
         
@@ -1458,6 +1487,7 @@ class BSCWebSocketMonitor:
                 logger.info(f"   状态: {'🟢 运行中' if self.ws and not self.should_stop else '🔴 已停止'}")
                 logger.info(f"   重连次数: {self.reconnect_count}")
                 logger.info(f"   消息总数: {self.message_count}")
+                logger.info(f"   缓存命中: {self.cache_hit_count} 次（节省API调用）")
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
                 logger.info("=" * 80)
