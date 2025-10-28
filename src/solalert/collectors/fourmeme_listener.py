@@ -175,7 +175,7 @@ class FourMemeListener(BaseCollector):
             await self.stop()
     
     async def _collect_today_history(self, entity):
-        """采集当天的历史消息"""
+        """采集当天的历史消息（优化：连续重复则提前结束）"""
         try:
             self.log_info("📚 开始采集当天历史消息...")
 
@@ -184,6 +184,8 @@ class FourMemeListener(BaseCollector):
             total_count = 0
             token_count = 0
             saved_count = 0
+            consecutive_duplicates = 0  # 连续重复计数
+            max_consecutive_duplicates = 10  # 连续10条重复就停止
 
             async for message in self.client.iter_messages(entity, limit=100):
                 msg_time = message.date.astimezone(BEIJING_TZ)
@@ -203,6 +205,14 @@ class FourMemeListener(BaseCollector):
                     token_count += 1
                     if token_found is True:  # 只有 True 表示成功入库
                         saved_count += 1
+                        consecutive_duplicates = 0  # 有新数据，重置计数器
+                    else:  # False 表示重复
+                        consecutive_duplicates += 1  # 重复数据，计数器+1
+                        
+                        # 连续N条重复，提前结束
+                        if consecutive_duplicates >= max_consecutive_duplicates:
+                            self.log_info(f"🎯 连续{max_consecutive_duplicates}条消息均为重复，历史补偿完成")
+                            break
 
             self.log_success(
                 f"历史消息采集完成: 检查{total_count}条，发现{token_count}个Token，"
