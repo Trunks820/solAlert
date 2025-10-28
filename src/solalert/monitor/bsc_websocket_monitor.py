@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from collections import OrderedDict
 from ..api.telegram_api import TelegramAPI
 from ..api.dbotx_api import DBotXAPI
 from ..core.redis_client import get_redis
@@ -79,10 +80,16 @@ class BSCWebSocketMonitor:
         self.WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
         self.USDC = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
         self.FOURMEME_PROXY = [
-            "0x5c952063c7fc8610ffdb798152d69f0b9550762b",  # 主Proxy
-            "0x8e06ab256ca534ebba05d700f8e40341ec39e0d6"   # Try Buy
+            "0x5c952063c7fc8610ffdb798152d69f0b9550762b".lower(),  # 主Proxy
+            "0x8e06ab256ca534ebba05d700f8e40341ec39e0d6".lower()   # Try Buy
         ]
         self.TOPIC_V2_SWAP = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+        
+        # Fourmeme 自定义事件（可捕获内部调用）
+        self.FOURMEME_CUSTOM_EVENTS = [
+            "0x7db52723a3b2cdd6164364b3b766e65e540d7be48ffa89582956d8eaebe62942",  # 事件1
+            "0x48063b1239b68b5d50123408787a6df1f644d9160f0e5f702fefddb9a855954d"   # 事件2
+        ]
         
         # Multicall2 配置（BSC）
         # 注意：BSC 上有多个 Multicall 实现，优先使用跨链通用的 Multicall3
@@ -136,8 +143,8 @@ class BSCWebSocketMonitor:
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="BSC-WS-Worker")
         self.thread_local = threading.local()
         
-        # 交易去重
-        self.seen_txs = set()
+        # 交易去重（使用OrderedDict自动维护顺序，LRU淘汰）
+        self.seen_txs = OrderedDict()
         self.max_seen_txs = 10000
         
         # WBNB 价格缓存
@@ -147,6 +154,10 @@ class BSCWebSocketMonitor:
         
         # RPC 调用计数
         self.rpc_id = 0
+        
+        # 断线回补
+        self.last_processed_block = 0
+        self.reconnect_time = 0
         
     async def load_config_from_redis(self):
         """从 Redis 加载配置"""
@@ -1105,12 +1116,14 @@ class BSCWebSocketMonitor:
             return None
     
     async def handle_swap_event(self, log: Dict):
-        """处理 PancakeSwap Swap 事件（外盘）- 优化版（使用三层缓存）"""
+        """处理 PancakeSwap Swap 事件（外盘）- 优化版（使用三层缓存 + receipt兜底）"""
         tx_hash = log.get("transactionHash")
         pair_address = log.get("address", "").lower()
         swap_data = self.parse_swap_data(log.get("data"))
         
         if not swap_data:
+            # WebSocket数据解析失败，尝试从receipt兜底
+            await self._handle_swap_with_receipt_fallback(tx_hash, pair_address)
             return
         
         # 使用优化的批量查询（支持 L1/L2/L3 缓存）
@@ -1311,6 +1324,34 @@ class BSCWebSocketMonitor:
             notify_error=None
         )
         # 冷却期已在播报前设置，此处无需重复
+    
+    async def _handle_swap_with_receipt_fallback(self, tx_hash: str, pair_address: str):
+        """外盘receipt兜底：从交易回执中提取Swap事件"""
+        try:
+            # 获取交易回执
+            receipt = self.rpc_call("eth_getTransactionReceipt", [tx_hash])
+            if not receipt:
+                logger.debug(f"⚠️ 获取receipt失败: {tx_hash}")
+                return
+            
+            logs = receipt.get("logs", [])
+            swap_topic = self.TOPIC_V2_SWAP
+            
+            # 查找Swap事件
+            for log in logs:
+                topics = log.get("topics", [])
+                log_addr = log.get("address", "").lower()
+                
+                # 匹配Swap事件
+                if topics and topics[0].lower() == swap_topic and log_addr == pair_address:
+                    logger.info(f"✅ Receipt兜底成功: {tx_hash[:10]}... (外盘)")
+                    # 递归调用原函数处理
+                    await self.handle_swap_event(log)
+                    return
+            
+            logger.debug(f"⚠️ Receipt中未找到Swap事件: {tx_hash}")
+        except Exception as e:
+            logger.debug(f"❌ Receipt兜底失败: {e}")
     
     async def handle_proxy_event(self, log: Dict):
         """处理 Fourmeme Proxy 事件（内盘）"""
@@ -1607,51 +1648,89 @@ class BSCWebSocketMonitor:
             if not isinstance(result, dict):
                 return
             
-            # 去重
+            # 去重（OrderedDict自动LRU）
             tx_hash = result.get("transactionHash")
             if tx_hash:
                 if tx_hash in self.seen_txs:
                     return
                 
-                self.seen_txs.add(tx_hash)
+                self.seen_txs[tx_hash] = True
                 
+                # LRU淘汰最老的交易（FIFO）
                 if len(self.seen_txs) > self.max_seen_txs:
-                    self.seen_txs.clear()
+                    self.seen_txs.popitem(last=False)  # 弹出最早的
+            
+            # 更新最后处理的区块号（用于断线回补）
+            block_number = result.get("blockNumber")
+            if block_number:
+                try:
+                    block_num = int(block_number, 16) if isinstance(block_number, str) else block_number
+                    if block_num > self.last_processed_block:
+                        self.last_processed_block = block_num
+                except:
+                    pass
             
             # 判断事件类型
             topics = result.get("topics", [])
             addr = result.get("address", "").lower()
             
-            if not topics:
+            # 防御性检查：topics必须存在且不为空
+            if not topics or len(topics) == 0:
                 return
             
-            # Swap 事件（外盘）
-            if topics[0] == self.TOPIC_V2_SWAP:
-                self.executor.submit(self._run_async_handler, self.handle_swap_event(result))
+            # 统一小写（BSC节点返回是0x大写）
+            topic0 = topics[0].lower() if topics[0] else ""
+            if not topic0:
+                return
             
-            # Proxy 事件（内盘）
+            # Fourmeme 自定义事件（内盘，含内部调用）
+            if topic0 in self.FOURMEME_CUSTOM_EVENTS:
+                self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
+            
+            # Swap 事件（外盘）
+            elif topic0 == self.TOPIC_V2_SWAP:
+                self.executor.submit(self._run_async_in_thread, self.handle_swap_event, result)
+            
+            # Proxy 事件（内盘，直接调用）
             elif addr in self.FOURMEME_PROXY:
-                self.executor.submit(self._run_async_handler, self.handle_proxy_event(result))
+                self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
+            
+            # Transfer 兜底（防止fourmeme升级/换topic）
+            elif topic0 == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef":
+                # Transfer事件格式: Transfer(address indexed from, address indexed to, uint256 value)
+                # topics[1] = from (padded), topics[2] = to (padded)
+                if len(topics) >= 3:
+                    # 提取from和to地址（去掉padding的0）
+                    from_addr = ("0x" + topics[1][-40:]).lower() if len(topics[1]) >= 40 else ""
+                    to_addr = ("0x" + topics[2][-40:]).lower() if len(topics[2]) >= 40 else ""
+                    
+                    # 检查from或to是否是Proxy地址
+                    if from_addr in self.FOURMEME_PROXY or to_addr in self.FOURMEME_PROXY:
+                        self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
         
         except Exception as e:
             logger.error(f"❌ 处理消息出错: {e}")
     
-    def _run_async_handler(self, coro):
-        """在新事件循环中运行异步处理器"""
+    def _run_async_in_thread(self, async_func, *args, **kwargs):
+        """在线程池中运行异步函数（正确的异步调用方式）"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(coro)
+            loop.run_until_complete(async_func(*args, **kwargs))
         finally:
             loop.close()
     
     def on_open(self, ws):
         """WebSocket 连接成功回调"""
-        if self.reconnect_count == 0:
+        is_reconnect = self.reconnect_count > 0
+        
+        if not is_reconnect:
             logger.info("✅ WebSocket 连接成功！")
             logger.info(f"节点: {self.ws_url[:50]}")
         else:
             logger.info(f"✅ WebSocket 重连成功！(第{self.reconnect_count}次)")
+            # 重连后立即回补遗漏的交易
+            self.executor.submit(self._backfill_missed_logs)
         
         self.reconnect_count += 1
         
@@ -1675,6 +1754,19 @@ class BSCWebSocketMonitor:
         }))
         logger.info(f"✓ 订阅 PancakeV2 Swap")
         
+        # 订阅 Fourmeme 自定义事件（捕获内部调用）
+        custom_event_id = swap_id + 1
+        ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": custom_event_id,
+            "method": "eth_subscribe",
+            "params": ["logs", {
+                "address": self.FOURMEME_PROXY,
+                "topics": [self.FOURMEME_CUSTOM_EVENTS]
+            }]
+        }))
+        logger.info(f"✓ 订阅 Fourmeme 自定义事件（含内部调用）")
+        
         logger.info("✅ 已订阅事件监听")
         logger.info(f"📱 Telegram 频道: {self.bsc_channel_id}")
         logger.info(f"⏳ 等待链上交易...")
@@ -1691,6 +1783,78 @@ class BSCWebSocketMonitor:
         else:
             logger.warning(f"⚠️  WebSocket 连接断开: {close_status_code} - {close_msg}")
             logger.info("🔄 将在5秒后自动重连...")
+    
+    def _backfill_missed_logs(self):
+        """断线回补：使用eth_getLogs回补遗漏的交易"""
+        try:
+            import time
+            
+            # 记录重连时间
+            self.reconnect_time = time.time()
+            
+            # 获取当前区块
+            latest_block_hex = self.rpc_call("eth_blockNumber", [])
+            if not latest_block_hex:
+                logger.warning("❌ 获取最新区块失败，跳过回补")
+                return
+            
+            latest_block = int(latest_block_hex, 16)
+            
+            # 如果是第一次连接，只回补最近100个区块
+            if self.last_processed_block == 0:
+                from_block = max(latest_block - 100, 0)
+            else:
+                # 从上次处理的区块开始回补（最多回补1000个区块，约50秒）
+                from_block = max(self.last_processed_block, latest_block - 1000)
+            
+            logger.info(f"🔄 开始回补遗漏交易: 区块 #{from_block} → #{latest_block} (共{latest_block - from_block}个)")
+            
+            # 分批查询（每次1000个区块，BSC节点支持更大batch）
+            batch_size = 1000
+            total_logs = 0
+            
+            for start in range(from_block, latest_block + 1, batch_size):
+                end = min(start + batch_size - 1, latest_block)
+                
+                # 查询Proxy相关的日志
+                logs = self.rpc_call("eth_getLogs", [{
+                    "fromBlock": hex(start),
+                    "toBlock": hex(end),
+                    "address": self.FOURMEME_PROXY
+                }])
+                
+                if logs and isinstance(logs, list):
+                    total_logs += len(logs)
+                    # 处理每条日志
+                    for log in logs:
+                        try:
+                            # 异步处理日志（在线程池中）
+                            self.executor.submit(self._run_async_in_thread, self._process_backfill_log, log)
+                        except Exception as e:
+                            logger.debug(f"处理回补日志失败: {e}")
+            
+            logger.info(f"✅ 回补完成: 共处理{total_logs}条日志")
+            self.last_processed_block = latest_block
+            
+        except Exception as e:
+            logger.error(f"❌ 回补失败: {e}")
+    
+    async def _process_backfill_log(self, log):
+        """处理回补的日志"""
+        try:
+            # 判断是内盘还是外盘
+            topics = log.get("topics", [])
+            if not topics:
+                return
+            
+            topic0 = topics[0].lower() if topics[0] else ""
+            addr = log.get("address", "").lower()
+            
+            # 内盘事件
+            if topic0 in self.FOURMEME_CUSTOM_EVENTS or addr in self.FOURMEME_PROXY:
+                await self.handle_proxy_event(log)
+        except Exception as e:
+            logger.debug(f"处理回补日志异常: {e}")
     
     def signal_handler(self, signum, frame):
         """信号处理器（Ctrl+C）"""
