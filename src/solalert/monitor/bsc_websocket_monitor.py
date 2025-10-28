@@ -116,6 +116,8 @@ class BSCWebSocketMonitor:
         self.ws = None
         self.should_stop = False
         self.reconnect_count = 0  # 重连计数
+        self.last_message_time = time.time()  # 最后一次收到消息的时间
+        self.message_count = 0  # 消息计数器
         
         # 线程池
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="BSC-WS-Worker")
@@ -1439,9 +1441,45 @@ class BSCWebSocketMonitor:
         except Exception as e:
             logger.error(f"❌ 处理内盘交易出错: {e}")
     
+    def health_check_loop(self):
+        """健康检查循环（每分钟输出一次状态）"""
+        while not self.should_stop:
+            try:
+                time.sleep(60)  # 每60秒检查一次
+                
+                if self.should_stop:
+                    break
+                
+                now = time.time()
+                idle_seconds = int(now - self.last_message_time)
+                
+                logger.info("=" * 80)
+                logger.info("💓 WebSocket 健康检查")
+                logger.info(f"   状态: {'🟢 运行中' if self.ws and not self.should_stop else '🔴 已停止'}")
+                logger.info(f"   重连次数: {self.reconnect_count}")
+                logger.info(f"   消息总数: {self.message_count}")
+                logger.info(f"   上次消息: {idle_seconds}秒前")
+                logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
+                logger.info("=" * 80)
+                
+                # 如果超过10分钟没有消息，主动重连
+                if idle_seconds > 600 and self.ws:
+                    logger.warning("⚠️ 检测到10分钟无消息，主动触发重连...")
+                    try:
+                        self.ws.close()
+                    except:
+                        pass
+                    
+            except Exception as e:
+                logger.error(f"健康检查异常: {e}")
+    
     def on_message(self, ws, message):
         """WebSocket 消息回调"""
         try:
+            # 更新最后消息时间和计数
+            self.last_message_time = time.time()
+            self.message_count += 1
+            
             msg = json.loads(message)
             
             # 跳过订阅确认
@@ -1530,6 +1568,8 @@ class BSCWebSocketMonitor:
     def on_error(self, ws, error):
         """WebSocket 错误回调"""
         logger.error(f"❌ WebSocket 错误: {error}")
+        import traceback
+        logger.error(f"错误堆栈: {traceback.format_exc()}")
     
     def on_close(self, ws, close_status_code, close_msg):
         """WebSocket 关闭回调"""
@@ -1581,6 +1621,11 @@ class BSCWebSocketMonitor:
 
         ws_thread = threading.Thread(target=run_ws, daemon=True)
         ws_thread.start()
+        
+        # 启动健康检查线程
+        health_thread = threading.Thread(target=self.health_check_loop, daemon=True)
+        health_thread.start()
+        logger.info("💓 健康检查已启动（每60秒一次）")
         
         # 保持主线程运行
         try:
