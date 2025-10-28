@@ -120,6 +120,10 @@ class BSCWebSocketMonitor:
             'volume': {'enabled': True, 'threshold': 20000}       # 默认：外盘交易量 >= $20000
         }
         
+        # 触发逻辑（默认值）
+        self.trigger_logic_internal = 'any'  # 内盘触发逻辑
+        self.trigger_logic_external = 'any'  # 外盘触发逻辑
+        
         # WebSocket
         self.ws = None
         self.should_stop = False
@@ -165,11 +169,12 @@ class BSCWebSocketMonitor:
                 self.min_amount_internal = config.get('min_transaction_usd', 200)
                 self.cumulative_min_amount_internal = config.get('cumulative_min_amount_usd', 500)
                 self.time_interval_internal = config.get('timeInterval', '1m')  # 内盘时间间隔
+                self.trigger_logic_internal = config.get('triggerLogic', 'any')  # 内盘触发逻辑
                 # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
                 threshold = config.get('topHoldersThreshold')
                 self.top_holders_threshold_internal = float(threshold) if threshold is not None else None
                 
-                events_config_str = config.get('events_config', '{}')
+                events_config_str = config.get('eventsConfig', '{}')
                 if events_config_str:
                     try:
                         if isinstance(events_config_str, str):
@@ -206,11 +211,12 @@ class BSCWebSocketMonitor:
                 self.min_amount_external = config.get('min_transaction_usd', 400)
                 self.cumulative_min_amount_external = config.get('cumulative_min_amount_usd', 1000)  
                 self.time_interval_external = config.get('timeInterval', '5m')  # 外盘时间间隔
+                self.trigger_logic_external = config.get('triggerLogic', 'any')  # 外盘触发逻辑
                 # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
                 threshold = config.get('topHoldersThreshold')
                 self.top_holders_threshold_external = float(threshold) if threshold is not None else None  
                 
-                events_config_str = config.get('events_config', '{}')
+                events_config_str = config.get('eventsConfig', '{}')
                 if events_config_str:
                     try:
                         if isinstance(events_config_str, str):
@@ -234,8 +240,8 @@ class BSCWebSocketMonitor:
             logger.error(f"❌ 加载 Redis 配置失败: {e}")
         
         # 打印最终配置信息
-        logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 累计>={self.cumulative_min_amount_internal}U, 涨幅>={self.internal_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.internal_events_config.get('volume', {}).get('threshold')}")
-        logger.info(f"📊 外盘配置: 单笔>={self.min_amount_external}U, 累计>={self.cumulative_min_amount_external}U, 涨幅>={self.external_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.external_events_config.get('volume', {}).get('threshold')}")
+        logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 累计>={self.cumulative_min_amount_internal}U, 涨幅>={self.internal_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.internal_events_config.get('volume', {}).get('threshold')}, 触发逻辑={self.trigger_logic_internal}")
+        logger.info(f"📊 外盘配置: 单笔>={self.min_amount_external}U, 累计>={self.cumulative_min_amount_external}U, 涨幅>={self.external_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.external_events_config.get('volume', {}).get('threshold')}, 触发逻辑={self.trigger_logic_external}")
         
         # 性能优化说明
         logger.info("✨ 性能优化: 已启用三层缓存架构 (L1: 内存LRU / L2: Redis持久化 / L3: Multicall3批量查询)")
@@ -1047,8 +1053,9 @@ class BSCWebSocketMonitor:
                 'holderChange': 0
             }
             
-            # 9. 选择对应的 events_config
+            # 9. 选择对应的 events_config 和 trigger_logic
             events_config = self.internal_events_config if is_internal else self.external_events_config
+            trigger_logic = self.trigger_logic_internal if is_internal else self.trigger_logic_external
             
             logger.info(f"🔎 [第二层指标检查] {pool_emoji}{pool_type} {symbol} ({token_address})")
             logger.info(f"   ├─ {time_interval}涨幅: {price_change:+.2f}%")
@@ -1066,13 +1073,15 @@ class BSCWebSocketMonitor:
                 # 这个分支不会执行，因为如果未通过已经return了
                 pass
             
-            logger.info(f"   └─ 配置阈值: 涨幅>={events_config.get('priceChange', {}).get('risePercent')}% | 交易量>=${events_config.get('volume', {}).get('threshold')}")
+            # 显示触发逻辑
+            logic_text = "AND" if trigger_logic == "all" else "OR"
+            logger.info(f"   └─ 配置阈值: 涨幅>={events_config.get('priceChange', {}).get('risePercent')}% {logic_text} 交易量>=${events_config.get('volume', {}).get('threshold')}")
             logger.debug(f"   配置详情: {events_config}")
             logger.debug(f"   统计数据: {stats}")
             
-            # 10. 使用 TriggerLogic 评估
+            # 10. 使用 TriggerLogic 评估（使用配置的触发逻辑）
             should_trigger, triggered_events = TriggerLogic.evaluate_trigger(
-                stats, events_config, 'any'
+                stats, events_config, trigger_logic
             )
             
             logger.debug(f"   触发结果: should_trigger={should_trigger}, triggered_events={len(triggered_events) if triggered_events else 0}")
@@ -1432,6 +1441,16 @@ class BSCWebSocketMonitor:
             token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True)
             if not token_data:
                 return
+            
+            # 更新symbol缓存（如果第一层获取失败，这里用DBotX的正确symbol更新）
+            if target_symbol == "???" and token_data.get('symbol'):
+                correct_symbol = token_data.get('symbol')
+                try:
+                    redis_key = f"token:{target_token}:symbol"
+                    self.redis_client.client.setex(redis_key, 86400, correct_symbol)
+                    logger.debug(f"✅ 更新symbol缓存: {target_token} → {correct_symbol}")
+                except:
+                    pass
             
             # 🔒 关键：第二层通过后立即设置冷却期（防止并发重复播报）
             # 在播报前设置，避免同步 I/O 阻塞期间其他交易也通过
