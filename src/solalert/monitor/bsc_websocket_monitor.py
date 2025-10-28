@@ -1603,23 +1603,52 @@ class BSCWebSocketMonitor:
         
         # 创建 WebSocket（添加 ping/pong 心跳保活）
         websocket.enableTrace(False)
-        self.ws = websocket.WebSocketApp(
-            self.ws_url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
         
-        # 在单独线程中运行 WebSocket（添加心跳参数）
-        def run_ws():
-            self.ws.run_forever(
-                ping_interval=20,    # 每20秒发送ping（更频繁，保持连接活跃）
-                ping_timeout=10,     # ping超时10秒
-                skip_utf8_validation=True  # 跳过UTF-8验证，提升性能
-            )
+        # 在单独线程中运行 WebSocket（添加心跳和自动重连）
+        def run_ws_with_retry():
+            """带重连机制的 WebSocket 运行循环"""
+            retry_count = 0
+            while not self.should_stop:
+                try:
+                    logger.info(f"🔌 WebSocket 连接尝试... (第{retry_count + 1}次)")
+                    
+                    # 每次重连都创建新的 WebSocket 对象
+                    self.ws = websocket.WebSocketApp(
+                        self.ws_url,
+                        on_message=self.on_message,
+                        on_open=self.on_open,
+                        on_error=self.on_error,
+                        on_close=self.on_close
+                    )
+                    
+                    self.ws.run_forever(
+                        ping_interval=20,    # 每20秒发送ping
+                        ping_timeout=10,     # ping超时10秒
+                        skip_utf8_validation=True
+                    )
+                    
+                    # 如果正常退出（用户停止），跳出循环
+                    if self.should_stop:
+                        break
+                    
+                    # 异常退出，等待后重连
+                    retry_count += 1
+                    wait_seconds = min(5 * retry_count, 60)  # 最多等60秒
+                    logger.warning(f"⏳ WebSocket 断开，{wait_seconds}秒后重连...")
+                    time.sleep(wait_seconds)
+                    
+                except Exception as e:
+                    logger.error(f"❌ WebSocket 运行异常: {e}")
+                    import traceback
+                    logger.error(f"异常堆栈: {traceback.format_exc()}")
+                    
+                    if not self.should_stop:
+                        retry_count += 1
+                        wait_seconds = min(5 * retry_count, 60)
+                        logger.warning(f"⏳ {wait_seconds}秒后重试...")
+                        time.sleep(wait_seconds)
 
-        ws_thread = threading.Thread(target=run_ws, daemon=True)
+        ws_thread = threading.Thread(target=run_ws_with_retry, daemon=True)
         ws_thread.start()
         
         # 启动健康检查线程
