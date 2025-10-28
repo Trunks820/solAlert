@@ -1212,8 +1212,8 @@ class BSCWebSocketMonitor:
             # 不是fourmeme → 加入Redis缓存（30天过期）
             if self.redis_client:
                 try:
-                    self.redis_client.sadd(NON_FOURMEME_KEY, base_token)
-                    self.redis_client.expire(NON_FOURMEME_KEY, 30 * 24 * 3600)  # 30天过期
+                    self.redis_client.client.sadd(NON_FOURMEME_KEY, base_token)
+                    self.redis_client.client.expire(NON_FOURMEME_KEY, 30 * 24 * 3600)  # 30天过期
                 except Exception as e:
                     logger.warning(f"⚠️  Redis缓存写入失败: {e}")
             print(f"⏭️  外盘非 fourmeme: {base_symbol}：{base_token}")
@@ -1637,11 +1637,19 @@ class BSCWebSocketMonitor:
             
             msg = json.loads(message)
             
-            # 跳过订阅确认
-            if "id" in msg:
+            # 跳过订阅确认（包含id但不包含method的消息）
+            if "id" in msg and "method" not in msg:
+                # 这是订阅确认消息，记录subscription ID
+                sub_id = msg.get("result")
+                if sub_id:
+                    logger.debug(f"✓ 订阅成功，subscription ID: {sub_id}")
                 return
             
-            # 获取日志
+            # 获取实时事件（method=eth_subscription）
+            if msg.get("method") != "eth_subscription":
+                logger.warning(f"⚠️ 收到未知消息类型: {msg.get('method', 'unknown')}")
+                return
+            
             params = msg.get("params", {})
             result = params.get("result", {})
             
