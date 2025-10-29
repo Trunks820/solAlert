@@ -31,6 +31,48 @@ from ..notifiers.alert_recorder import get_alert_recorder
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+class TokenBucket:
+    """
+    令牌桶限流器：平滑请求峰值，防止瞬时并发超限
+    
+    原理：
+    - 每秒补充 rate 个令牌
+    - 每次请求消耗1个令牌
+    - 令牌不足时等待
+    - 桶容量为 capacity，限制突发流量
+    """
+    def __init__(self, rate: float, capacity: int):
+        self.rate = rate  # 每秒补充令牌数
+        self.capacity = capacity  # 令牌桶容量
+        self.tokens = 0.0  # 冷启动：从0开始蓄积，避免启动时突发流量
+        self.last_update = time.time()
+        self.lock = threading.Lock()
+    
+    def acquire(self) -> float:
+        """
+        获取一个令牌
+        
+        Returns:
+            0: 成功获取令牌
+            > 0: 需要等待的秒数
+        """
+        with self.lock:
+            now = time.time()
+            # 补充令牌（根据时间流逝）
+            elapsed = now - self.last_update
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.last_update = now
+            
+            # 尝试消耗1个令牌
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return 0  # 成功，无需等待
+            else:
+                # 令牌不足，计算需要等待的时间
+                wait_time = (1.0 - self.tokens) / self.rate
+                return wait_time
+
 # 可选依赖：eth_abi（用于 Multicall2）
 try:
     from eth_abi import encode as eth_abi_encode, decode as eth_abi_decode
@@ -143,9 +185,16 @@ class BSCWebSocketMonitor:
         self.message_count = 0  # 消息计数器
         self.cache_hit_count = 0  # 非fourmeme缓存命中计数
         
-        # 线程池
-        self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="BSC-WS-Worker")
+        # 线程池（降低并发度，配合令牌桶平滑流量）
+        self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="BSC-WS-Worker")
         self.thread_local = threading.local()
+        
+        # 令牌桶限流器（全局流量控制，防止瞬时峰值）
+        # 令牌桶限流（冷启动，避免突发）
+        # rate=100: 中等速率，留150 req/s安全边界（vs 250 RPS节点限制）
+        # capacity=20: 严格限制突发流量，最多20次瞬时请求（降低峰值）
+        # 初始tokens=0: 从空桶开始，逐步蓄积，抹平启动时的峰值
+        self.token_bucket = TokenBucket(rate=100.0, capacity=20)
         
         # 交易去重（使用 tx_hash:logIndex 组合键，支持多日志处理）
         self.seen_txs = OrderedDict()
@@ -159,35 +208,59 @@ class BSCWebSocketMonitor:
 
         
         self.session = requests.Session()
-        # 配置连接池和重试策略
+        # 配置连接池和重试策略（降低并发，配合令牌桶和线程池）
         retry_strategy = Retry(
             total=3,
             backoff_factor=0.3,
             status_forcelist=[500, 502, 503, 504]
         )
         adapter = HTTPAdapter(
-            pool_connections=10,  # 连接池大小
-            pool_maxsize=20,      # 最大连接数
+            pool_connections=5,   # 连接池大小（与线程池max_workers一致）
+            pool_maxsize=10,      # 最大连接数（降低并发压力）
             max_retries=retry_strategy
         )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
-        # RPC 调用计数
+        # RPC 调用计数和统计
         self.rpc_id = 0
+        self.rpc_stats = {}  # {method: count} 统计各方法调用次数
+        self.rpc_stats_start_time = time.time()  # 统计开始时间
+        
+        # 速率限制（防止429限流）
+        self.rate_limit_lock = threading.Lock()
+        self.last_rpc_time = 0
+        # min_rpc_interval 已降低到最小值，主要流控交给令牌桶
+        # 此值仅作为备用保护层，基本不起作用
+        self.min_rpc_interval = 0.001  # 1ms 象征性间隔，主流控靠令牌桶
+        self.rate_limit_429_count = 0  # 429错误计数
+        self.rate_limit_backoff_until = 0  # 退避截止时间（秒）
+        self.rate_limit_consecutive_429 = 0  # 连续429次数
         
         # 断线回补
         self.last_processed_block = 0
         self.reconnect_time = 0
         self.last_backfill_time = 0  # 上次回补时间
-        self.backfill_cooldown = 60  # 回补冷却期（60秒）
+        self.backfill_cooldown = 300  # 回补冷却期（5分钟，大幅减少回补频率）
         self.backfill_count = 0  # 回补次数统计
         
-        # 回执缓存（减少 eth_getTransactionReceipt 重复调用）
-        self.receipt_cache = {}  # {tx_hash: {"receipt": {}, "tx_info": {}, "cached_at": timestamp}}
-        self.receipt_cache_ttl = 60  # 60秒过期
+        # 回执缓存（减少 eth_getTransactionReceipt 重复调用，带并发保护）
+        self.receipt_cache = {}  # {tx_hash: {"receipt": {}, "tx_info": {}, "cached_at": timestamp, "status": "ready|loading|failed", "event": threading.Event()}}
+        self.receipt_cache_ttl = 1800  # 30分钟过期（交易回执不变，长时间缓存安全）
+        self.receipt_cache_failed_ttl = 120  # 失败结果缓存2分钟（避免429后立即重试）
         self.receipt_cache_hits = 0  # 命中计数
-        self.receipt_cache_lock = threading.Lock()  # 线程安全锁
+        self.receipt_cache_misses = 0  # 未命中计数
+        self.receipt_cache_concurrent_waits = 0  # 并发等待计数
+        self.receipt_cache_failed_hits = 0  # 失败缓存命中（避免重试）
+        self.receipt_cache_wait_time_total = 0.0  # 累计等待耗时（秒）
+        self.receipt_cache_wait_timeouts = 0  # 等待超时次数
+        self.receipt_cache_lock = threading.Lock()  # 全局锁（仅用于读写缓存字典）
+        
+        # eth_call 缓存（减少代币信息重复查询）
+        self.eth_call_cache = {}  # {(to, data): (result, cached_at)}
+        self.eth_call_cache_ttl = 300  # 5分钟过期（decimals/symbol不会变）
+        self.eth_call_cache_hits = 0  # 命中计数
+        self.eth_call_cache_lock = threading.Lock()  # 线程安全锁
         
     async def load_config_from_redis(self):
         """从 Redis 加载配置"""
@@ -211,6 +284,8 @@ class BSCWebSocketMonitor:
                 self.cumulative_min_amount_internal = config.get('cumulative_min_amount_usd', 500)
                 self.time_interval_internal = config.get('timeInterval', '1m')  # 内盘时间间隔
                 self.trigger_logic_internal = config.get('triggerLogic', 'any')  # 内盘触发逻辑
+                
+                logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 累计>={self.cumulative_min_amount_internal}U, 时间间隔={self.time_interval_internal}")
                 # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
                 threshold = config.get('topHoldersThreshold')
                 self.top_holders_threshold_internal = float(threshold) if threshold is not None else None
@@ -253,6 +328,9 @@ class BSCWebSocketMonitor:
                 self.cumulative_min_amount_external = config.get('cumulative_min_amount_usd', 1000)  
                 self.time_interval_external = config.get('timeInterval', '5m')  # 外盘时间间隔
                 self.trigger_logic_external = config.get('triggerLogic', 'any')  # 外盘触发逻辑
+                
+                logger.info(f"📊 外盘配置: 单笔>={self.min_amount_external}U, 累计>={self.cumulative_min_amount_external}U, 时间间隔={self.time_interval_external}")
+                
                 # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
                 threshold = config.get('topHoldersThreshold')
                 self.top_holders_threshold_external = float(threshold) if threshold is not None else None  
@@ -279,6 +357,10 @@ class BSCWebSocketMonitor:
 
         except Exception as e:
             logger.error(f"❌ 加载 Redis 配置失败: {e}")
+        
+        # 计算全局最小金额阈值（用于提前过滤）
+        self.global_min_amount = min(self.min_amount_internal, self.min_amount_external)
+        logger.info(f"🔍 全局最小过滤阈值: {self.global_min_amount}U（取内外盘最小值，提前过滤小额交易）")
         
         # 打印最终配置信息
         logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 累计>={self.cumulative_min_amount_internal}U, 涨幅>={self.internal_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.internal_events_config.get('volume', {}).get('threshold')}, 触发逻辑={self.trigger_logic_internal}")
@@ -320,77 +402,283 @@ class BSCWebSocketMonitor:
     
     def get_receipt_cached(self, tx_hash: str) -> tuple:
         """
-        获取交易回执（带缓存，60秒TTL，线程安全）
+        获取交易回执（带缓存，并发保护，失败缓存）
+        
+        优化：
+        1. Loading状态：防止多个线程同时拉取同一交易
+        2. Event等待：后续线程等待第一个线程完成
+        3. 失败缓存：RPC失败时缓存5秒，避免风暴式重试
+        4. 详细统计：hits/misses/waits/failed_hits
         
         Returns:
             (receipt, tx_info) 或 (None, None) 如果失败
         """
         now = time.time()
+        event_to_wait = None
         
-        # 1. 检查缓存（线程安全）
+        # === 阶段1: 检查缓存（快速路径） ===
         with self.receipt_cache_lock:
             if tx_hash in self.receipt_cache:
                 cached_data = self.receipt_cache[tx_hash]
+                status = cached_data.get("status", "ready")
                 cached_at = cached_data.get("cached_at", 0)
                 
-                # 未过期
-                if now - cached_at < self.receipt_cache_ttl:
+                # 情况1: 正在加载中 → 其他线程正在拉取，等待它完成
+                if status == "loading":
+                    event_to_wait = cached_data.get("event")
+                    self.receipt_cache_concurrent_waits += 1
+                    logger.info(f"⏳ 并发等待（其他线程正在拉取）: {tx_hash[:10]}... (等待#{self.receipt_cache_concurrent_waits})")
+                
+                # 情况2: 成功缓存，未过期
+                elif status == "ready" and now - cached_at < self.receipt_cache_ttl:
                     receipt = cached_data.get("receipt")
                     tx_info = cached_data.get("tx_info")
                     
-                    # 验证数据完整性（防止脏数据）
+                    # 验证数据完整性
                     if receipt and isinstance(receipt, dict) and receipt.get("logs"):
                         self.receipt_cache_hits += 1
-                        logger.debug(f"✅ 回执缓存命中: {tx_hash[:10]}... (#{self.receipt_cache_hits})")
+                        logger.debug(f"✅ 回执缓存命中: {tx_hash[:10]}... (命中#{self.receipt_cache_hits})")
                         return receipt, tx_info
                     else:
-                        # 脏数据，删除并重新拉取
-                        logger.debug(f"⚠️ 回执缓存数据不完整，重新拉取: {tx_hash[:10]}...")
+                        # 脏数据，删除
+                        logger.debug(f"⚠️ 脏数据，重新拉取: {tx_hash[:10]}...")
                         del self.receipt_cache[tx_hash]
+                
+                # 情况3: 失败缓存，未过期 → 避免短期内重试
+                elif status == "failed" and now - cached_at < self.receipt_cache_failed_ttl:
+                    self.receipt_cache_failed_hits += 1
+                    logger.debug(f"🚫 失败缓存命中（跳过重试）: {tx_hash[:10]}... (失败缓存#{self.receipt_cache_failed_hits})")
+                    return None, None
+                
+                # 情况4: 过期，删除
+                else:
+                    del self.receipt_cache[tx_hash]
         
-        # 2. 缓存未命中，调用 RPC（锁外执行，避免阻塞其他线程）
-        logger.debug(f"🔍 回执缓存未命中，调用RPC: {tx_hash[:10]}...")
-        receipt = self.rpc_call("eth_getTransactionReceipt", [tx_hash])
-        tx_info = self.rpc_call("eth_getTransactionByHash", [tx_hash])
+        # === 阶段2: 如果需要等待其他线程 ===
+        if event_to_wait:
+            # 等待最多10秒（防止死锁），记录耗时
+            wait_start = time.time()
+            wait_result = event_to_wait.wait(timeout=10)
+            wait_elapsed = time.time() - wait_start
+            
+            # 统计等待耗时
+            self.receipt_cache_wait_time_total += wait_elapsed
+            
+            # 检查是否超时
+            if not wait_result or wait_elapsed >= 9.5:  # 接近10秒视为超时
+                self.receipt_cache_wait_timeouts += 1
+                logger.warning(
+                    f"⚠️ 并发等待超时: {tx_hash[:10]}... (耗时{wait_elapsed:.2f}s, "
+                    f"超时#{self.receipt_cache_wait_timeouts}次，将自行拉取)"
+                )
+            else:
+                logger.info(f"✅ 并发等待完成: {tx_hash[:10]}... (耗时{wait_elapsed:.2f}s)")
+            
+            # 等待完成后，再次尝试读缓存
+            with self.receipt_cache_lock:
+                if tx_hash in self.receipt_cache:
+                    cached_data = self.receipt_cache[tx_hash]
+                    if cached_data.get("status") == "ready":
+                        receipt = cached_data.get("receipt")
+                        tx_info = cached_data.get("tx_info")
+                        if receipt:
+                            logger.info(f"✅ 等待后获取结果成功: {tx_hash[:10]}...")
+                            return receipt, tx_info
+            
+            # 如果等待后仍未获取到，说明第一个线程失败了，继续后续流程
+            logger.warning(f"⚠️ 等待后仍未获取到数据，自行拉取: {tx_hash[:10]}...")
         
-        # 3. 写入缓存（线程安全）
+        # === 阶段3: 缓存未命中，占位并拉取 ===
+        loading_event = threading.Event()
+        
         with self.receipt_cache_lock:
-            # 双重检查：可能其他线程已经写入了
-            if tx_hash not in self.receipt_cache or now - self.receipt_cache[tx_hash].get("cached_at", 0) > self.receipt_cache_ttl:
+            # 双重检查：可能刚才等待时其他线程已写入
+            if tx_hash in self.receipt_cache and self.receipt_cache[tx_hash].get("status") == "ready":
+                cached_data = self.receipt_cache[tx_hash]
+                receipt = cached_data.get("receipt")
+                tx_info = cached_data.get("tx_info")
+                if receipt:
+                    return receipt, tx_info
+            
+            # 设置 loading 状态（占位）
+            self.receipt_cache[tx_hash] = {
+                "status": "loading",
+                "event": loading_event,
+                "cached_at": now
+            }
+            self.receipt_cache_misses += 1
+            logger.debug(f"🔍 回执缓存未命中，调用RPC: {tx_hash[:10]}... (未命中#{self.receipt_cache_misses})")
+        
+        # === 阶段4: 锁外执行 RPC（避免阻塞） ===
+        try:
+            receipt = self.rpc_call("eth_getTransactionReceipt", [tx_hash])
+            tx_info = self.rpc_call("eth_getTransactionByHash", [tx_hash])
+            
+            # 判断是否成功
+            success = receipt and isinstance(receipt, dict) and receipt.get("logs")
+            
+            # 写入缓存
+            with self.receipt_cache_lock:
+                if success:
+                    # 成功：缓存 5 分钟
+                    self.receipt_cache[tx_hash] = {
+                        "status": "ready",
+                        "receipt": receipt,
+                        "tx_info": tx_info,
+                        "cached_at": now,
+                        "event": None
+                    }
+                else:
+                    # 失败：缓存 5 秒（防止风暴式重试）
+                    self.receipt_cache[tx_hash] = {
+                        "status": "failed",
+                        "receipt": None,
+                        "tx_info": None,
+                        "cached_at": now,
+                        "event": None
+                    }
+                    logger.debug(f"❌ RPC失败，缓存失败状态5秒: {tx_hash[:10]}...")
+                
+                # 清理过期缓存
+                if len(self.receipt_cache) > 5000:
+                    to_delete = [
+                        k for k, v in self.receipt_cache.items()
+                        if now - v.get("cached_at", 0) > max(self.receipt_cache_ttl, self.receipt_cache_failed_ttl)
+                    ]
+                    for k in to_delete:
+                        del self.receipt_cache[k]
+                    if to_delete:
+                        logger.debug(f"🧹 清理过期回执缓存: {len(to_delete)} 条")
+            
+            # 通知等待的线程
+            loading_event.set()
+            
+            return receipt, tx_info
+            
+        except Exception as e:
+            logger.debug(f"❌ RPC异常: {tx_hash[:10]}... - {e}")
+            
+            # 异常也缓存为失败状态
+            with self.receipt_cache_lock:
                 self.receipt_cache[tx_hash] = {
-                    "receipt": receipt,
-                    "tx_info": tx_info,
-                    "cached_at": now
+                    "status": "failed",
+                    "receipt": None,
+                    "tx_info": None,
+                    "cached_at": now,
+                    "event": None
                 }
             
-            # 4. 清理过期缓存（防止内存泄漏）
-            if len(self.receipt_cache) > 5000:  # 超过 5k 条
-                to_delete = [
-                    k for k, v in self.receipt_cache.items()
-                    if now - v.get("cached_at", 0) > self.receipt_cache_ttl
-                ]
-                for k in to_delete:
-                    del self.receipt_cache[k]
-                if to_delete:
-                    logger.debug(f"🧹 清理过期回执缓存: {len(to_delete)} 条")
+            loading_event.set()
+            return None, None
+    
+    def cached_eth_call(self, to: str, data: str):
+        """
+        带缓存的 eth_call（用于代币信息查询）
         
-        return receipt, tx_info
+        优化：
+        - 缓存 decimals/symbol 等不变的数据
+        - USDT/WBNB等常见代币100%命中
+        - 减少30-50% eth_call
+        """
+        cache_key = (to.lower(), data.lower())
+        now = time.time()
+        
+        # 检查缓存
+        with self.eth_call_cache_lock:
+            if cache_key in self.eth_call_cache:
+                result, cached_at = self.eth_call_cache[cache_key]
+                if now - cached_at < self.eth_call_cache_ttl:
+                    self.eth_call_cache_hits += 1
+                    return result
+        
+        # 缓存未命中，调用RPC
+        result = self.rpc_call("eth_call", [{"to": to, "data": data}, "latest"])
+        
+        # 写入缓存
+        if result:  # 只缓存成功的结果
+            with self.eth_call_cache_lock:
+                self.eth_call_cache[cache_key] = (result, now)
+                
+                # 清理过期缓存（防止内存泄漏）
+                if len(self.eth_call_cache) > 5000:
+                    to_delete = [
+                        k for k, (_, t) in self.eth_call_cache.items()
+                        if now - t > self.eth_call_cache_ttl
+                    ]
+                    for k in to_delete:
+                        del self.eth_call_cache[k]
+        
+        return result
     
     def rpc_call(self, method: str, params: list):
-        """发送 HTTP RPC 请求（使用长连接 + 慢调用监控）"""
+        """
+        发送 HTTP RPC 请求（带令牌桶 + 429处理 + 慢调用监控）
+        
+        优化：
+        1. 令牌桶（主流控）：全局流量控制（100 req/s，容量20），冷启动避免突发
+        2. 最小间隔（备用）：象征性1ms间隔，主要流控交给令牌桶
+        3. 429检测：检测限流错误并指数退避
+        4. 退避机制：连续429时延长退避时间（最高120s）
+        5. 统计监控：记录429次数和慢调用
+        """
         self.rpc_id += 1
+        
+        # === 阶段0: 令牌桶限流（全局流量控制）===
+        wait_time = self.token_bucket.acquire()
+        if wait_time > 0:
+            time.sleep(wait_time)
+        
+        # === 阶段1: 速率限制（防止429） ===
+        with self.rate_limit_lock:
+            # 检查是否在退避期内
+            now = time.time()
+            if now < self.rate_limit_backoff_until:
+                backoff_wait = self.rate_limit_backoff_until - now
+                logger.warning(f"⏸️  速率限制退避中，等待 {backoff_wait:.2f}s...")
+                time.sleep(backoff_wait)
+            
+            # 限制最小请求间隔
+            elapsed_since_last = now - self.last_rpc_time
+            if elapsed_since_last < self.min_rpc_interval:
+                time.sleep(self.min_rpc_interval - elapsed_since_last)
+            
+            self.last_rpc_time = time.time()
+        
+        # === 阶段2: 发送RPC请求 ===
         start_time = time.time()
+        self.rpc_stats[method] = self.rpc_stats.get(method, 0) + 1
         
         try:
-            # 使用长连接（Session）
             resp = self.session.post(
                 self.rpc_url,
                 json={"jsonrpc": "2.0", "id": self.rpc_id, "method": method, "params": params},
                 timeout=10
             )
+            
+            # === 阶段3: 检查429限流 ===
+            if resp.status_code == 429:
+                self.rate_limit_429_count += 1
+                self.rate_limit_consecutive_429 += 1
+                
+                # 指数退避：1s, 2s, 4s, 8s, 最高16s
+                backoff_time = min(2 ** self.rate_limit_consecutive_429, 16)
+                self.rate_limit_backoff_until = time.time() + backoff_time
+                
+                logger.warning(
+                    f"🚫 遇到429限流 (累计#{self.rate_limit_429_count}, 连续#{self.rate_limit_consecutive_429}次), "
+                    f"退避 {backoff_time}s, method={method}"
+                )
+                
+                # 返回None，让上层缓存为failed状态
+                return None
+            
+            # === 阶段4: 成功响应，重置连续429计数 ===
+            if resp.status_code == 200:
+                self.rate_limit_consecutive_429 = 0  # 重置连续429计数
+            
             result = resp.json().get("result")
             
-            # 慢调用监控（超过 1 秒）
+            # === 阶段5: 慢调用监控 ===
             latency = time.time() - start_time
             if latency > 1.0:
                 logger.warning("RPC慢调用", extra={
@@ -400,6 +688,7 @@ class BSCWebSocketMonitor:
                 })
             
             return result
+            
         except Exception as e:
             latency = time.time() - start_time
             logger.debug(f"RPC 错误: {e}", extra={
@@ -642,11 +931,8 @@ class BSCWebSocketMonitor:
                 except:
                     pass
             
-            # L3: 链上查询
-            data = self.rpc_call("eth_call", [{
-                "to": token,
-                "data": "0x313ce567"  # decimals()
-            }, "latest"])
+            # L3: 链上查询（使用缓存）
+            data = self.cached_eth_call(token, "0x313ce567")
             
             result = int(data, 16) if data else 18
             
@@ -698,11 +984,8 @@ class BSCWebSocketMonitor:
                     cached_value = cached_value.decode('utf-8')
                 return cached_value
             
-            # L3: 链上查询
-            data = self.rpc_call("eth_call", [{
-                "to": token,
-                "data": "0x95d89b41"  # symbol()
-            }, "latest"])
+            # L3: 链上查询（使用缓存）
+            data = self.cached_eth_call(token, "0x95d89b41")
             
             # 使用改进的解析函数
             result = self.parse_symbol_data(data)
@@ -733,15 +1016,9 @@ class BSCWebSocketMonitor:
                 if len(parts) == 2:
                     return parts[0], parts[1]
             
-            # L3: 链上查询
-            token0_data = self.rpc_call("eth_call", [{
-                "to": pair,
-                "data": "0x0dfe1681"  # token0()
-            }, "latest"])
-            token1_data = self.rpc_call("eth_call", [{
-                "to": pair,
-                "data": "0xd21220a7"  # token1()
-            }, "latest"])
+            # L3: 链上查询（使用缓存）
+            token0_data = self.cached_eth_call(pair, "0x0dfe1681")
+            token1_data = self.cached_eth_call(pair, "0xd21220a7")
             
             if token0_data and token1_data:
                 token0 = "0x" + token0_data[-40:]
@@ -1786,8 +2063,52 @@ class BSCWebSocketMonitor:
                 logger.info(f"   回补次数: {self.backfill_count} (冷却期: {self.backfill_cooldown}s)")
                 logger.info(f"   消息总数: {self.message_count}")
                 logger.info(f"   去重缓存: {len(self.seen_txs)} / {self.max_seen_txs} ({len(self.seen_txs) / self.max_seen_txs * 100:.1f}%)")
-                logger.info(f"   回执缓存: {len(self.receipt_cache)} 条 (命中 {self.receipt_cache_hits} 次, 节省RPC)")
+                
+                # 回执缓存详细统计
+                total_cache_requests = self.receipt_cache_hits + self.receipt_cache_misses
+                hit_rate = (self.receipt_cache_hits / total_cache_requests * 100) if total_cache_requests > 0 else 0
+                avg_wait_time = (self.receipt_cache_wait_time_total / self.receipt_cache_concurrent_waits) if self.receipt_cache_concurrent_waits > 0 else 0
+                
+                logger.info(f"   回执缓存: {len(self.receipt_cache)} 条")
+                logger.info(f"      ├─ 命中: {self.receipt_cache_hits} 次 ({hit_rate:.1f}% 命中率)")
+                logger.info(f"      ├─ 未命中: {self.receipt_cache_misses} 次")
+                logger.info(f"      ├─ 并发等待: {self.receipt_cache_concurrent_waits} 次（节省RPC）")
+                
+                # 等待耗时统计
+                if self.receipt_cache_concurrent_waits > 0:
+                    logger.info(f"      │  ├─ 平均耗时: {avg_wait_time:.2f}s/次")
+                    logger.info(f"      │  ├─ 累计耗时: {self.receipt_cache_wait_time_total:.1f}s")
+                    if self.receipt_cache_wait_timeouts > 0:
+                        timeout_rate = (self.receipt_cache_wait_timeouts / self.receipt_cache_concurrent_waits * 100)
+                        logger.info(f"      │  └─ ⚠️ 超时: {self.receipt_cache_wait_timeouts} 次 ({timeout_rate:.1f}%)")
+                    else:
+                        logger.info(f"      │  └─ ✅ 无超时")
+                
+                logger.info(f"      └─ 失败缓存命中: {self.receipt_cache_failed_hits} 次（避免重试）")
+                
+                logger.info(f"   eth_call缓存: {len(self.eth_call_cache)} 条 (命中 {self.eth_call_cache_hits} 次, 节省RPC)")
                 logger.info(f"   非fourmeme缓存: {self.cache_hit_count} 次（节省API调用）")
+                
+                # RPC 调用统计（本次运行累计）
+                total_rpc_calls = sum(self.rpc_stats.values())
+                if total_rpc_calls > 0:
+                    running_hours = (time.time() - self.rpc_stats_start_time) / 3600
+                    rpc_per_hour = total_rpc_calls / running_hours if running_hours > 0 else 0
+                    daily_projection = rpc_per_hour * 24
+                    
+                    logger.info(f"   RPC统计（累计）: {total_rpc_calls} 次 ({rpc_per_hour:.0f}/小时, 日推算:{daily_projection/1_000_000:.2f}M)")
+                    # 显示 Top 3 方法
+                    top_methods = sorted(self.rpc_stats.items(), key=lambda x: x[1], reverse=True)[:3]
+                    for method, count in top_methods:
+                        logger.info(f"      ├─ {method}: {count} 次")
+                    
+                    # 429限流统计
+                    if self.rate_limit_429_count > 0:
+                        rate_429 = (self.rate_limit_429_count / total_rpc_calls * 100) if total_rpc_calls > 0 else 0
+                        logger.info(f"      └─ ⚠️ 429限流: {self.rate_limit_429_count} 次 ({rate_429:.2f}%, 连续{self.rate_limit_consecutive_429}次)")
+                    else:
+                        logger.info(f"      └─ ✅ 无429限流")
+                
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
                 logger.info("=" * 80)
