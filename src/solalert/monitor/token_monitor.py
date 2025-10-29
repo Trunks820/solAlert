@@ -5,6 +5,7 @@ Token监控引擎
 import asyncio
 import json
 import hashlib
+import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from .jupiter_api import JupiterAPI
@@ -556,22 +557,25 @@ class TokenMonitorEngine:
         # 辅助函数：查询单个 token
         async def fetch_single_token(ca: str, chain: str) -> Optional[tuple]:
             """查询单个 token 的数据"""
+            start_time = time.time()
+            short_ca = ca[:6]
+            
             try:
                 # 1. 搜索 pair
-                logger.info(f"🔍 [{chain.upper()}] 查询 Token: {ca[:10]}... - 搜索交易对")
+                t1 = time.time()
                 pair_info = await self.dbotx_api.search_pairs(ca)
+                t1_elapsed = time.time() - t1
                 if not pair_info:
                     logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 未找到交易对")
                     return None
                 
                 # 2. 获取详细数据
                 pair_address = pair_info.get('pair_address')
-                # 从 search_pairs 返回的数据中获取真实的链名称
-                # 因为 SOL Token 可能在多条链上（如 BSC 上的 Wrapped SOL）
-                actual_chain = pair_info.get('chain', chain)  # 优先使用 API 返回的链，回退到传入的 chain
-                logger.info(f"✓ [{chain.upper()}] Token {ca[:10]}... - 找到交易对: {pair_address[:10]}... (链: {actual_chain})")
+                actual_chain = pair_info.get('chain', chain)
                 
+                t2 = time.time()
                 raw_data = await self.dbotx_api.get_pair_info(actual_chain, pair_address)
+                t2_elapsed = time.time() - t2
                 if not raw_data:
                     logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 获取交易对详情失败")
                     return None
@@ -582,15 +586,22 @@ class TokenMonitorEngine:
                     logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 解析数据失败")
                     return None
                 
-                logger.info(f"✓ [{chain.upper()}] Token {ca[:10]}... - 解析成功: {parsed_data['symbol']}")
-                
                 # 4. 转换为 stats5m 格式
+                t3 = time.time()
                 stats5m = await self.convert_dbotx_to_stats5m(parsed_data, ca)
+                t3_elapsed = time.time() - t3
+                
                 if not stats5m:
                     logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 转换 stats5m 格式失败")
                     return None
                 
-                logger.info(f"✅ [{chain.upper()}] Token {ca[:10]}... - 数据获取完成")
+                # 汇总耗时
+                total_time = time.time() - start_time
+                logger.info(
+                    f"✅ [{chain.upper()}] {parsed_data['symbol']} ({short_ca}...) "
+                    f"完成 | 总耗时: {total_time:.2f}s "
+                    f"(搜索: {t1_elapsed:.2f}s, 详情: {t2_elapsed:.2f}s, 转换: {t3_elapsed:.2f}s)"
+                )
                 return (ca, {
                     'address': ca,
                     'symbol': parsed_data['symbol'],
@@ -609,16 +620,11 @@ class TokenMonitorEngine:
                 logger.warning(f"❌ [{chain.upper()}] 查询 {ca[:10]}... 失败: {e}")
                 return None
         
-        # 1. 获取 Solana 链数据（串行查询，避免API限流）
+        # 1. 获取 Solana 链数据（并发查询，提高速度）
         if sol_tokens:
-            logger.info(f"🔍 使用 DBotX API 查询 {len(sol_tokens)} 个 Solana Token...")
-            results = []
-            for ca in sol_tokens:
-                result = await fetch_single_token(ca, 'solana')  # 注意：DBotX API 使用 'solana'，不是 'sol'
-                results.append(result)
-                # 添加小延迟，避免触发API限流（经验值：每个请求间隔200ms）
-                if len(sol_tokens) > 1:
-                    await asyncio.sleep(0.2)
+            logger.info(f"🔍 使用 DBotX API 并发查询 {len(sol_tokens)} 个 Solana Token...")
+            tasks = [fetch_single_token(ca, 'solana') for ca in sol_tokens]  # 注意：DBotX API 使用 'solana'，不是 'sol'
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
             for result in results:
                 if result and not isinstance(result, Exception):
