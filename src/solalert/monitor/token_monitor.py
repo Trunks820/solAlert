@@ -30,7 +30,7 @@ class TokenMonitorEngine:
         self.dbotx_api = DBotXAPI()  # 使用 DBotX API 替代 GMGN API
         self.notification_service = NotificationService(
             telegram_enabled=True,
-            telegram_chat_id=-1002569554228,
+            telegram_chat_id=-1003291885712,
             wechat_enabled=False
         )
         self.alert_recorder = AlertRecorder()  # 用于数据库和WebSocket推送
