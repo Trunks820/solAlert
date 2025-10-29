@@ -179,6 +179,15 @@ class BSCWebSocketMonitor:
         # 断线回补
         self.last_processed_block = 0
         self.reconnect_time = 0
+        self.last_backfill_time = 0  # 上次回补时间
+        self.backfill_cooldown = 60  # 回补冷却期（60秒）
+        self.backfill_count = 0  # 回补次数统计
+        
+        # 回执缓存（减少 eth_getTransactionReceipt 重复调用）
+        self.receipt_cache = {}  # {tx_hash: {"receipt": {}, "tx_info": {}, "cached_at": timestamp}}
+        self.receipt_cache_ttl = 60  # 60秒过期
+        self.receipt_cache_hits = 0  # 命中计数
+        self.receipt_cache_lock = threading.Lock()  # 线程安全锁
         
     async def load_config_from_redis(self):
         """从 Redis 加载配置"""
@@ -308,6 +317,64 @@ class BSCWebSocketMonitor:
         if not hasattr(self.thread_local, 'dbotx_api'):
             self.thread_local.dbotx_api = DBotXAPI()
         return self.thread_local.dbotx_api
+    
+    def get_receipt_cached(self, tx_hash: str) -> tuple:
+        """
+        获取交易回执（带缓存，60秒TTL，线程安全）
+        
+        Returns:
+            (receipt, tx_info) 或 (None, None) 如果失败
+        """
+        now = time.time()
+        
+        # 1. 检查缓存（线程安全）
+        with self.receipt_cache_lock:
+            if tx_hash in self.receipt_cache:
+                cached_data = self.receipt_cache[tx_hash]
+                cached_at = cached_data.get("cached_at", 0)
+                
+                # 未过期
+                if now - cached_at < self.receipt_cache_ttl:
+                    receipt = cached_data.get("receipt")
+                    tx_info = cached_data.get("tx_info")
+                    
+                    # 验证数据完整性（防止脏数据）
+                    if receipt and isinstance(receipt, dict) and receipt.get("logs"):
+                        self.receipt_cache_hits += 1
+                        logger.debug(f"✅ 回执缓存命中: {tx_hash[:10]}... (#{self.receipt_cache_hits})")
+                        return receipt, tx_info
+                    else:
+                        # 脏数据，删除并重新拉取
+                        logger.debug(f"⚠️ 回执缓存数据不完整，重新拉取: {tx_hash[:10]}...")
+                        del self.receipt_cache[tx_hash]
+        
+        # 2. 缓存未命中，调用 RPC（锁外执行，避免阻塞其他线程）
+        logger.debug(f"🔍 回执缓存未命中，调用RPC: {tx_hash[:10]}...")
+        receipt = self.rpc_call("eth_getTransactionReceipt", [tx_hash])
+        tx_info = self.rpc_call("eth_getTransactionByHash", [tx_hash])
+        
+        # 3. 写入缓存（线程安全）
+        with self.receipt_cache_lock:
+            # 双重检查：可能其他线程已经写入了
+            if tx_hash not in self.receipt_cache or now - self.receipt_cache[tx_hash].get("cached_at", 0) > self.receipt_cache_ttl:
+                self.receipt_cache[tx_hash] = {
+                    "receipt": receipt,
+                    "tx_info": tx_info,
+                    "cached_at": now
+                }
+            
+            # 4. 清理过期缓存（防止内存泄漏）
+            if len(self.receipt_cache) > 5000:  # 超过 5k 条
+                to_delete = [
+                    k for k, v in self.receipt_cache.items()
+                    if now - v.get("cached_at", 0) > self.receipt_cache_ttl
+                ]
+                for k in to_delete:
+                    del self.receipt_cache[k]
+                if to_delete:
+                    logger.debug(f"🧹 清理过期回执缓存: {len(to_delete)} 条")
+        
+        return receipt, tx_info
     
     def rpc_call(self, method: str, params: list):
         """发送 HTTP RPC 请求（使用长连接 + 慢调用监控）"""
@@ -1398,8 +1465,8 @@ class BSCWebSocketMonitor:
     async def _handle_swap_with_receipt_fallback(self, tx_hash: str, pair_address: str):
         """外盘receipt兜底：从交易回执中提取Swap事件"""
         try:
-            # 获取交易回执
-            receipt = self.rpc_call("eth_getTransactionReceipt", [tx_hash])
+            # 获取交易回执（使用缓存）
+            receipt, _ = self.get_receipt_cached(tx_hash)
             if not receipt:
                 logger.debug(f"⚠️ 获取receipt失败: {tx_hash}")
                 return
@@ -1433,7 +1500,8 @@ class BSCWebSocketMonitor:
         try:
             dbotx_api = self.get_thread_dbotx_api()
             
-            receipt = self.rpc_call("eth_getTransactionReceipt", [tx_hash])
+            # 获取交易回执（使用缓存）
+            receipt, tx_info = self.get_receipt_cached(tx_hash)
             if not receipt:
                 return
             
@@ -1476,8 +1544,7 @@ class BSCWebSocketMonitor:
             wbnb_in = sum(t["value"] for t in transfers 
                          if t["token"] == self.WBNB and t["to"] in self.FOURMEME_PROXY)
             
-            # 获取交易信息（BNB 买入）
-            tx_info = self.rpc_call("eth_getTransactionByHash", [tx_hash])
+            # 获取交易信息（BNB 买入，已从缓存获取）
             tx_value = 0
             if tx_info and tx_info.get("value"):
                 try:
@@ -1716,9 +1783,11 @@ class BSCWebSocketMonitor:
                 logger.info("💓 WebSocket 健康检查")
                 logger.info(f"   状态: {'🟢 运行中' if self.ws and not self.should_stop else '🔴 已停止'}")
                 logger.info(f"   重连次数: {self.reconnect_count}")
+                logger.info(f"   回补次数: {self.backfill_count} (冷却期: {self.backfill_cooldown}s)")
                 logger.info(f"   消息总数: {self.message_count}")
                 logger.info(f"   去重缓存: {len(self.seen_txs)} / {self.max_seen_txs} ({len(self.seen_txs) / self.max_seen_txs * 100:.1f}%)")
-                logger.info(f"   缓存命中: {self.cache_hit_count} 次（节省API调用）")
+                logger.info(f"   回执缓存: {len(self.receipt_cache)} 条 (命中 {self.receipt_cache_hits} 次, 节省RPC)")
+                logger.info(f"   非fourmeme缓存: {self.cache_hit_count} 次（节省API调用）")
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
                 logger.info("=" * 80)
@@ -1853,7 +1922,7 @@ class BSCWebSocketMonitor:
         else:
             logger.info(f"✅ WebSocket 重连成功！(第{self.reconnect_count}次)")
             # 重连后立即回补遗漏的交易
-            self.executor.submit(self._backfill_missed_logs)
+            self.executor.submit(self._backfill_missed_logs, f"重连#{self.reconnect_count}")
         
         self.reconnect_count += 1
         
@@ -1907,14 +1976,30 @@ class BSCWebSocketMonitor:
             logger.warning(f"⚠️  WebSocket 连接断开: {close_status_code} - {close_msg}")
             logger.info("🔄 将在5秒后自动重连...")
     
-    def _backfill_missed_logs(self):
-        """断线回补：使用eth_getLogs回补遗漏的交易"""
+    def _backfill_missed_logs(self, reason="重连"):
+        """
+        断线回补：使用eth_getLogs回补遗漏的交易（优化版）
+        
+        优化：
+        - 60秒冷却期，防止频繁触发
+        - 离线时间阈值（>30秒才回补）
+        - 缩小区块跨度（200块）
+        - 记录触发原因和统计
+        """
         try:
-
-            # 记录重连时间
-            self.reconnect_time = time.time()
+            now = time.time()
             
-            # 获取当前区块
+            # 1. 冷却期检查（60秒内不重复回补）
+            if now - self.last_backfill_time < self.backfill_cooldown:
+                elapsed = int(now - self.last_backfill_time)
+                logger.info(f"⏭️  回补冷却中 ({elapsed}s/{self.backfill_cooldown}s)，跳过本次回补（原因：{reason}）")
+                return
+            
+            # 记录回补时间和原因
+            self.last_backfill_time = now
+            self.reconnect_time = now
+            
+            # 2. 获取当前区块
             latest_block_hex = self.rpc_call("eth_blockNumber", [])
             if not latest_block_hex:
                 logger.warning("❌ 获取最新区块失败，跳过回补")
@@ -1922,17 +2007,33 @@ class BSCWebSocketMonitor:
             
             latest_block = int(latest_block_hex, 16)
             
-            # 如果是第一次连接，只回补最近100个区块
+            # 3. 计算回补区块范围
             if self.last_processed_block == 0:
-                from_block = max(latest_block - 100, 0)
+                # 首次连接，只回补最近50个区块（约15秒）
+                from_block = max(latest_block - 50, 0)
+                offline_seconds = "首次连接"
             else:
-                # 从上次处理的区块开始回补（最多回补1000个区块，约50秒）
-                from_block = max(self.last_processed_block, latest_block - 1000)
+                # 计算离线时间（按3秒/块估算）
+                missed_blocks = latest_block - self.last_processed_block
+                offline_seconds = missed_blocks * 3  # BSC 约3秒/块
+                
+                # 离线时间阈值：只在离线 > 30秒 才回补
+                if offline_seconds < 30:
+                    logger.info(f"⏭️  离线时间过短 ({offline_seconds:.0f}s < 30s)，跳过回补（原因：{reason}）")
+                    self.last_processed_block = latest_block
+                    return
+                
+                # 限制回补区块跨度（最多200块，约10分钟）
+                max_backfill_blocks = 200
+                from_block = max(self.last_processed_block, latest_block - max_backfill_blocks)
             
-            logger.info(f"🔄 开始回补遗漏交易: 区块 #{from_block} → #{latest_block} (共{latest_block - from_block}个)")
+            block_span = latest_block - from_block
+            self.backfill_count += 1
             
-            # 分批查询（每次1000个区块，BSC节点支持更大batch）
-            batch_size = 1000
+            logger.info(f"🔄 [回补 #{self.backfill_count}] 开始: #{from_block} → #{latest_block} ({block_span}块, 离线≈{offline_seconds}s, 原因:{reason})")
+            
+            # 4. 分批查询（缩小batch，降低单次请求压力）
+            batch_size = 200  # 从1000改为200
             total_logs = 0
             
             for start in range(from_block, latest_block + 1, batch_size):
@@ -1955,11 +2056,11 @@ class BSCWebSocketMonitor:
                         except Exception as e:
                             logger.debug(f"处理回补日志失败: {e}")
             
-            logger.info(f"✅ 回补完成: 共处理{total_logs}条日志")
+            logger.info(f"✅ [回补 #{self.backfill_count}] 完成: 共处理 {total_logs} 条日志")
             self.last_processed_block = latest_block
             
         except Exception as e:
-            logger.error(f"❌ 回补失败: {e}")
+            logger.error(f"❌ [回补 #{self.backfill_count}] 失败: {e}")
     
     async def _process_backfill_log(self, log):
         """处理回补的日志"""
