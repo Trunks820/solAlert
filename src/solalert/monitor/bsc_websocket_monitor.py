@@ -15,6 +15,8 @@ import traceback
 import urllib3
 import threading
 import os
+import time
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +28,8 @@ from ..core.redis_client import get_redis
 from ..core.config import TELEGRAM_CONFIG
 from .trigger_logic import TriggerLogic
 from ..notifiers.alert_recorder import get_alert_recorder
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # 可选依赖：eth_abi（用于 Multicall2）
 try:
@@ -143,14 +147,31 @@ class BSCWebSocketMonitor:
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="BSC-WS-Worker")
         self.thread_local = threading.local()
         
-        # 交易去重（使用OrderedDict自动维护顺序，LRU淘汰）
+        # 交易去重（使用 tx_hash:logIndex 组合键，支持多日志处理）
         self.seen_txs = OrderedDict()
-        self.max_seen_txs = 10000
+        self.max_seen_txs = 100000  # 增大容量以适应 (tx_hash, logIndex) 组合键
         
         # WBNB 价格缓存
         self.wbnb_price = 600.0
         self.wbnb_price_timestamp = 0
         self.price_cache_ttl = 300  # 5分钟
+        
+
+        
+        self.session = requests.Session()
+        # 配置连接池和重试策略
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(
+            pool_connections=10,  # 连接池大小
+            pool_maxsize=20,      # 最大连接数
+            max_retries=retry_strategy
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
         
         # RPC 调用计数
         self.rpc_id = 0
@@ -265,12 +286,20 @@ class BSCWebSocketMonitor:
         self.wbnb_price = await asyncio.to_thread(self.get_wbnb_price)
         logger.info(f"💰 WBNB 价格: ${self.wbnb_price:.2f}")
         
-        # 统计非fourmeme缓存大小
+        # 统计非fourmeme缓存大小并确保TTL
+        self.NON_FOURMEME_KEY = "bsc:non_fourmeme_tokens"
+        self.NON_FOURMEME_TTL = 30 * 24 * 3600  # 30天
+        
         if self.redis_client:
             try:
-                NON_FOURMEME_KEY = "bsc:non_fourmeme_tokens"
-                cache_size = self.redis_client.scard(NON_FOURMEME_KEY)
-                logger.info(f"📊 非fourmeme缓存: {cache_size} 个token (30天过期)")
+                cache_size = self.redis_client.scard(self.NON_FOURMEME_KEY)
+                # 确保缓存有过期时间（防止永久存储）
+                ttl = self.redis_client.client.ttl(self.NON_FOURMEME_KEY)
+                if ttl == -1:  # -1 表示没有过期时间
+                    self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
+                    logger.info(f"📊 非fourmeme缓存: {cache_size} 个token (已设置30天过期)")
+                else:
+                    logger.info(f"📊 非fourmeme缓存: {cache_size} 个token (剩余{ttl // 86400}天)")
             except Exception as e:
                 logger.debug(f"获取缓存统计失败: {e}")
     
@@ -281,17 +310,35 @@ class BSCWebSocketMonitor:
         return self.thread_local.dbotx_api
     
     def rpc_call(self, method: str, params: list):
-        """发送 HTTP RPC 请求"""
+        """发送 HTTP RPC 请求（使用长连接 + 慢调用监控）"""
         self.rpc_id += 1
+        start_time = time.time()
+        
         try:
-            resp = requests.post(
+            # 使用长连接（Session）
+            resp = self.session.post(
                 self.rpc_url,
                 json={"jsonrpc": "2.0", "id": self.rpc_id, "method": method, "params": params},
                 timeout=10
             )
-            return resp.json().get("result")
+            result = resp.json().get("result")
+            
+            # 慢调用监控（超过 1 秒）
+            latency = time.time() - start_time
+            if latency > 1.0:
+                logger.warning("RPC慢调用", extra={
+                    "method": method,
+                    "latency": f"{latency:.2f}s",
+                    "params_count": len(params)
+                })
+            
+            return result
         except Exception as e:
-            logger.debug(f"RPC 错误: {e}")
+            latency = time.time() - start_time
+            logger.debug(f"RPC 错误: {e}", extra={
+                "method": method,
+                "latency": f"{latency:.2f}s"
+            })
             return None
     
     def multicall2_try_aggregate(self, calls: list) -> list:
@@ -470,6 +517,19 @@ class BSCWebSocketMonitor:
                 results.append(None)
         return results
     
+    def _extract_pair_from_receipt(self, logs: list) -> str:
+        """从 receipt logs 中提取 PancakeV2 Pair 地址"""
+        try:
+            swap_topic = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+            for log in logs:
+                topics = log.get("topics", [])
+                if topics and topics[0] == swap_topic:
+                    # Swap 事件的地址就是 Pair 地址
+                    return log.get("address", "").lower()
+        except Exception as e:
+            logger.debug(f"提取 pair 失败: {e}")
+        return None
+    
     def get_wbnb_price(self) -> float:
         """动态获取 WBNB 价格（带缓存）"""
         now = time.time()
@@ -480,7 +540,8 @@ class BSCWebSocketMonitor:
             # 禁用 SSL 警告
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             
-            resp = requests.get(
+            # 使用长连接（Session）
+            resp = self.session.get(
                 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BNB_USDT',
                 timeout=5,
                 verify=False  # 禁用 SSL 证书验证
@@ -965,9 +1026,9 @@ class BSCWebSocketMonitor:
             )
             
             if result.get('success'):
-                print(f"✅ 已发送 Telegram 通知")
+                logger.info(f"✅ Telegram通知已发送 - {token_address[:10]}...")
             else:
-                print(f"❌ Telegram 发送失败: {result.get('error')}")
+                logger.error(f"❌ Telegram发送失败 - {token_address[:10]}...: {result.get('error')}")
         
         except Exception as e:
             logger.error(f"❌ 发送通知异常: {e}")
@@ -1013,7 +1074,7 @@ class BSCWebSocketMonitor:
             raw_data = await dbotx_api.get_pair_info('bsc', pair_address)
             
             if not raw_data:
-                print(f"⏭️  [第二层] 无 DBotX 数据: {token_address}...")
+                logger.debug("第二层过滤-无DBotX数据", extra={"token": token_address[:10]})
                 return None
             
             # 3. 判断内外盘
@@ -1192,16 +1253,17 @@ class BSCWebSocketMonitor:
         if not self.first_layer_filter(usd_value, is_internal=False):
             return
         
-        print(f"✅ [外盘] 通过第一层过滤: {base_symbol} (${usd_value:.2f})")
+        # 东八区时间
+        cn_time = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
+        logger.info(f"✅ [外盘] 通过第一层: {base_symbol} (${usd_value:.2f}) [{cn_time}] - {base_token[:10]}...")
         
         # 🚀 优化：先检查 Redis 缓存（非fourmeme token黑名单）
-        NON_FOURMEME_KEY = "bsc:non_fourmeme_tokens"
         if self.redis_client:
             try:
-                is_cached_non_fourmeme = self.redis_client.sismember(NON_FOURMEME_KEY, base_token)
+                is_cached_non_fourmeme = self.redis_client.sismember(self.NON_FOURMEME_KEY, base_token)
                 if is_cached_non_fourmeme:
                     self.cache_hit_count += 1
-                    print(f"⏭️  外盘非 fourmeme (缓存命中 #{self.cache_hit_count}): {base_symbol}：{base_token}")
+                    logger.debug(f"⏭️  外盘非fourmeme (缓存命中 #{self.cache_hit_count}): {base_symbol} - {base_token[:10]}...")
                     return
             except Exception as e:
                 logger.warning(f"⚠️  Redis缓存查询失败: {e}")
@@ -1212,14 +1274,15 @@ class BSCWebSocketMonitor:
             # 不是fourmeme → 加入Redis缓存（30天过期）
             if self.redis_client:
                 try:
-                    self.redis_client.client.sadd(NON_FOURMEME_KEY, base_token)
-                    self.redis_client.client.expire(NON_FOURMEME_KEY, 30 * 24 * 3600)  # 30天过期
+                    self.redis_client.client.sadd(self.NON_FOURMEME_KEY, base_token)
+                    # 每次添加时重置过期时间，保持30天滚动窗口
+                    self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
                 except Exception as e:
                     logger.warning(f"⚠️  Redis缓存写入失败: {e}")
-            print(f"⏭️  外盘非 fourmeme: {base_symbol}：{base_token}")
+            logger.debug(f"⏭️  外盘非fourmeme: {base_symbol} - {base_token[:10]}...")
             return
         
-        print(f"✓ 外盘是 fourmeme: {base_symbol}：{base_token}")
+        logger.info(f"✓ 外盘是fourmeme: {base_symbol} - {base_token[:10]}...")
         
         # 第二层过滤
         token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
@@ -1275,6 +1338,7 @@ class BSCWebSocketMonitor:
 💰 代币: {symbol}
 📝 名称: {symbol}
 🔗 合约: <code>{base_token}</code>
+🔗 交易哈希: <code>{tx_hash}</code>
 
 📊 <b>实时数据</b>
 💵 当前价格: {price_str}
@@ -1291,18 +1355,24 @@ class BSCWebSocketMonitor:
 ⏰ 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}
 """
         
-        print(f"\n{'='*80}")
-        print(f"{pool_emoji} 【{pool_type}】{quote_symbol} 买入 {symbol}")
-        print(f"付出: {quote_formatted} {quote_symbol} (≈${usd_value:.2f})")
-        print(f"得到: {base_formatted} {symbol}")
-        print(f"涨幅: {price_change:+.2f}% | 交易量: ${volume:,.0f} | 市值: ${market_cap:,.0f}")
-        print(f"税率: 买{buy_tax:.1f}% / 卖{sell_tax:.1f}%")
-        print(f"地址: {base_token}")
-        print(f"{'='*80}\n")
+        # 结构化日志输出（外盘）
+        logger.info("外盘交易触发", extra={
+            "pool_type": pool_type,
+            "symbol": symbol,
+            "token": base_token[:10],
+            "tx_hash": tx_hash[:10],
+            "quote_amount": f"{quote_formatted} {quote_symbol}",
+            "usd_value": f"${usd_value:.2f}",
+            "base_amount": f"{base_formatted} {symbol}",
+            "price_change": f"{price_change:+.2f}%",
+            "volume": f"${volume:,.0f}",
+            "market_cap": f"${market_cap:,.0f}",
+            "buy_tax": f"{buy_tax:.1f}%",
+            "sell_tax": f"{sell_tax:.1f}%"
+        })
         
         # 发送推送
         await self.send_alert(message, base_token)
-        print(f"✅ 已发送 Telegram 通知")
         
         # 记录到数据库并推送WebSocket
         await asyncio.to_thread(
@@ -1344,7 +1414,7 @@ class BSCWebSocketMonitor:
                 
                 # 匹配Swap事件
                 if topics and topics[0].lower() == swap_topic and log_addr == pair_address:
-                    logger.info(f"✅ Receipt兜底成功: {tx_hash[:10]}... (外盘)")
+                    logger.info(f"✅ Receipt兜底成功: {tx_hash} (外盘)")
                     # 递归调用原函数处理
                     await self.handle_swap_event(log)
                     return
@@ -1460,23 +1530,41 @@ class BSCWebSocketMonitor:
             else:
                 usd_value = float(quote_value)
             
+            # 🔍 调试日志：内盘 tx 详情
+            logger.info(f"🔍 内盘tx: hash={tx_hash}, proxy={proxy_type}, input_BNB={quote_amount / 10**quote_decimals:.4f}, usd={usd_value:.2f}, token={target_token}")
+            
             # 第一层过滤
             if not self.first_layer_filter(usd_value, is_internal=True):
-                print(f"⏭️  内盘金额不足: {target_symbol} (${usd_value:.2f})")
+                logger.debug(f"⏭️  内盘金额不足: {target_symbol} (${usd_value:.2f}) - {target_token[:10]}...")
                 return
             
-            print(f"✅ [内盘] 通过第一层过滤: {target_symbol} (${usd_value:.2f})")
+            # 东八区时间
+            cn_time = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
+            logger.info(f"✅ [内盘] 通过第一层: {target_symbol} (${usd_value:.2f}) [{cn_time}]")
             
             # 获取 launchpad 信息
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
             if not launchpad_info:
-                print(f"⏭️  内盘无 Launchpad 信息: {target_symbol}")
-                return
+                logger.warning(f"⚠️ API miss: hash={tx_hash}, token={target_token} - 使用 fallback")
+                # Fallback：构造基础 launchpad_info
+                launchpad_info = {
+                    'launchpad': 'fourmeme',
+                    'pair_address': None  # 稍后尝试从 receipt 提取
+                }
             
             pair_address = launchpad_info.get('pair_address')
             if not pair_address:
-                print(f"⏭️  内盘无交易对地址: {target_symbol}")
-                return
+                # 尝试从 receipt 的 logs 中提取 PancakeV2 Pair 地址
+                pair_address = self._extract_pair_from_receipt(logs)
+                if pair_address:
+                    logger.info(f"✅ 从 receipt 提取到 pair: {pair_address}")
+                    launchpad_info['pair_address'] = pair_address
+                else:
+                    logger.debug("内盘无交易对地址", extra={
+                        "token": target_token[:10],
+                        "symbol": target_symbol
+                    })
+                    return
             
             # 第二层过滤
             token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True)
@@ -1542,6 +1630,7 @@ class BSCWebSocketMonitor:
 💰 代币: {symbol}
 📝 名称: {symbol}
 🔗 合约: <code>{target_token}</code>
+🔗 交易哈希: <code>{tx_hash}</code>
 
 📊 <b>实时数据</b>
 💵 当前价格: {price_str}
@@ -1558,18 +1647,25 @@ class BSCWebSocketMonitor:
 ⏰ 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}
 """
             
-            print(f"\n{'='*80}")
-            print(f"{pool_emoji} 【{pool_type} - {proxy_type}】{quote_symbol} 买入 {symbol}")
-            print(f"付出: {quote_formatted} {quote_symbol} (≈${usd_value:.2f})")
-            print(f"得到: {target_formatted} {symbol}")
-            print(f"涨幅: {price_change:+.2f}% | 交易量: ${volume:,.0f} | 市值: ${market_cap:,.0f}")
-            print(f"税率: 买{buy_tax:.1f}% / 卖{sell_tax:.1f}%")
-            print(f"地址: {target_token}")
-            print(f"{'='*80}\n")
+            # 结构化日志输出（内盘）
+            logger.info("内盘交易触发", extra={
+                "pool_type": pool_type,
+                "proxy_type": proxy_type,
+                "symbol": symbol,
+                "token": target_token[:10],
+                "tx_hash": tx_hash[:10],
+                "quote_amount": f"{quote_formatted} {quote_symbol}",
+                "usd_value": f"${usd_value:.2f}",
+                "target_amount": f"{target_formatted} {symbol}",
+                "price_change": f"{price_change:+.2f}%",
+                "volume": f"${volume:,.0f}",
+                "market_cap": f"${market_cap:,.0f}",
+                "buy_tax": f"{buy_tax:.1f}%",
+                "sell_tax": f"{sell_tax:.1f}%"
+            })
             
             # 发送推送
             await self.send_alert(message, target_token)
-            print(f"✅ 已发送 Telegram 通知")
             
             # 记录到数据库并推送WebSocket
             await asyncio.to_thread(
@@ -1607,11 +1703,21 @@ class BSCWebSocketMonitor:
                 now = time.time()
                 idle_seconds = int(now - self.last_message_time)
                 
+                # 去重缓存定期清理（超过 80% 容量时清理最老的 20%）
+                seen_txs_size = len(self.seen_txs)
+                if seen_txs_size > self.max_seen_txs * 0.8:
+                    cleanup_count = int(self.max_seen_txs * 0.2)
+                    for _ in range(cleanup_count):
+                        if self.seen_txs:
+                            self.seen_txs.popitem(last=False)  # 弹出最老的
+                    logger.info(f"🧹 去重缓存清理: 移除 {cleanup_count} 条旧记录 ({seen_txs_size} → {len(self.seen_txs)})")
+                
                 logger.info("=" * 80)
                 logger.info("💓 WebSocket 健康检查")
                 logger.info(f"   状态: {'🟢 运行中' if self.ws and not self.should_stop else '🔴 已停止'}")
                 logger.info(f"   重连次数: {self.reconnect_count}")
                 logger.info(f"   消息总数: {self.message_count}")
+                logger.info(f"   去重缓存: {len(self.seen_txs)} / {self.max_seen_txs} ({len(self.seen_txs) / self.max_seen_txs * 100:.1f}%)")
                 logger.info(f"   缓存命中: {self.cache_hit_count} 次（节省API调用）")
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
@@ -1656,17 +1762,31 @@ class BSCWebSocketMonitor:
             if not isinstance(result, dict):
                 return
             
-            # 去重（OrderedDict自动LRU）
+            # 去重（使用 tx_hash:logIndex 组合键，支持同一交易的多个日志）
             tx_hash = result.get("transactionHash")
-            if tx_hash:
-                if tx_hash in self.seen_txs:
-                    return
-                
-                self.seen_txs[tx_hash] = True
-                
-                # LRU淘汰最老的交易（FIFO）
-                if len(self.seen_txs) > self.max_seen_txs:
-                    self.seen_txs.popitem(last=False)  # 弹出最早的
+            if not tx_hash:
+                # transactionHash 可能为 None（订阅确认、部分节点 bug）
+                return
+            
+            # logIndex 是十六进制字符串，转为整数避免格式差异（0x1 vs 0x01）
+            log_index_hex = result.get("logIndex", "0x0")
+            try:
+                log_index = int(log_index_hex, 16) if isinstance(log_index_hex, str) else int(log_index_hex or 0)
+            except (ValueError, TypeError):
+                log_index = 0
+            
+            # 组合键：tx_hash:logIndex
+            key = f"{tx_hash}:{log_index}"
+            if key in self.seen_txs:
+                logger.debug(f"⏭️  去重跳过: {tx_hash[:10]}...#{log_index}")
+                return
+            
+            self.seen_txs[key] = True
+            logger.debug(f"✅ 处理日志: {tx_hash[:10]}...#{log_index} (缓存大小: {len(self.seen_txs)})")
+            
+            # LRU淘汰最老的日志（FIFO）
+            if len(self.seen_txs) > self.max_seen_txs:
+                self.seen_txs.popitem(last=False)  # 弹出最早的
             
             # 更新最后处理的区块号（用于断线回补）
             block_number = result.get("blockNumber")
@@ -1720,13 +1840,8 @@ class BSCWebSocketMonitor:
             logger.error(f"❌ 处理消息出错: {e}")
     
     def _run_async_in_thread(self, async_func, *args, **kwargs):
-        """在线程池中运行异步函数（正确的异步调用方式）"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(async_func(*args, **kwargs))
-        finally:
-            loop.close()
+        """在线程池中运行异步函数（使用 asyncio.run 简化事件循环管理）"""
+        asyncio.run(async_func(*args, **kwargs))
     
     def on_open(self, ws):
         """WebSocket 连接成功回调"""
@@ -1795,8 +1910,7 @@ class BSCWebSocketMonitor:
     def _backfill_missed_logs(self):
         """断线回补：使用eth_getLogs回补遗漏的交易"""
         try:
-            import time
-            
+
             # 记录重连时间
             self.reconnect_time = time.time()
             
@@ -1871,6 +1985,14 @@ class BSCWebSocketMonitor:
         
         if self.ws:
             self.ws.close()
+        
+        # 关闭 HTTP Session
+        if hasattr(self, 'session'):
+            try:
+                self.session.close()
+                logger.info("✅ HTTP Session 已关闭")
+            except Exception as e:
+                logger.debug(f"关闭 Session 异常: {e}")
         
         self.executor.shutdown(wait=False)
         
@@ -1950,5 +2072,14 @@ class BSCWebSocketMonitor:
             self.should_stop = True
             if self.ws:
                 self.ws.close()
+            
+            # 关闭 HTTP Session
+            if hasattr(self, 'session'):
+                try:
+                    self.session.close()
+                    logger.info("✅ HTTP Session 已关闭")
+                except Exception as e:
+                    logger.debug(f"关闭 Session 异常: {e}")
+            
             self.executor.shutdown(wait=False)
 
