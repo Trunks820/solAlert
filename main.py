@@ -271,7 +271,7 @@ async def run_all_services():
         pump_listener.start(),
         bonk_collector.start(),
         # fourmeme_listener.start(),  # 已停用
-        token_monitor.run_monitor_schedule(interval_minutes=1),  # 1分钟间隔监控
+        token_monitor.run_monitor_schedule(interval_minutes=0.5),  # 30秒间隔监控
         bsc_monitor.start(),  # BSC WebSocket 监控
     ]
     
@@ -348,8 +348,8 @@ def main():
             interval = args.interval if args.interval != 60 else 600
             run_twitter_push_sync(interval, once=args.once)
         elif args.module == "token_monitor":
-            # Token监控任务，默认1分钟间隔
-            interval = args.interval if args.interval != 60 else 1
+            # Token监控任务，默认30秒间隔
+            interval = args.interval / 60 if args.interval != 60 else 0.5  # 转换为分钟
             asyncio.run(run_token_monitor(interval, once=args.once))
         elif args.module == "bsc_monitor":
             # BSC WebSocket 监控任务（实时监听链上事件）

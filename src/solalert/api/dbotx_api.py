@@ -20,11 +20,16 @@ class DBotXAPI:
         self.api_key = api_key
         
         # 创建异步 HTTP 客户端
+        # 添加 User-Agent 模拟浏览器请求（某些API会检测）
+        default_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
         self.client = httpx.AsyncClient(
             verify=False,  # 禁用 SSL 验证
             timeout=httpx.Timeout(10.0, connect=5.0),  # 总超时10秒，连接超时5秒
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-            follow_redirects=True
+            follow_redirects=True,
+            headers=default_headers
         )
         
         # 禁用 SSL 警告
@@ -74,24 +79,28 @@ class DBotXAPI:
                                 pool_type = largest_pair.get('poolType', '')
                                 currency_reserve = largest_pair.get('currencyReserve', 0)
                                 
-                                logger.debug(
+                                # 提取链名称（API返回的是真实链名，如 'solana', 'bsc'）
+                                chain_name = largest_pair.get('chain', '')
+                                
+                                logger.info(
                                     f"✅ 找到最大交易对: {pair_id[:10]}... "
-                                    f"(24h: ${volume_24h:,.0f}, 池: {pool_type}, 储备: {currency_reserve:.2f})"
+                                    f"(链: {chain_name}, 24h: ${volume_24h:,.0f}, 池: {pool_type}, 储备: {currency_reserve:.2f})"
                                 )
                                 
                                 # 返回完整信息（用于判断内外盘）
                                 return {
                                     'pair_address': pair_id,
+                                    'chain': chain_name,  # 添加链名称字段
                                     'pool_type': pool_type,
                                     'currency_reserve': currency_reserve or 0,
                                     'is_launch_migration': largest_pair.get('isLaunchMigration', False),
                                     'volume_24h': volume_24h
                                 }
                             else:
-                                logger.debug(f"⚠️  未找到交易对")
+                                logger.warning(f"⚠️  Token {token_address[:10]}... 搜索结果为空，未找到交易对")
                                 return None
                         else:
-                            logger.debug(f"⚠️  Search API 返回错误: {data}")
+                            logger.warning(f"⚠️  Search API 返回错误: {data}")
                             return None
                     
                     elif response.status_code in [429, 500, 502, 503, 504]:
@@ -141,7 +150,7 @@ class DBotXAPI:
             
             params = {
                 'chain': chain.lower(),
-                'pair': pair_address.lower()
+                'pair': pair_address  # 保持原始大小写（Solana地址区分大小写）
             }
             
             headers = {
@@ -157,10 +166,10 @@ class DBotXAPI:
                         data = response.json()
                         
                         if data.get('err') is False and data.get('res'):
-                            logger.debug(f"✅ DBotX API 成功: {pair_address[:10]}...")
+                            logger.info(f"✅ DBotX API 成功获取 pair_info: {pair_address[:10]}...")
                             return data['res']
                         else:
-                            logger.debug(f"⚠️  DBotX API 返回错误: {data}")
+                            logger.warning(f"⚠️  DBotX API 返回错误: pair={pair_address[:10]}... data={data}")
                             return None
                     
                     elif response.status_code in [429, 500, 502, 503, 504]:

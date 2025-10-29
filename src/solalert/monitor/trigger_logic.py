@@ -54,7 +54,8 @@ class TriggerLogic:
         fall_threshold = config.get("fallPercent")
         
         # 判断上涨
-        if rise_threshold is not None and price_change >= rise_threshold:
+        # 注意：rise_threshold 为 0 或 None 时不监控上涨
+        if rise_threshold is not None and rise_threshold > 0 and price_change >= rise_threshold:
             event = TriggerEvent(
                 event_type="价格上涨",
                 value=price_change,
@@ -64,7 +65,8 @@ class TriggerLogic:
             return True, event
         
         # 判断下跌
-        if fall_threshold is not None and price_change <= -fall_threshold:
+        # 注意：fall_threshold 为 0 或 None 时不监控下跌
+        if fall_threshold is not None and fall_threshold > 0 and price_change <= -fall_threshold:
             event = TriggerEvent(
                 event_type="价格下跌",
                 value=price_change,
@@ -98,7 +100,8 @@ class TriggerLogic:
         decrease_threshold = config.get("decreasePercent")
         
         # 判断增加
-        if increase_threshold is not None and holder_change >= increase_threshold:
+        # 注意：increase_threshold 为 0 或 None 时不监控增加
+        if increase_threshold is not None and increase_threshold > 0 and holder_change >= increase_threshold:
             event = TriggerEvent(
                 event_type="持币人数增加",
                 value=holder_change,
@@ -108,7 +111,8 @@ class TriggerLogic:
             return True, event
         
         # 判断减少
-        if decrease_threshold is not None and holder_change <= -decrease_threshold:
+        # 注意：decrease_threshold 为 0 或 None 时不监控减少
+        if decrease_threshold is not None and decrease_threshold > 0 and holder_change <= -decrease_threshold:
             event = TriggerEvent(
                 event_type="持币人数减少",
                 value=holder_change,
@@ -137,48 +141,23 @@ class TriggerLogic:
         if not config.get("enabled"):
             return False, None
         
-        # 优先使用 threshold（绝对值，单位 USDT）
+        # 只使用 threshold（绝对值，单位 USDT）
         volume_threshold = config.get("threshold")
         
-        if volume_threshold is not None:
-            # 获取当前交易量（优先使用 volume_1m，其次 volume，兼容不同数据源）
-            current_volume = stats.get("volume_1m", 0) or stats.get("volume", 0)
-            
-            # 判断是否达到阈值
-            if current_volume >= volume_threshold:
-                # 根据数据源判断时间窗口
-                time_window = "1分钟" if stats.get("volume_1m") else "5分钟"
-                
-                event = TriggerEvent(
-                    event_type="交易量达标",
-                    value=current_volume,
-                    threshold=volume_threshold,
-                    description=f"💰 {time_window}交易量 ${current_volume:,.0f} (阈值: ≥${volume_threshold:,.0f})"
-                )
-                return True, event
+        if volume_threshold is None or volume_threshold <= 0:
+            # 没有配置有效阈值，不触发
+            return False, None
         
-        # 兼容旧版：如果没有 threshold，则用涨跌幅判断（保留原逻辑）
-        volume_change = stats.get("volumeChange", 0)
-        increase_threshold = config.get("increasePercent")
-        decrease_threshold = config.get("decreasePercent")
+        # 获取当前交易量（优先使用 volume_5m，其次 volume）
+        current_volume = stats.get("volume_5m", 0) or stats.get("volume", 0)
         
-        # 判断增加
-        if increase_threshold is not None and volume_change >= increase_threshold:
+        # 判断是否达到阈值
+        if current_volume >= volume_threshold:
             event = TriggerEvent(
-                event_type="交易量增加",
-                value=volume_change,
-                threshold=increase_threshold,
-                description=f"💰 交易量 +{volume_change:.2f}% (阈值: ≥{increase_threshold}%)"
-            )
-            return True, event
-        
-        # 判断减少
-        if decrease_threshold is not None and volume_change <= -decrease_threshold:
-            event = TriggerEvent(
-                event_type="交易量减少",
-                value=volume_change,
-                threshold=-decrease_threshold,
-                description=f"💰 交易量 {volume_change:.2f}% (阈值: ≤-{decrease_threshold}%)"
+                event_type="交易量达标",
+                value=current_volume,
+                threshold=volume_threshold,
+                description=f"💰 5分钟交易量 ${current_volume:,.0f} (阈值: ≥${volume_threshold:,.0f})"
             )
             return True, event
         

@@ -130,6 +130,7 @@ class TokenMonitorEngine:
             
             # 构造 stats5m 格式（字段名需要与 TriggerLogic 保持一致）
             stats5m = {
+                'chain': 'solana',  # 添加链标识
                 'price': dbotx_data.get('price', 0),
                 'price_5m_change_percent': price_5m_change,
                 'price_1h_change_percent': price_1h_change,
@@ -410,10 +411,12 @@ class TokenMonitorEngine:
             price = float(stats.get('price', 0))
             price_5m_change = float(stats.get('price_5m_change_percent', 0))
             price_1h_change = float(stats.get('price_1h_change_percent', 0))
+            volume_5m = float(stats.get('volume_5m', 0))
+            volume_1h = float(stats.get('volume_1h', 0))
             
             logger.info(f"   💰 当前价格: ${price:.8f}")
             logger.info(f"   📈 价格变化: 5分钟 {price_5m_change:+.2f}% | 1小时 {price_1h_change:+.2f}%")
-            # 交易量和持有人的详细变化已经在 convert_dbotx_to_stats5m 中打印了
+            logger.info(f"   💸 交易量: 5分钟 ${volume_5m:,.0f} | 1小时 ${volume_1h:,.0f}")
         except Exception as e:
             logger.debug(f"   ⚠️  打印实时数据失败: {e}")
         
@@ -555,45 +558,67 @@ class TokenMonitorEngine:
             """查询单个 token 的数据"""
             try:
                 # 1. 搜索 pair
+                logger.info(f"🔍 [{chain.upper()}] 查询 Token: {ca[:10]}... - 搜索交易对")
                 pair_info = await self.dbotx_api.search_pairs(ca)
                 if not pair_info:
-                    logger.debug(f"⚠️  {chain.upper()} Token {ca[:10]}... 未找到交易对")
+                    logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 未找到交易对")
                     return None
                 
                 # 2. 获取详细数据
                 pair_address = pair_info.get('pair_address')
-                raw_data = await self.dbotx_api.get_pair_info(chain, pair_address)
+                # 从 search_pairs 返回的数据中获取真实的链名称
+                # 因为 SOL Token 可能在多条链上（如 BSC 上的 Wrapped SOL）
+                actual_chain = pair_info.get('chain', chain)  # 优先使用 API 返回的链，回退到传入的 chain
+                logger.info(f"✓ [{chain.upper()}] Token {ca[:10]}... - 找到交易对: {pair_address[:10]}... (链: {actual_chain})")
+                
+                raw_data = await self.dbotx_api.get_pair_info(actual_chain, pair_address)
                 if not raw_data:
-                    logger.debug(f"⚠️  {chain.upper()} Token {ca[:10]}... 获取详情失败")
+                    logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 获取交易对详情失败")
                     return None
                 
                 # 3. 解析数据
                 parsed_data = self.dbotx_api.parse_token_data(raw_data)
                 if not parsed_data:
-                    logger.debug(f"⚠️  {chain.upper()} Token {ca[:10]}... 解析数据失败")
+                    logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 解析数据失败")
                     return None
+                
+                logger.info(f"✓ [{chain.upper()}] Token {ca[:10]}... - 解析成功: {parsed_data['symbol']}")
                 
                 # 4. 转换为 stats5m 格式
                 stats5m = await self.convert_dbotx_to_stats5m(parsed_data, ca)
                 if not stats5m:
+                    logger.warning(f"⚠️  [{chain.upper()}] Token {ca[:10]}... - 转换 stats5m 格式失败")
                     return None
                 
+                logger.info(f"✅ [{chain.upper()}] Token {ca[:10]}... - 数据获取完成")
                 return (ca, {
                     'address': ca,
                     'symbol': parsed_data['symbol'],
                     'name': parsed_data['name'],
                     'stats5m': stats5m,
-                    'source': 'dbotx'
+                    'source': 'dbotx',
+                    # 添加用于Telegram消息显示的字段
+                    'price': parsed_data.get('price', 0),
+                    'marketCap': parsed_data.get('market_cap', 0),
+                    'holders': parsed_data.get('holder_count', 0),
+                    'liquidity': parsed_data.get('liquidity', 0),
+                    'volume_24h': parsed_data.get('volume_24h', 0),
+                    'price_24h': parsed_data.get('price_24h', 0),
                 })
             except Exception as e:
-                logger.debug(f"⚠️  查询 {ca[:10]}... 失败: {e}")
+                logger.warning(f"❌ [{chain.upper()}] 查询 {ca[:10]}... 失败: {e}")
                 return None
         
-        # 1. 获取 Solana 链数据（并发查询）
+        # 1. 获取 Solana 链数据（串行查询，避免API限流）
         if sol_tokens:
             logger.info(f"🔍 使用 DBotX API 查询 {len(sol_tokens)} 个 Solana Token...")
-            tasks = [fetch_single_token(ca, 'sol') for ca in sol_tokens]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            results = []
+            for ca in sol_tokens:
+                result = await fetch_single_token(ca, 'solana')  # 注意：DBotX API 使用 'solana'，不是 'sol'
+                results.append(result)
+                # 添加小延迟，避免触发API限流（经验值：每个请求间隔200ms）
+                if len(sol_tokens) > 1:
+                    await asyncio.sleep(0.2)
             
             for result in results:
                 if result and not isinstance(result, Exception):
@@ -605,7 +630,7 @@ class TokenMonitorEngine:
         # 2. 获取 BSC 链数据（并发查询）
         if bsc_tokens:
             logger.info(f"🔍 使用 DBotX API 查询 {len(bsc_tokens)} 个 BSC Token...")
-            tasks = [fetch_single_token(ca, 'bsc') for ca in bsc_tokens]
+            tasks = [fetch_single_token(ca, 'bsc') for ca in bsc_tokens]  # BSC 链名称正确
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             for result in results:
