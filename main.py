@@ -195,8 +195,9 @@ async def run_bsc_monitor():
     logging.getLogger('telegram').setLevel(logging.WARNING)
     
     # WebSocket 和 RPC 配置（Chainstack）
-    WS_URL = "wss://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
-    RPC_URL = "https://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    # NodeReal 端点（BSC官方合作伙伴）
+    WS_URL = "wss://bsc-mainnet.nodereal.io/ws/v1/eabfba52010f4271ad675f5dab4295a8"
+    RPC_URL = "https://bsc-mainnet.nodereal.io/v1/eabfba52010f4271ad675f5dab4295a8"
     
     try:
         # 创建监控器
@@ -250,8 +251,9 @@ async def run_all_services():
     token_monitor = TokenMonitorEngine()
     
     # 初始化 BSC WebSocket 监控
-    WS_URL = "wss://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
-    RPC_URL = "https://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    # NodeReal 端点（BSC官方合作伙伴）
+    WS_URL = "wss://bsc-mainnet.nodereal.io/ws/v1/eabfba52010f4271ad675f5dab4295a8"
+    RPC_URL = "https://bsc-mainnet.nodereal.io/v1/eabfba52010f4271ad675f5dab4295a8"
     
     bsc_monitor = BSCWebSocketMonitor(
         ws_url=WS_URL,

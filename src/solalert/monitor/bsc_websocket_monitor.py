@@ -190,11 +190,11 @@ class BSCWebSocketMonitor:
         self.thread_local = threading.local()
         
         # 令牌桶限流器（全局流量控制，防止瞬时峰值）
-        # 令牌桶限流（冷启动，避免突发）
-        # rate=100: 中等速率，留150 req/s安全边界（vs 250 RPS节点限制）
-        # capacity=20: 严格限制突发流量，最多20次瞬时请求（降低峰值）
+        # OPTIMIZED: 提高速率和容量，适配NodeReal高延迟（避免不必要的等待）
+        # rate=300: 高速率应对NodeReal慢响应（200-500ms latency需要更多并发）
+        # capacity=100: 允许突发流量（Swap事件密集时不阻塞）
         # 初始tokens=0: 从空桶开始，逐步蓄积，抹平启动时的峰值
-        self.token_bucket = TokenBucket(rate=100.0, capacity=20)
+        self.token_bucket = TokenBucket(rate=200.0, capacity=50)
         
         # 交易去重（使用 tx_hash:logIndex 组合键，支持多日志处理）
         self.seen_txs = OrderedDict()
@@ -246,8 +246,9 @@ class BSCWebSocketMonitor:
         
         # 回执缓存（减少 eth_getTransactionReceipt 重复调用，带并发保护）
         self.receipt_cache = {}  # {tx_hash: {"receipt": {}, "tx_info": {}, "cached_at": timestamp, "status": "ready|loading|failed", "event": threading.Event()}}
-        self.receipt_cache_ttl = 1800  # 30分钟过期（交易回执不变，长时间缓存安全）
-        self.receipt_cache_failed_ttl = 120  # 失败结果缓存2分钟（避免429后立即重试）
+        # OPTIMIZED: TTL延长到1小时，提高缓存命中率（交易回执永不变）
+        self.receipt_cache_ttl = 3600  # 1小时过期（从30分钟提升）
+        self.receipt_cache_failed_ttl = 300  # 失败结果缓存5分钟（从2分钟提升，避免NodeReal慢节点重试）
         self.receipt_cache_hits = 0  # 命中计数
         self.receipt_cache_misses = 0  # 未命中计数
         self.receipt_cache_concurrent_waits = 0  # 并发等待计数
@@ -456,16 +457,16 @@ class BSCWebSocketMonitor:
         
         # === 阶段2: 如果需要等待其他线程 ===
         if event_to_wait:
-            # 等待最多10秒（防止死锁），记录耗时
+            # OPTIMIZED: 等待5秒适配NodeReal高延迟
             wait_start = time.time()
-            wait_result = event_to_wait.wait(timeout=10)
+            wait_result = event_to_wait.wait(timeout=5)
             wait_elapsed = time.time() - wait_start
             
             # 统计等待耗时
             self.receipt_cache_wait_time_total += wait_elapsed
             
             # 检查是否超时
-            if not wait_result or wait_elapsed >= 9.5:  # 接近10秒视为超时
+            if not wait_result or wait_elapsed >= 5.5:  # 接近6秒视为超时
                 self.receipt_cache_wait_timeouts += 1
                 logger.warning(
                     f"⚠️ 并发等待超时: {tx_hash[:10]}... (耗时{wait_elapsed:.2f}s, "
@@ -2450,9 +2451,10 @@ class BSCWebSocketMonitor:
                         on_close=self.on_close
                     )
                     
+                    # OPTIMIZED: 减少心跳间隔，提高WS稳定性（NodeReal延迟高）
                     self.ws.run_forever(
-                        ping_interval=20,    # 每20秒发送ping
-                        ping_timeout=10,     # ping超时10秒
+                        ping_interval=10,    # 每10秒发送ping（降低重连风险）
+                        ping_timeout=5,      # ping超时5秒（快速检测断线）
                         skip_utf8_validation=True
                     )
                     
