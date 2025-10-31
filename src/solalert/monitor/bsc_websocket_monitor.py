@@ -1378,26 +1378,48 @@ class BSCWebSocketMonitor:
         except Exception as e:
             logger.error(f"❌ 发送通知异常: {e}")
     
-    async def check_external_is_fourmeme(self, token_address: str) -> Optional[Dict]:
-        """检查外盘代币是否来自 fourmeme 平台"""
+    async def check_external_is_fourmeme(self, token_address: str) -> tuple[bool, bool, Optional[Dict]]:
+        """
+        检查外盘代币是否来自 fourmeme 平台
+        
+        Returns:
+            (is_fourmeme, is_confirmed, launchpad_info):
+            - is_fourmeme: 是否是fourmeme
+            - is_confirmed: 是否确认结果（False表示API失败，结果不确定）
+            - launchpad_info: 详细信息（仅当is_fourmeme=True时有值）
+            
+        示例:
+            (True, True, {...})   - 确认是fourmeme
+            (False, True, None)   - 确认不是fourmeme（可以加黑名单）
+            (False, False, None)  - API失败，未知（不应加黑名单）
+        """
         dbotx_api = self.get_thread_dbotx_api()
         
         try:
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', token_address)
             
             if not launchpad_info:
-                return None
+                # API失败或无数据，结果不确定
+                # 这可能是：1) API故障  2) 网络问题  3) token太新还没数据
+                # 为安全起见，不确认结果
+                return (False, False, None)
             
             launchpad = launchpad_info.get('launchpad', '').lower()
             
-            if launchpad != 'fourmeme':
-                return None
-            
-            return launchpad_info
+            if launchpad == 'fourmeme':
+                # 确认是fourmeme
+                return (True, True, launchpad_info)
+            elif launchpad:
+                # 有明确的launchpad信息（如pancake_v2），确认不是fourmeme
+                return (False, True, None)
+            else:
+                # launchpad为空，可能是数据不完整，不确认
+                return (False, False, None)
         
         except Exception as e:
             logger.error(f"❌ 检查 Launchpad 失败: {e}")
-            return None
+            # API异常，结果不确定
+            return (False, False, None)
     
     async def second_layer_filter(
         self,
@@ -1614,17 +1636,23 @@ class BSCWebSocketMonitor:
                 logger.warning(f"⚠️  Redis缓存查询失败: {e}")
         
         # fourmeme 验证（未命中缓存才调用API）
-        launchpad_info = await self.check_external_is_fourmeme(base_token)
-        if not launchpad_info:
-            # 不是fourmeme → 加入Redis缓存（30天过期）
-            if self.redis_client:
-                try:
-                    self.redis_client.client.sadd(self.NON_FOURMEME_KEY, base_token)
-                    # 每次添加时重置过期时间，保持30天滚动窗口
-                    self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
-                except Exception as e:
-                    logger.warning(f"⚠️  Redis缓存写入失败: {e}")
-            logger.debug(f"⏭️  外盘非fourmeme: {base_symbol} - {base_token[:10]}...")
+        is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
+        
+        if not is_fourmeme:
+            if is_confirmed:
+                # 确认不是fourmeme → 加入Redis黑名单（30天过期）
+                if self.redis_client:
+                    try:
+                        self.redis_client.client.sadd(self.NON_FOURMEME_KEY, base_token)
+                        # 每次添加时重置过期时间，保持30天滚动窗口
+                        self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
+                        logger.debug(f"✅ 已加入黑名单: {base_symbol} - {base_token[:10]}...")
+                    except Exception as e:
+                        logger.warning(f"⚠️  Redis缓存写入失败: {e}")
+                logger.debug(f"⏭️  外盘非fourmeme: {base_symbol} - {base_token[:10]}...")
+            else:
+                # API失败，结果不确定 → 不加黑名单，下次继续检查
+                logger.debug(f"⚠️  外盘fourmeme检查失败（API故障），跳过但不加黑名单: {base_symbol} - {base_token[:10]}...")
             return
         
         logger.info(f"✓ 外盘是fourmeme: {base_symbol} - {base_token[:10]}...")
