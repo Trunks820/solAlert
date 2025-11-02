@@ -26,7 +26,7 @@ class DBotXAPI:
         }
         self.client = httpx.AsyncClient(
             verify=False,  # 禁用 SSL 验证
-            timeout=httpx.Timeout(10.0, connect=5.0),  # 总超时10秒，连接超时5秒
+            timeout=httpx.Timeout(30.0, connect=10.0, read=20.0),  # 总超时30秒，连接10秒，读取20秒
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             follow_redirects=True,
             headers=default_headers
@@ -116,10 +116,11 @@ class DBotXAPI:
                 
                 except httpx.TimeoutException:
                     if attempt < 2:
-                        logger.debug(f"⏱️ Search API 超时，重试 {attempt + 1}/3")
-                        await asyncio.sleep(1)
+                        retry_delay = 2 ** attempt  # 指数退避：1s, 2s, 4s
+                        logger.debug(f"⏱️ Search API 超时，{retry_delay}秒后重试 {attempt + 1}/3")
+                        await asyncio.sleep(retry_delay)
                         continue
-                    logger.warning(f"⚠️  Search API 超时（已重试3次）")
+                    logger.warning(f"⚠️  Search API 超时（已重试3次）: {token_address[:10]}...")
                     return None
                 except Exception as e:
                     if attempt < 2:
@@ -184,10 +185,11 @@ class DBotXAPI:
                 
                 except httpx.TimeoutException:
                     if attempt < 2:
-                        logger.debug(f"⏱️ DBotX API 超时，重试 {attempt + 1}/3")
-                        await asyncio.sleep(1)
+                        retry_delay = 2 ** attempt  # 指数退避：1s, 2s, 4s
+                        logger.debug(f"⏱️ DBotX API 超时，{retry_delay}秒后重试 {attempt + 1}/3")
+                        await asyncio.sleep(retry_delay)
                         continue
-                    logger.warning(f"⚠️  DBotX API 超时（已重试3次）")
+                    logger.warning(f"⚠️  DBotX API 超时（已重试3次）: pair={pair_address[:10]}...")
                     return None
                 except Exception as e:
                     if attempt < 2:

@@ -1,8 +1,8 @@
 # SOL Token WebSocket 监控系统 - 技术方案（方案B）
 
-> 版本：v1.2  
-> 日期：2025-10-31  
-> 状态：开发中 - 数据已初始化完成
+> 版本：v1.4  
+> 日期：2025-11-02  
+> 状态：✅ 开发完成 - 生产环境运行中
 
 ---
 
@@ -1053,23 +1053,298 @@ curl -X POST http://localhost:8080/reload
 
 ---
 
-## 后续优化
+## 技术决策与优化
 
-### 第一阶段（当前）
-- ✅ 基础订阅功能
-- ✅ 告警推送
-- ✅ 持久化管理
-- ✅ 监控日志
+### 核心决策
 
-### 第二阶段
+#### 1. 订阅策略
+**决策**：单连接订阅所有20个批次
+- 统一使用 `pairsInfoInterval: "1m"`
+- 单个WebSocket连接，发送20次subscribe请求
+- 每次订阅最多99个pair（符合API限制）
+- 批次间延迟0.5秒避免请求过快
+
+**理由**：
+- DBotX支持单连接多次订阅
+- 管理简单，减少连接维护成本
+- 避免多连接的负载均衡复杂度
+
+#### 2. 数据匹配策略
+**决策**：统一订阅1m间隔，根据配置动态选择时间窗口字段
+
+**核心逻辑**：
+- WebSocket订阅统一使用 `pairsInfoInterval: "1m"`
+- DBotX返回所有时间窗口的数据（1m/5m/1h/6h/24h）
+- 根据每个CA配置的 `time_interval`，动态选择对应字段
+
+**字段映射表**：
+```python
+FIELD_MAP = {
+    '1m': {
+        'price_change': 'pc1m',
+        'buy_volume': 'bv1m',
+        'sell_volume': 'sv1m',
+        'buy_txs': 'bt1m',
+        'sell_txs': 'st1m',
+        'buy_amount': 'ba1m',
+        'sell_amount': 'sa1m',
+    },
+    '5m': {
+        'price_change': 'pc5m',
+        'buy_volume': 'bv5m',
+        'sell_volume': 'sv5m',
+        'buy_txs': 'bt5m',
+        'sell_txs': 'st5m',
+        'buy_amount': 'ba5m',
+        'sell_amount': 'sa5m',
+    },
+    '1h': {
+        'price_change': 'pc1h',
+        'buy_volume': 'bv1h',
+        'sell_volume': 'sv1h',
+        'buy_txs': 'bt1h',
+        'sell_txs': 'st1h',
+        'buy_amount': 'ba1h',
+        'sell_amount': 'sa1h',
+    },
+    '6h': {
+        'price_change': 'pc6h',
+        'buy_volume': 'bv6h',
+        'sell_volume': 'sv6h',
+        'buy_txs': 'bt6h',
+        'sell_txs': 'st6h',
+    },
+    '24h': {
+        'price_change': 'pc24h',
+        'buy_volume': 'bv24h',
+        'sell_volume': 'sv24h',
+        'buy_txs': 'bt24h',
+        'sell_txs': 'st24h',
+    },
+}
+
+def get_field_value(data: dict, field_name: str, time_interval: str) -> float:
+    """
+    根据时间间隔获取对应字段的值
+    
+    Args:
+        data: WebSocket返回的数据
+        field_name: 字段名（price_change, buy_volume等）
+        time_interval: 时间间隔（1m, 5m, 1h等）
+    
+    Returns:
+        对应字段的值
+    """
+    field_key = FIELD_MAP.get(time_interval, {}).get(field_name)
+    if not field_key:
+        return 0
+    return data.get(field_key, 0)
+
+# 使用示例
+time_interval = config['time_interval']  # 从配置读取：1m/5m/1h
+
+# 动态获取对应时间窗口的数据
+price_change = get_field_value(data, 'price_change', time_interval) * 100  # 转百分比
+buy_volume = get_field_value(data, 'buy_volume', time_interval)
+sell_volume = get_field_value(data, 'sell_volume', time_interval)
+total_volume = buy_volume + sell_volume
+```
+
+**优势**：
+- ✅ 灵活：未来模板改成5m/1h，代码不需要修改
+- ✅ 简单：统一的订阅参数，一个映射表搞定
+- ✅ 扩展性：新增时间窗口只需在映射表加一行
+- ✅ 性能：字典查找O(1)，无性能损耗
+
+#### 3. 配置缓存方案
+**决策**：前期使用Redis缓存，后期考虑落地到数据库
+
+**Redis Key设计**（遵循项目统一风格 `quick_monitor:` 前缀）：
+```python
+# 1. 配置缓存（Hash结构）- 每个pair一个
+quick_monitor:ws:config:{pair_address}
+# 内容：ca, template_id, time_interval, events_config等
+
+# 2. CA到Pair映射（String）
+quick_monitor:ws:ca_pair:{ca}
+# 内容：pair_address
+
+# 3. 批次索引（Set）
+quick_monitor:ws:batch:{batch_id}
+# 内容：该批次所有的pair地址
+
+# 4. 告警冷却（String，带TTL）
+quick_monitor:ws:cooldown:{ca}
+# TTL: 180-210秒（3分钟+30秒随机抖动）
+
+# 5. 配置版本号（String）
+quick_monitor:ws:version
+# 内容：最后更新时间戳
+```
+
+**启动流程**：
+```python
+1. 从Redis读取模板配置
+   quick_monitor:template:sol
+   
+2. 从数据库读取批次池
+   sol_ws_batch_pool（已有的表）
+   按batch_id, template_id分组统计
+   
+3. 加载配置到内存缓存
+   {pair_address: config_dict}
+   
+4. 启动WebSocket连接并订阅
+```
+
+**配置刷新**（可选，暂不实现）：
+```python
+# 定期检查数据库配置变化（每5分钟）
+# 1. 对比 update_time
+# 2. 更新变化的配置到内存缓存
+# 3. 记录变更日志
+```
+
+**优势**：
+- 避免每次消息都查数据库（1899个CA，1分钟间隔 = 1899次/分钟）
+- 支持配置热更新（检测到变化自动刷新）
+- Redis读取性能高
+
+#### 4. 告警去重机制
+**决策**：3分钟冷却期 + 30秒随机抖动（参考BSC区块监控）
+```python
+import random
+
+cooldown_seconds = 180 + random.randint(0, 30)  # 180-210秒
+redis.setex(f"sol:ws:cooldown:{ca}", cooldown_seconds, "1")
+```
+
+**理由**：
+- 避免短时间内重复告警
+- 随机抖动防止多个CA同时解除冷却造成告警风暴
+
+#### 5. 批次优先级
+**说明**：虽然初始化时部分CA的pair获取顺序有误，但整体仍按历史市值排序
+- Batch 1-2：市值最高（≥ $10M，配置4）
+- Batch 3-8：次高（$1M-$10M，配置3）
+- Batch 9-15：中等（$500K-$1M，配置2）
+- Batch 16-20：较低（$300K-$500K，配置1）
+
+**建议**：后续可通过定期任务重新排序优化
+
+### 性能优化
+
+#### 1. 内存缓存配置（已采纳）
+```python
+class SolWebSocketConnection:
+    def __init__(self):
+        self.config_cache = {}  # {pair_address: config_dict}
+    
+    async def load_config_from_redis(self):
+        """从Redis批量加载配置"""
+        pairs = self.get_all_pairs()
+        pipeline = self.redis.pipeline()
+        for pair in pairs:
+            pipeline.get(f"sol:ws:config:{pair}")
+        results = pipeline.execute()
+        # 解析并缓存
+```
+
+#### 2. 数据库索引优化（已采纳）
+```sql
+-- 优化查询性能
+ALTER TABLE sol_ws_batch_pool 
+ADD INDEX idx_batch_active_interval (batch_id, is_active, time_interval);
+
+ALTER TABLE sol_ws_batch_pool
+ADD INDEX idx_pair_active (pair_address, is_active);
+
+-- 告警日志查询优化
+ALTER TABLE sol_ws_alert_log
+ADD INDEX idx_ca_alert_time (ca, alert_time DESC);
+
+ALTER TABLE sol_ws_alert_log
+ADD INDEX idx_template_time (template_id, alert_time DESC);
+```
+
+#### 3. 数据验证
+```python
+class DataValidator:
+    @staticmethod
+    def validate_pair_data(data: dict) -> bool:
+        """验证WebSocket数据完整性"""
+        required = ['p', 'tp', 'mp']  # pair, token_price, market_cap
+        if not all(k in data for k in required):
+            return False
+        
+        # 验证数值合理性
+        if data.get('tp', 0) <= 0 or data.get('mp', 0) <= 0:
+            return False
+        
+        return True
+    
+    @staticmethod
+    def is_valid_price_change(value: float) -> bool:
+        """验证价格变化范围（-1000% 到 +1000%）"""
+        return -10.0 <= value <= 10.0
+```
+
+### 配置刷新机制
+
+```python
+class ConfigRefresher:
+    """配置刷新器 - 定期检查数据库配置变化"""
+    
+    def __init__(self, db, redis):
+        self.db = db
+        self.redis = redis
+        self.last_check = None
+    
+    async def refresh_loop(self):
+        """每5分钟检查一次"""
+        while True:
+            try:
+                await self.check_and_update()
+                await asyncio.sleep(300)  # 5分钟
+            except Exception as e:
+                logger.error(f"配置刷新失败: {e}")
+    
+    async def check_and_update(self):
+        """检查并更新配置"""
+        # 1. 查询有更新的配置
+        updated = self.db.execute_query("""
+            SELECT * FROM sol_ws_batch_pool
+            WHERE update_time > %s AND is_active = 1
+        """, (self.last_check,))
+        
+        if not updated:
+            return
+        
+        # 2. 更新Redis
+        pipeline = self.redis.pipeline()
+        for config in updated:
+            key = f"sol:ws:config:{config['pair_address']}"
+            pipeline.set(key, json.dumps(config))
+        pipeline.execute()
+        
+        # 3. 记录日志
+        logger.info(f"配置已更新: {len(updated)} 条")
+        self.last_check = datetime.now()
+```
+
+### 后续优化（暂不实现）
+
+#### 第二阶段
+- ⏳ 动态批次调整（根据告警频率重新排序CA）
 - ⏳ Web管理界面
-- ⏳ 动态添加/删除订阅
 - ⏳ 实时监控Dashboard
 - ⏳ 告警规则可视化编辑
 
-### 第三阶段
+#### 第三阶段
+- ⏳ 智能冷却（根据触发频率动态调整冷却期）
+- ⏳ Prometheus监控指标
+- ⏳ 告警聚合报告（每日TOP10统计）
 - ⏳ 机器学习预测
-- ⏳ 智能告警（减少误报）
 - ⏳ 多链支持（ETH、BSC等）
 - ⏳ 告警分级（紧急/重要/普通）
 
@@ -1106,9 +1381,32 @@ DBotX API限制：
 
 ---
 
-**文档版本**：v1.2  
-**最后更新**：2025-10-31  
+**文档版本**：v1.4  
+**最后更新**：2025-11-02  
 **维护人员**：开发团队  
-**状态**：✅ 数据库表已创建，✅ 批次池已初始化（1,899个CA），⏳ 待开发WebSocket监控主程序
+**状态**：✅ 开发完成，✅ 生产环境运行中
+
+---
+
+## 更新记录
+
+### v1.4 (2025-11-02)
+- ✅ 优化 DBotX API 超时配置（10s→30s）
+- ✅ 增加指数退避重试策略（1s, 2s, 4s）
+- ✅ 完善错误日志（添加具体失败的CA/Pair信息）
+- ✅ Telegram 告警添加内联按钮（GMGN + AXIOM）
+- ✅ 数据验证优化（过滤异常价格变化 >500%）
+- ✅ 项目迁移文档（PROJECT_MIGRATION_GUIDE.md）
+
+### v1.3 (2025-10-31)
+- ✅ WebSocket 连接实现完成
+- ✅ 告警逻辑实现完成
+- ✅ 数据库索引优化
+- ✅ 首次生产环境测试通过
+
+### v1.2 (2025-10-30)
+- ✅ 数据库表设计完成
+- ✅ 批次池初始化完成（1,899个CA）
+- ✅ 技术方案评审通过
 
 
