@@ -1847,7 +1847,7 @@ class BSCWebSocketMonitor:
         
         # 🔒 关键：检查冷却期（只读，不设置）
         # 避免为已在冷却期的代币构建消息
-        if not await self.can_alert_token(base_token):
+        if not await self.check_alert_cooldown_readonly(base_token):
             logger.info(f"⏳ 冷却期内，跳过: {base_token}")
             return
         
@@ -2145,7 +2145,7 @@ class BSCWebSocketMonitor:
             
             # 🔒 关键：检查冷却期（只读，不设置）
             # 避免为已在冷却期的代币构建消息
-            if not await self.can_alert_token(target_token):
+            if not await self.check_alert_cooldown_readonly(target_token):
                 logger.info(f"⏳ 冷却期内，跳过: {target_token}")
                 return
             

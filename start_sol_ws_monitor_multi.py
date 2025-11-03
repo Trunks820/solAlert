@@ -275,10 +275,16 @@ async def batch_ws_handler(
                                 
                                 ca = full_config['ca']
                                 symbol = full_config['token_symbol']
-                                
+
                                 # 🚀 健壮的数据验证（防止 None 值导致 TypeError）
-                                pc1m = to_float(item.get('pc1m'), 0) * 100
-                                volume = to_float(item.get('bsv'), 0)
+                                try:
+                                    pc1m_raw = to_float(item.get('pc1m'), 0)
+                                    volume_raw = to_float(item.get('bsv'), 0)
+                                    pc1m = (pc1m_raw if pc1m_raw is not None else 0) * 100
+                                    volume = volume_raw if volume_raw is not None else 0
+                                except (TypeError, ValueError) as e:
+                                    logger.debug(f"⚠️  [{conn_name}] 数据转换失败: {e}, 跳过")
+                                    continue
                                 
                                 # 📊 详细日志：显示收到的数据（每5条输出一次汇总）
                                 if data_count % 5 == 0:
