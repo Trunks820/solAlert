@@ -166,9 +166,19 @@ class DBotXAPI:
                     if response.status_code == 200:
                         data = response.json()
                         
-                        if data.get('err') is False and data.get('res'):
-                            logger.info(f"✅ DBotX API 成功获取 pair_info: {pair_address[:10]}...")
-                            return data['res']
+                        if data.get('err') is False:
+                            res = data.get('res')
+                            
+                            # 区分：None（失败）和 {}（空数据）
+                            if res is None:
+                                logger.warning(f"⚠️  DBotX API 返回错误: pair={pair_address[:10]}... data={data}")
+                                return None
+                            elif not res:  # 空字典 {}
+                                logger.debug(f"⚠️  DBotX API 返回空数据: pair={pair_address[:10]}... 将触发降级")
+                                return res  # 返回空字典，让调用方判断并降级
+                            else:
+                                logger.info(f"✅ DBotX API 成功获取 pair_info: {pair_address[:10]}...")
+                                return res
                         else:
                             logger.warning(f"⚠️  DBotX API 返回错误: pair={pair_address[:10]}... data={data}")
                             return None

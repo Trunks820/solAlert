@@ -1355,10 +1355,16 @@ class BSCWebSocketMonitor:
         ]
         return InlineKeyboardMarkup(buttons)
     
-    async def send_alert(self, message: str, token_address: str):
-        """发送 Telegram 通知"""
+    async def send_alert(self, message: str, token_address: str) -> bool:
+        """
+        发送 Telegram 通知
+        
+        Returns:
+            bool: 是否发送成功
+        """
         if not self.enable_telegram:
-            return
+            logger.debug(f"⏭️  Telegram未启用，跳过发送")
+            return False
         
         try:
             reply_markup = self.create_token_buttons(token_address)
@@ -1372,11 +1378,14 @@ class BSCWebSocketMonitor:
             
             if result.get('success'):
                 logger.info(f"✅ Telegram通知已发送 - {token_address[:10]}...")
+                return True
             else:
                 logger.error(f"❌ Telegram发送失败 - {token_address[:10]}...: {result.get('error')}")
+                return False
         
         except Exception as e:
             logger.error(f"❌ 发送通知异常: {e}")
+            return False
     
     async def check_external_is_fourmeme(self, token_address: str) -> tuple[bool, bool, Optional[Dict]]:
         """
@@ -1544,7 +1553,13 @@ class BSCWebSocketMonitor:
             return None
     
     async def handle_swap_event(self, log: Dict):
-        """处理 PancakeSwap Swap 事件（外盘）- 优化版（使用三层缓存 + receipt兜底）"""
+        """
+        处理 PancakeSwap Swap 事件（外盘）
+        
+        🚀 优化：使用 DBotX API 替代 RPC 调用（带降级策略）
+        - 优先路径：1次API调用获取所有数据
+        - 降级路径：API失败 → RPC获取token0/token1 → 继续处理
+        """
         tx_hash = log.get("transactionHash")
         pair_address = log.get("address", "").lower()
         swap_data = self.parse_swap_data(log.get("data"))
@@ -1554,57 +1569,92 @@ class BSCWebSocketMonitor:
             await self._handle_swap_with_receipt_fallback(tx_hash, pair_address)
             return
         
-        # 使用优化的批量查询（支持 L1/L2/L3 缓存）
-        pair_info = self.get_pair_full_info(pair_address)
-        if not pair_info:
+        # 🚀 优先路径：尝试使用 DBotX API 获取交易对信息
+        dbotx_api = DBotXAPI()
+        pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
+        
+        mint = None
+        base_mint = None
+        base_symbol = None
+        token_symbol = None
+        use_api_data = False  # 标记是否使用 API 完整数据
+        
+        # 检查 API 返回（可能是 None、空字典 {}、或有数据的字典）
+        if pair_info_raw is not None:  # 排除 None
+            mint = pair_info_raw.get('mint', '').lower()
+            base_mint = pair_info_raw.get('baseMint', '').lower()
+            base_symbol = pair_info_raw.get('baseSymbol', '')
+            token_symbol = pair_info_raw.get('symbol', '')
+            
+            # 检查关键字段是否存在且非空
+            # 注意：空字典 {} 会进入这个分支，但 mint/base_mint 会是空字符串
+            if mint and base_mint:  # 两者都非空才使用 API 数据
+                use_api_data = True
+                logger.debug(f"✅ API 数据完整: {pair_address[:10]}... (mint={mint[:10]}, base={base_mint[:10]})")
+            else:
+                logger.info(f"⚠️  API 数据不完整（空字典或缺少字段），准备降级到 RPC: {pair_address[:10]}...")
+        else:
+            logger.info(f"⚠️  API 返回 None，准备降级到 RPC: {pair_address[:10]}...")
+        
+        # 🔄 降级路径：API 失败或数据不完整，使用 RPC 获取 token0/token1
+        if not use_api_data:
+            logger.info(f"🔄 [降级] 使用 RPC 获取 token0/token1: {pair_address[:10]}...")
+            
+            # 使用原来的 RPC 方式
+            pair_info = self.get_pair_full_info(pair_address)
+            if not pair_info:
+                logger.debug(f"⏭️  RPC 也失败，跳过: {pair_address[:10]}...")
+                return
+            
+            mint = pair_info['token0'].lower()  # 根据测试，token0 = mint
+            base_mint = pair_info['token1'].lower()  # token1 = baseMint
+            token_symbol = pair_info.get('symbol0', '???')
+            base_symbol = pair_info.get('symbol1', '???')
+            
+            # 标记为降级模式（后续需要调用 second_layer_filter）
+            pair_info_raw = None
+        
+        # 快速过滤：检查基础货币是否是我们关注的稳定币
+        if base_mint not in (self.USDT, self.USDC, self.WBNB):
             return
         
-        token0 = pair_info['token0']
-        token1 = pair_info['token1']
-        
-        # 快速过滤：只处理 USDT/USDC/WBNB 相关的交易对
-        if token0 not in (self.USDT, self.USDC, self.WBNB) and token1 not in (self.USDT, self.USDC, self.WBNB):
-            return
-        
-        # 排除稳定币对（如 USDT/WBNB）
-        if {token0, token1} & {self.USDT, self.USDC, self.WBNB} == {token0, token1}:
-            return
-        
-        # 解析交易
+        # 解析交易数据
         amount0_in = swap_data["amount0In"]
         amount1_in = swap_data["amount1In"]
         amount0_out = swap_data["amount0Out"]
         amount1_out = swap_data["amount1Out"]
         
+        # 判断是否是买入行为（稳定币输入 → 主代币输出）
+        # 根据测试结果：mint=token0, baseMint=token1 (100%匹配)
         quote_token = None
         base_token = None
         quote_amount = 0
         base_amount = 0
-        quote_decimals = 18
-        base_decimals = 18
-        quote_symbol = "???"
-        base_symbol = "???"
+        quote_decimals = 18  # 稳定币精度默认18
+        base_decimals = pair_info_raw.get('decimals', 18)  # 主代币精度
+        quote_symbol = base_symbol
+        base_symbol = token_symbol
         
         if amount0_in > 0 and amount1_out > 0:
-            if token0 in (self.USDT, self.USDC, self.WBNB):
-                quote_token = token0
-                base_token = token1
-                quote_amount = amount0_in
-                base_amount = amount1_out
-                quote_decimals = pair_info['decimals0']
-                base_decimals = pair_info['decimals1']
-                quote_symbol = pair_info['symbol0']
-                base_symbol = pair_info['symbol1']
+            # token0输入 → token1输出
+            # 这种情况通常不是买入（token0是主代币，token1是稳定币）
+            # 但我们仍需检查
+            if mint == base_mint:  # 特殊情况：稳定币对
+                return
+            logger.debug(f"⏭️  可能是卖出：token0输入 → token1输出")
+            return
+            
         elif amount1_in > 0 and amount0_out > 0:
-            if token1 in (self.USDT, self.USDC, self.WBNB):
-                quote_token = token1
-                base_token = token0
-                quote_amount = amount1_in
-                base_amount = amount0_out
-                quote_decimals = pair_info['decimals1']
-                base_decimals = pair_info['decimals0']
-                quote_symbol = pair_info['symbol1']
-                base_symbol = pair_info['symbol0']
+            # token1输入 → token0输出
+            # 根据测试：token1=baseMint（稳定币），token0=mint（主代币）
+            # 这是标准的买入行为 ✓
+            quote_token = base_mint  # 稳定币
+            base_token = mint  # 主代币
+            quote_amount = amount1_in
+            base_amount = amount0_out
+        else:
+            # 其他情况：可能是复杂交易
+            return
         
         if not quote_token or not base_token:
             return
@@ -1630,13 +1680,25 @@ class BSCWebSocketMonitor:
                 is_cached_non_fourmeme = self.redis_client.sismember(self.NON_FOURMEME_KEY, base_token)
                 if is_cached_non_fourmeme:
                     self.cache_hit_count += 1
-                    logger.debug(f"⏭️  外盘非fourmeme (缓存命中 #{self.cache_hit_count}): {base_symbol} - {base_token[:10]}...")
+                    logger.info(f"⏭️  [外盘] 非fourmeme (缓存命中 #{self.cache_hit_count}): {base_symbol} (${usd_value:.2f}) - {base_token[:10]}...")
                     return
             except Exception as e:
                 logger.warning(f"⚠️  Redis缓存查询失败: {e}")
         
-        # fourmeme 验证（未命中缓存才调用API）
-        is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
+        # 检查是否是 fourmeme
+        is_fourmeme = False
+        is_confirmed = False  # 是否能确认（API 有数据）
+        
+        if use_api_data and pair_info_raw:
+            # 快速路径：使用 API 已返回的数据
+            pre_dex = pair_info_raw.get('preDex', '').lower()
+            pool_type = pair_info_raw.get('poolType', '').lower()
+            is_fourmeme = (pre_dex == 'fourmeme' or pool_type == 'fourmeme')
+            is_confirmed = True
+        else:
+            # 降级路径：使用原有的 API 检查
+            logger.debug(f"🔄 [降级] 调用 check_external_is_fourmeme: {base_token[:10]}...")
+            is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
         
         if not is_fourmeme:
             if is_confirmed:
@@ -1644,29 +1706,149 @@ class BSCWebSocketMonitor:
                 if self.redis_client:
                     try:
                         self.redis_client.client.sadd(self.NON_FOURMEME_KEY, base_token)
-                        # 每次添加时重置过期时间，保持30天滚动窗口
                         self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
                         logger.debug(f"✅ 已加入黑名单: {base_symbol} - {base_token[:10]}...")
                     except Exception as e:
                         logger.warning(f"⚠️  Redis缓存写入失败: {e}")
-                logger.debug(f"⏭️  外盘非fourmeme: {base_symbol} - {base_token[:10]}...")
+                
+                # 🔍 详细日志：显示判定依据
+                if use_api_data and pair_info_raw:
+                    pre_dex = pair_info_raw.get('preDex', 'N/A')
+                    pool_type = pair_info_raw.get('poolType', 'N/A')
+                    logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | preDex={pre_dex}, poolType={pool_type} | {base_token[:10]}...")
+                else:
+                    logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
             else:
-                # API失败，结果不确定 → 不加黑名单，下次继续检查
-                logger.debug(f"⚠️  外盘fourmeme检查失败（API故障），跳过但不加黑名单: {base_symbol} - {base_token[:10]}...")
+                # API 失败，不确定 → 不加黑名单
+                logger.info(f"⚠️  [外盘] fourmeme检查失败（API故障），跳过但不加黑名单: {base_symbol} - {base_token[:10]}...")
             return
         
-        logger.info(f"✓ 外盘是fourmeme: {base_symbol} - {base_token[:10]}...")
+        # 🔍 详细日志：显示判定依据
+        if use_api_data and pair_info_raw:
+            pre_dex = pair_info_raw.get('preDex', 'N/A')
+            pool_type = pair_info_raw.get('poolType', 'N/A')
+            logger.info(f"✅ [外盘] 是fourmeme: {base_symbol} (${usd_value:.2f}) | preDex={pre_dex}, poolType={pool_type} | {base_token[:10]}...")
+        else:
+            logger.info(f"✅ [外盘] 是fourmeme: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
         
-        # 第二层过滤
-        token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
-        if not token_data:
-            return
+        # 🚀 第二层过滤：区分快速路径和降级路径
+        if use_api_data and pair_info_raw:
+            # ============================================
+            # 快速路径：直接使用 API 返回的数据进行第二层判断
+            # ============================================
+            logger.debug(f"⚡ [快速路径] 使用 API 数据进行第二层判断")
+            
+            token_price_usd = pair_info_raw.get('tokenPriceUsd', 0)
+            market_cap = pair_info_raw.get('marketCap', 0)
+            
+            # 获取配置的时间间隔
+            time_interval = self.time_interval_external  # 外盘
+            
+            # 根据时间间隔选择对应的涨跌幅和交易量
+            if time_interval == '1m':
+                price_change = pair_info_raw.get('priceChange1m', 0) * 100
+                volume = pair_info_raw.get('buyAndSellVolume1m', 0)
+            elif time_interval == '5m':
+                price_change = pair_info_raw.get('priceChange5m', 0) * 100
+                volume = pair_info_raw.get('buyAndSellVolume5m', 0)
+            elif time_interval == '1h':
+                price_change = pair_info_raw.get('priceChange1h', 0) * 100
+                volume = pair_info_raw.get('buyAndSellVolume1h', 0)
+            else:
+                price_change = pair_info_raw.get('priceChange5m', 0) * 100  # 默认5分钟
+                volume = pair_info_raw.get('buyAndSellVolume5m', 0)
+            
+            # 获取外盘配置（从 external_events_config 读取）
+            external_config = self.external_events_config
+            
+            # 第二层判断：涨跌幅和交易量
+            min_price_change = external_config.get('priceChange', {}).get('risePercent', 50)  # 默认50%
+            min_volume = external_config.get('volume', {}).get('threshold', 20000)  # 默认$20000
+            
+            # 检查是否满足条件
+            triggered_events = []
+            
+            # 检查涨跌幅
+            price_change_enabled = external_config.get('priceChange', {}).get('enabled', True)
+            if price_change_enabled:
+                if price_change >= min_price_change:
+                    triggered_events.append({'event': 'priceChange', 'value': price_change})
+                    logger.debug(f"✅ 涨跌幅达标: {price_change:+.2f}% >= {min_price_change}%")
+                else:
+                    logger.debug(f"⏭️  涨跌幅不足: {price_change:.2f}% < {min_price_change}%")
+            
+            # 检查交易量
+            volume_enabled = external_config.get('volume', {}).get('enabled', True)
+            if volume_enabled:
+                if volume >= min_volume:
+                    triggered_events.append({'event': 'volume', 'value': volume})
+                    logger.debug(f"✅ 交易量达标: ${volume:.2f} >= ${min_volume}")
+                else:
+                    logger.debug(f"⏭️  交易量不足: ${volume:.2f} < ${min_volume}")
+            
+            # 根据触发逻辑判断是否通过第二层
+            trigger_logic = self.trigger_logic_external  # 'any' 或 'all'
+            
+            if trigger_logic == 'all':
+                # 要求所有启用的指标都达标
+                required_events = []
+                if price_change_enabled:
+                    required_events.append('priceChange')
+                if volume_enabled:
+                    required_events.append('volume')
+                
+                triggered_event_names = {e['event'] for e in triggered_events}
+                if not all(evt in triggered_event_names for evt in required_events):
+                    logger.debug(f"⏭️  未满足'all'触发逻辑（需要所有指标）")
+                    return
+            elif trigger_logic == 'any':
+                # 只要有一个指标达标即可
+                if not triggered_events:
+                    logger.debug(f"⏭️  未满足'any'触发逻辑（至少一个指标）")
+                    return
+            
+            logger.info(f"✅ 通过第二层: 触发事件={[e['event'] for e in triggered_events]}")
+            
+            # 构建 token_data（兼容原有格式）
+            token_data = {
+                'symbol': token_symbol,
+                'price': token_price_usd,
+                'price_change': price_change,
+                'volume': volume,
+                'market_cap': market_cap,
+                'buy_tax': pair_info_raw.get('safetyInfo', {}).get('buyTax', 0) if pair_info_raw.get('safetyInfo') else 0,
+                'sell_tax': pair_info_raw.get('safetyInfo', {}).get('sellTax', 0) if pair_info_raw.get('safetyInfo') else 0,
+                'pool_type': pool_type or 'pancake_v2',
+                'pool_emoji': '🔥',
+                'is_internal': False,
+                'triggered_events': triggered_events
+            }
+        else:
+            # ============================================
+            # 降级路径：使用 second_layer_filter（再次调用 API）
+            # ============================================
+            logger.info(f"🔄 [降级路径] 调用 second_layer_filter")
+            
+            # 构造 launchpad_info（兼容 second_layer_filter）
+            launchpad_info = {
+                'launchpad': 'fourmeme',
+                'launchpad_status': 1,  # 外盘
+                'pair_address': pair_address
+            }
+            
+            # 调用统一的第二层过滤
+            token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
+            
+            if not token_data:
+                logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
+                return
+            
+            logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
         
-        # 🔒 关键：第二层通过后立即设置冷却期（防止并发重复播报）
-        # 在播报前设置，避免同步 I/O 阻塞期间其他交易也通过
-        already_alerted = not await self.check_and_set_alert_cooldown(base_token)
-        if already_alerted:
-            logger.info(f"⏳ 已在播报流程中，跳过: {base_token}")
+        # 🔒 关键：检查冷却期（只读，不设置）
+        # 避免为已在冷却期的代币构建消息
+        if not await self.can_alert_token(base_token):
+            logger.info(f"⏳ 冷却期内，跳过: {base_token}")
             return
         
         # 构建消息
@@ -1744,10 +1926,18 @@ class BSCWebSocketMonitor:
             "sell_tax": f"{sell_tax:.1f}%"
         })
         
-        # 发送推送
-        await self.send_alert(message, base_token)
+        # 🚀 发送推送，成功后才设置冷却期
+        send_success = await self.send_alert(message, base_token)
         
-        # 记录到数据库并推送WebSocket
+        if send_success:
+            # ✅ 播报成功，设置冷却期
+            await self.check_and_set_alert_cooldown(base_token)
+            logger.info(f"✅ 已设置冷却期: {base_token[:10]}... ({self.cooldown_minutes}分钟)")
+        else:
+            # ❌ 播报失败，不设置冷却期，允许下次重试
+            logger.warning(f"⚠️  播报失败，未设置冷却期: {base_token[:10]}...")
+        
+        # 记录到数据库并推送WebSocket（无论通知是否成功）
         await asyncio.to_thread(
             self.alert_recorder.write_bsc_alert,
             ca=base_token,
@@ -1764,9 +1954,8 @@ class BSCWebSocketMonitor:
             volume_24h=volume,
             holders=0,
             logo="",
-            notify_error=None
+            notify_error=None if send_success else "Telegram发送失败"
         )
-        # 冷却期已在播报前设置，此处无需重复
     
     async def _handle_swap_with_receipt_fallback(self, tx_hash: str, pair_address: str):
         """外盘receipt兜底：从交易回执中提取Swap事件"""
@@ -1954,11 +2143,10 @@ class BSCWebSocketMonitor:
                 except:
                     pass
             
-            # 🔒 关键：第二层通过后立即设置冷却期（防止并发重复播报）
-            # 在播报前设置，避免同步 I/O 阻塞期间其他交易也通过
-            already_alerted = not await self.check_and_set_alert_cooldown(target_token)
-            if already_alerted:
-                logger.info(f"⏳ 已在播报流程中，跳过: {target_token}")
+            # 🔒 关键：检查冷却期（只读，不设置）
+            # 避免为已在冷却期的代币构建消息
+            if not await self.can_alert_token(target_token):
+                logger.info(f"⏳ 冷却期内，跳过: {target_token}")
                 return
             
             # 构建消息
@@ -2037,10 +2225,18 @@ class BSCWebSocketMonitor:
                 "sell_tax": f"{sell_tax:.1f}%"
             })
             
-            # 发送推送
-            await self.send_alert(message, target_token)
+            # 🚀 发送推送，成功后才设置冷却期
+            send_success = await self.send_alert(message, target_token)
             
-            # 记录到数据库并推送WebSocket
+            if send_success:
+                # ✅ 播报成功，设置冷却期
+                await self.check_and_set_alert_cooldown(target_token)
+                logger.info(f"✅ 已设置冷却期: {target_token[:10]}... ({self.cooldown_minutes}分钟)")
+            else:
+                # ❌ 播报失败，不设置冷却期，允许下次重试
+                logger.warning(f"⚠️  播报失败，未设置冷却期: {target_token[:10]}...")
+            
+            # 记录到数据库并推送WebSocket（无论通知是否成功）
             await asyncio.to_thread(
                 self.alert_recorder.write_bsc_alert,
                 ca=target_token,
@@ -2057,9 +2253,8 @@ class BSCWebSocketMonitor:
                 volume_24h=volume,
                 holders=0,
                 logo="",
-                notify_error=None
+                notify_error=None if send_success else "Telegram发送失败"
             )
-            # 冷却期已在播报前设置，此处无需重复
         
         except Exception as e:
             logger.error(f"❌ 处理内盘交易出错: {e}")
