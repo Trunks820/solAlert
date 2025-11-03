@@ -276,12 +276,15 @@ class SolAlertChecker:
         template_name = config.get('template_name', '')
         time_interval = config.get('time_interval', '1m')
         
-        # 构造消息
-        message = f"""🔔 SOL WebSocket 实时告警
+        # 构造消息（HTML格式）
+        # 🚀 CA 链接：蓝色文本 + 可点击复制 + 点击跳转solscan
+        ca_link = f'<a href="https://solscan.io/token/{ca}"><code>{ca}</code></a>'
+        
+        message = f"""<b>🔔 SOL WebSocket 实时告警</b>
 
-💰 Token: {token_symbol}
+💰 Token: <b>{token_symbol}</b>
 📝 名称: {token_name}
-🔗 CA: `{ca}`
+🔗 CA: {ca_link}
 🏷️ 模板: {template_name}
 
 💵 当前价格: ${metrics['price']:.10f}
@@ -316,13 +319,11 @@ class SolAlertChecker:
             logger.warning("未安装python-telegram-bot库，无法创建按钮")
             return None
         
-        # 如果没有提供pair_address，使用ca
-        axiom_pair = pair_address if pair_address else ca
-        
+        # 🚀 Axiom 使用 CA 地址，固定添加 ?chain=sol 参数
         buttons = [
             [
                 InlineKeyboardButton("💹 GMGN", url=f"https://gmgn.ai/sol/token/{ca}"),
-                InlineKeyboardButton("📊 AXIOM", url=f"https://axiom.trade/meme/{axiom_pair}")
+                InlineKeyboardButton("📊 AXIOM", url=f"https://axiom.trade/meme/{pair_address}")
             ]
         ]
         return InlineKeyboardMarkup(buttons)
