@@ -146,21 +146,12 @@ class BSCWebSocketMonitor:
         self.message_count = 0  # 消息计数器
         self.cache_hit_count = 0  # 非fourmeme缓存命中计数
         
-        # ========== 队列架构（主流控）==========
-        # 消息队列：WebSocket → Queue → Consumer → RPC
-        # 优先级：0=内盘（立即处理），1=外盘（可延迟）
-        self.event_queue = None  # 在start()中初始化（需要asyncio事件循环）
-        self.queue_max_size = 1000  # 队列容量
-        self.queue_overflow_count = 0  # 队列溢出计数
-        self.queue_current_max = 0  # 队列历史最大深度
-        self.queue_sequence = 0  # 序列号（防止dict比较错误）
+        # ========== 直接处理架构（无队列）==========
+        # 处理流程：WebSocket → 线程池 → 异步处理（低延迟，高吞吐）
         
-        # 消费者数量（控制并发）
-        self.consumer_count = 3  # 3个消费者，稳定在6-15 RPS
-        self.consumer_tasks = []  # 消费者任务列表
-        
-        # 线程池（仅用于在同步WebSocket回调中提交异步任务）
-        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="BSC-WS-Bridge")
+        # 线程池（直接处理模式：WebSocket回调 → 线程池 → 异步处理）
+        # 8核24G服务器：扩大线程池以支持高并发直接处理
+        self.executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="BSC-WS-Direct")
         self.thread_local = threading.local()
         
         # 交易去重（使用 tx_hash:logIndex 组合键，支持多日志处理）
@@ -2486,53 +2477,6 @@ class BSCWebSocketMonitor:
         except Exception as e:
             logger.error(f"❌ 发送内盘告警失败: {e}")
     
-    async def _event_consumer(self, worker_id: int):
-        """
-        事件消费者（从队列取事件并处理）
-        
-        架构：Queue → Consumer (3并发) → RPC (Chainstack无限制)
-        """
-        logger.info(f"🔄 消费者#{worker_id} 已启动")
-        
-        while not self.should_stop:
-            try:
-                # 从队列取事件（带超时，避免阻塞停止信号）
-                priority, sequence, event_data = await asyncio.wait_for(
-                    self.event_queue.get(),
-                    timeout=1.0
-                )
-                
-                event_type = event_data['type']
-                result = event_data['result']
-                
-                # ========== 处理事件 ==========
-                if event_type == 'proxy':
-                    await self.handle_proxy_event(result)
-                elif event_type == 'swap':
-                    await self.handle_swap_event(result)
-                
-                self.event_queue.task_done()
-                
-            except asyncio.TimeoutError:
-                # 队列为空，继续等待
-                continue
-            except Exception as e:
-                logger.error(f"❌ 消费者#{worker_id} 处理错误: {e}")
-                logger.debug(f"错误堆栈: {traceback.format_exc()}")
-        
-        logger.info(f"🛑 消费者#{worker_id} 已停止")
-    
-    async def start_consumers(self):
-        """启动所有消费者任务"""
-        logger.info(f"🚀 启动 {self.consumer_count} 个消费者...")
-        
-        self.consumer_tasks = [
-            asyncio.create_task(self._event_consumer(i))
-            for i in range(self.consumer_count)
-        ]
-        
-        # 等待所有消费者完成（或被取消）
-        await asyncio.gather(*self.consumer_tasks, return_exceptions=True)
     
     def health_check_loop(self):
         """健康检查循环（每分钟输出一次状态）"""
@@ -2608,20 +2552,10 @@ class BSCWebSocketMonitor:
                     else:
                         logger.info(f"      └─ ✅ 无429限流")
                 
-                # 队列统计（事件缓冲监控）
-                if self.event_queue:
-                    try:
-                        queue_size = self.event_queue.qsize()
-                        queue_usage = (queue_size / self.queue_max_size * 100) if self.queue_max_size > 0 else 0
-                        logger.info(f"   事件队列: {queue_size}/{self.queue_max_size} ({queue_usage:.1f}%)")
-                        logger.info(f"      ├─ 历史峰值: {self.queue_current_max}")
-                        logger.info(f"      ├─ 消费者: {self.consumer_count} 个")
-                        if self.queue_overflow_count > 0:
-                            logger.warning(f"      └─ ⚠️ 溢出丢弃: {self.queue_overflow_count} 条")
-                        else:
-                            logger.info(f"      └─ ✅ 无溢出")
-                    except Exception as e:
-                        logger.debug(f"队列统计失败: {e}")
+                # 线程池统计（直接处理模式）
+                logger.info(f"   处理模式: 🚀 直接处理（无队列缓冲）")
+                logger.info(f"   线程池: {self.executor._max_workers} 个工作线程")
+                logger.info(f"      └─ 处理方式: WebSocket → 线程池 → 异步处理（低延迟）")
                 
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
@@ -2715,45 +2649,23 @@ class BSCWebSocketMonitor:
             if not topic0:
                 return
             
-            # ========== 队列架构：事件入队（立即返回，不阻塞）==========
+            # ========== 直接处理模式（禁用队列，线程池直接处理）==========
             
             # 1️⃣ Fourmeme Proxy 的所有事件（内盘交易）
             if addr == self.FOURMEME_PROXY[0].lower():
-                priority = 0  # 内盘：高优先级
-                event_type = 'proxy'
+                # 直接用线程池处理（无缓冲，低延迟）
+                self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
+                return
             
             # 2️⃣ Swap 事件（外盘：PancakeSwap V2）
             elif topic0 == self.TOPIC_V2_SWAP:
-                priority = 1  # 外盘：低优先级
-                event_type = 'swap'
+                # 直接用线程池处理（无缓冲，低延迟）
+                self.executor.submit(self._run_async_in_thread, self.handle_swap_event, result)
+                return
             
             # 其他事件：忽略
             else:
                 return
-            
-            # 放入队列（非阻塞）
-            if self.event_queue:
-                try:
-                    event_data = {'type': event_type, 'result': result}
-                    # 使用序列号防止dict比较（priority相同时比较sequence而非dict）
-                    self.queue_sequence += 1
-                    self.event_queue.put_nowait((priority, self.queue_sequence, event_data))
-                    
-                    # 更新队列深度统计
-                    current_size = self.event_queue.qsize()
-                    if current_size > self.queue_current_max:
-                        self.queue_current_max = current_size
-                    
-                except asyncio.QueueFull:
-                    self.queue_overflow_count += 1
-                    if self.queue_overflow_count % 100 == 1:  # 每100次警告一次
-                        logger.warning(f"⚠️ 队列已满({self.queue_max_size})，丢弃消息（累计:{self.queue_overflow_count}）")
-            else:
-                # 降级：队列未初始化，直接用线程池（兼容旧逻辑）
-                if event_type == 'proxy':
-                    self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
-                else:
-                    self.executor.submit(self._run_async_in_thread, self.handle_swap_event, result)
         
         except Exception as e:
             logger.error(f"❌ 处理消息出错: {e}")
@@ -2951,14 +2863,11 @@ class BSCWebSocketMonitor:
         # 加载配置
         await self.load_config_from_redis()
         
-        # ========== 初始化队列架构 ==========
-        logger.info("🔄 初始化事件队列...")
-        self.event_queue = asyncio.PriorityQueue(maxsize=self.queue_max_size)
-        logger.info(f"✅ 队列已创建: 容量{self.queue_max_size}, 消费者{self.consumer_count}个")
-        
-        # 启动消费者任务
-        consumer_task = asyncio.create_task(self.start_consumers())
-        logger.info(f"✅ 消费者任务已启动")
+        # ========== 直接处理模式 ==========
+        logger.info("🚀 使用直接处理模式（无队列缓冲，线程池直接处理）")
+        logger.info(f"✅ 线程池: {self.executor._max_workers} 个工作线程")
+        logger.info(f"   架构: WebSocket → 线程池({self.executor._max_workers}线程) → 异步处理")
+        logger.info(f"   特点: 低延迟、高并发、无缓冲积压")
         
         # 注册信号处理
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -3026,23 +2935,16 @@ class BSCWebSocketMonitor:
         except KeyboardInterrupt:
             logger.info("⚠️  收到中断信号")
         finally:
+            logger.info("🛑 正在关闭监控...")
             self.should_stop = True
-            
-            # 取消消费者任务
-            if hasattr(self, 'consumer_tasks') and self.consumer_tasks:
-                logger.info("🛑 正在停止消费者...")
-                for task in self.consumer_tasks:
-                    task.cancel()
-                # 等待所有消费者停止
-                try:
-                    await asyncio.gather(*self.consumer_tasks, return_exceptions=True)
-                    logger.info("✅ 所有消费者已停止")
-                except Exception as e:
-                    logger.debug(f"停止消费者异常: {e}")
             
             # 关闭WebSocket
             if self.ws:
-                self.ws.close()
+                try:
+                    self.ws.close()
+                    logger.info("✅ WebSocket 已关闭")
+                except Exception as e:
+                    logger.debug(f"关闭 WebSocket 异常: {e}")
             
             # 关闭 HTTP Session
             if hasattr(self, 'session'):
@@ -3052,5 +2954,11 @@ class BSCWebSocketMonitor:
                 except Exception as e:
                     logger.debug(f"关闭 Session 异常: {e}")
             
-            self.executor.shutdown(wait=False)
+            # 关闭线程池（等待所有任务完成，最多30秒）
+            if hasattr(self, 'executor'):
+                logger.info("🛑 等待线程池任务完成（最多30秒）...")
+                self.executor.shutdown(wait=True)
+                logger.info("✅ 线程池已关闭")
+            
+            logger.info("✅ 监控已完全关闭")
 
