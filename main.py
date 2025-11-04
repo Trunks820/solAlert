@@ -11,7 +11,10 @@ from pathlib import Path
 # 添加src目录到Python路径
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from solalert.core.logger import setup_logger
+# ⚠️ 重要：必须先初始化日志系统，再导入其他模块
+from solalert.core.logger import init_logging
+logger = init_logging()  # 统一初始化日志配置
+
 from solalert.core.config import get_config_summary, BSC_MONITOR_CONFIG
 from solalert.core.database import test_database_connection
 from solalert.collectors.pump_listener import PumpListener
@@ -23,8 +26,14 @@ from solalert.monitor.token_monitor import TokenMonitorEngine
 from solalert.monitor.bsc_monitor import BSCMonitor
 from solalert.monitor.bsc_websocket_monitor import BSCWebSocketMonitor
 
-# 设置日志
-logger = setup_logger()
+# SOL WS监控（单独导入，避免循环导入）
+def import_sol_ws_monitor():
+    """延迟导入SOL WS监控模块"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("sol_ws_monitor", "start_sol_ws_monitor_multi.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def print_banner():
@@ -180,24 +189,33 @@ async def run_token_monitor(interval: int = 1, once: bool = False):
         await monitor.run_monitor_schedule(interval_minutes=interval)
 
 
+async def run_sol_ws():
+    """
+    运行SOL WebSocket监控任务（21个批次并发监控）
+    """
+    logger.info("🚀 启动 SOL WebSocket 监控服务")
+    
+    try:
+        # 导入并运行SOL WS监控
+        sol_ws_module = import_sol_ws_monitor()
+        await sol_ws_module.main()
+    except KeyboardInterrupt:
+        logger.info("\n⏹️  用户停止服务")
+    except Exception as e:
+        logger.error(f"❌ SOL WebSocket 监控运行失败: {e}", exc_info=True)
+        raise
+
+
 async def run_bsc_monitor():
     """
     运行BSC链监控任务（WebSocket 实时监听 + 三层过滤）
     """
     logger.info("🚀 启动 BSC WebSocket 监控服务")
     
-    # 优化第三方库日志
-    logging.getLogger('urllib3').setLevel(logging.ERROR)
-    logging.getLogger('web3').setLevel(logging.ERROR)
-    logging.getLogger('asyncio').setLevel(logging.CRITICAL)
-    logging.getLogger('httpx').setLevel(logging.ERROR)
-    logging.getLogger('httpcore').setLevel(logging.ERROR)
-    logging.getLogger('telegram').setLevel(logging.WARNING)
-    
-    # WebSocket 和 RPC 配置（Chainstack）
-    # NodeReal 端点（BSC官方合作伙伴）
-    WS_URL = "wss://bsc-mainnet.nodereal.io/ws/v1/eabfba52010f4271ad675f5dab4295a8"
-    RPC_URL = "https://bsc-mainnet.nodereal.io/v1/eabfba52010f4271ad675f5dab4295a8"
+    # WebSocket 和 RPC 配置
+    # Chainstack 端点（25 RPS限制，已配置队列+令牌桶适配）
+    WS_URL = "wss://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    RPC_URL = "https://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
     
     try:
         # 创建监控器
@@ -233,16 +251,8 @@ async def run_bsc_monitor():
 
 
 async def run_all_services():
-    """运行所有服务（数据采集器 + Token监控 + BSC WebSocket监控）"""
+    """运行所有服务（数据采集器 + Token监控 + BSC WebSocket监控 + SOL WebSocket监控）"""
     logger.info("🚀 启动所有服务...")
-    
-    # 优化第三方库日志
-    logging.getLogger('urllib3').setLevel(logging.ERROR)
-    logging.getLogger('web3').setLevel(logging.ERROR)
-    logging.getLogger('asyncio').setLevel(logging.CRITICAL)
-    logging.getLogger('httpx').setLevel(logging.ERROR)
-    logging.getLogger('httpcore').setLevel(logging.ERROR)
-    logging.getLogger('telegram').setLevel(logging.WARNING)
     
     # 创建采集器和监控实例
     pump_listener = PumpListener()
@@ -251,9 +261,9 @@ async def run_all_services():
     token_monitor = TokenMonitorEngine()
     
     # 初始化 BSC WebSocket 监控
-    # NodeReal 端点（BSC官方合作伙伴）
-    WS_URL = "wss://bsc-mainnet.nodereal.io/ws/v1/eabfba52010f4271ad675f5dab4295a8"
-    RPC_URL = "https://bsc-mainnet.nodereal.io/v1/eabfba52010f4271ad675f5dab4295a8"
+    # Chainstack 端点（25 RPS限制，已配置队列+令牌桶适配）
+    WS_URL = "wss://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    RPC_URL = "https://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
     
     bsc_monitor = BSCWebSocketMonitor(
         ws_url=WS_URL,
@@ -268,6 +278,9 @@ async def run_all_services():
     logger.info(f"   冷却期: {bsc_monitor.cooldown_minutes}分钟")
     logger.info("=" * 80)
     
+    # 导入SOL WS监控
+    sol_ws_module = import_sol_ws_monitor()
+    
     # 并发运行所有服务
     services = [
         pump_listener.start(),
@@ -275,6 +288,7 @@ async def run_all_services():
         # fourmeme_listener.start(),  # 已停用
         token_monitor.run_monitor_schedule(interval_minutes=0.5),  # 30秒间隔监控
         bsc_monitor.start(),  # BSC WebSocket 监控
+        sol_ws_module.main(),  # SOL WebSocket 监控（21批次）
     ]
     
     try:
@@ -299,7 +313,7 @@ def main():
     parser = argparse.ArgumentParser(description="solAlert - Solana Token 监控预警系统")
     parser.add_argument(
         "--module",
-        choices=["pump_listener", "bonk_collector", "twitter_push_sync", "token_monitor", "bsc_monitor", "all"],  # 移除 fourmeme_listener
+        choices=["pump_listener", "bonk_collector", "twitter_push_sync", "token_monitor", "bsc_monitor", "sol_ws", "all"],
         default="pump_listener",
         help="要启动的模块 (默认: pump_listener)"
     )
@@ -356,6 +370,9 @@ def main():
         elif args.module == "bsc_monitor":
             # BSC WebSocket 监控任务（实时监听链上事件）
             asyncio.run(run_bsc_monitor())
+        elif args.module == "sol_ws":
+            # SOL WebSocket 监控任务（21批次并发监控）
+            asyncio.run(run_sol_ws())
         elif args.module == "all":
             asyncio.run(run_all_services())
     except KeyboardInterrupt:
