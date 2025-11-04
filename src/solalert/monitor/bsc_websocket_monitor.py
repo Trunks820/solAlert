@@ -26,52 +26,12 @@ from ..api.telegram_api import TelegramAPI
 from ..api.dbotx_api import DBotXAPI
 from ..core.redis_client import get_redis
 from ..core.config import TELEGRAM_CONFIG
+from ..core.formatters import format_number
 from .trigger_logic import TriggerLogic
 from ..notifiers.alert_recorder import get_alert_recorder
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-
-class TokenBucket:
-    """
-    令牌桶限流器：平滑请求峰值，防止瞬时并发超限
-    
-    原理：
-    - 每秒补充 rate 个令牌
-    - 每次请求消耗1个令牌
-    - 令牌不足时等待
-    - 桶容量为 capacity，限制突发流量
-    """
-    def __init__(self, rate: float, capacity: int):
-        self.rate = rate  # 每秒补充令牌数
-        self.capacity = capacity  # 令牌桶容量
-        self.tokens = 0.0  # 冷启动：从0开始蓄积，避免启动时突发流量
-        self.last_update = time.time()
-        self.lock = threading.Lock()
-    
-    def acquire(self) -> float:
-        """
-        获取一个令牌
-        
-        Returns:
-            0: 成功获取令牌
-            > 0: 需要等待的秒数
-        """
-        with self.lock:
-            now = time.time()
-            # 补充令牌（根据时间流逝）
-            elapsed = now - self.last_update
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-            self.last_update = now
-            
-            # 尝试消耗1个令牌
-            if self.tokens >= 1.0:
-                self.tokens -= 1.0
-                return 0  # 成功，无需等待
-            else:
-                # 令牌不足，计算需要等待的时间
-                wait_time = (1.0 - self.tokens) / self.rate
-                return wait_time
 
 # 可选依赖：eth_abi（用于 Multicall2）
 try:
@@ -91,7 +51,8 @@ except ImportError:
     InlineKeyboardButton = None
     InlineKeyboardMarkup = None
 
-logger = logging.getLogger(__name__)
+# 使用统一的层级logger命名
+logger = logging.getLogger('solalert.monitor.bsc_ws')
 
 
 class BSCWebSocketMonitor:
@@ -125,9 +86,9 @@ class BSCWebSocketMonitor:
         self.USDT = "0x55d398326f99059ff775485246999027b3197955"
         self.WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
         self.USDC = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
+        # 只监听主Proxy（Try Buy已废弃，2025年无活动）
         self.FOURMEME_PROXY = [
-            "0x5c952063c7fc8610ffdb798152d69f0b9550762b".lower(),  # 主Proxy
-            "0x8e06ab256ca534ebba05d700f8e40341ec39e0d6".lower()   # Try Buy
+            "0x5c952063c7fc8610ffdb798152d69f0b9550762b".lower()  # 主Proxy
         ]
         self.TOPIC_V2_SWAP = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
         
@@ -185,16 +146,22 @@ class BSCWebSocketMonitor:
         self.message_count = 0  # 消息计数器
         self.cache_hit_count = 0  # 非fourmeme缓存命中计数
         
-        # 线程池（降低并发度，配合令牌桶平滑流量）
-        self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="BSC-WS-Worker")
-        self.thread_local = threading.local()
+        # ========== 队列架构（主流控）==========
+        # 消息队列：WebSocket → Queue → Consumer → RPC
+        # 优先级：0=内盘（立即处理），1=外盘（可延迟）
+        self.event_queue = None  # 在start()中初始化（需要asyncio事件循环）
+        self.queue_max_size = 1000  # 队列容量
+        self.queue_overflow_count = 0  # 队列溢出计数
+        self.queue_current_max = 0  # 队列历史最大深度
+        self.queue_sequence = 0  # 序列号（防止dict比较错误）
         
-        # 令牌桶限流器（全局流量控制，防止瞬时峰值）
-        # OPTIMIZED: 提高速率和容量，适配NodeReal高延迟（避免不必要的等待）
-        # rate=300: 高速率应对NodeReal慢响应（200-500ms latency需要更多并发）
-        # capacity=100: 允许突发流量（Swap事件密集时不阻塞）
-        # 初始tokens=0: 从空桶开始，逐步蓄积，抹平启动时的峰值
-        self.token_bucket = TokenBucket(rate=200.0, capacity=50)
+        # 消费者数量（控制并发）
+        self.consumer_count = 3  # 3个消费者，稳定在6-15 RPS
+        self.consumer_tasks = []  # 消费者任务列表
+        
+        # 线程池（仅用于在同步WebSocket回调中提交异步任务）
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="BSC-WS-Bridge")
+        self.thread_local = threading.local()
         
         # 交易去重（使用 tx_hash:logIndex 组合键，支持多日志处理）
         self.seen_txs = OrderedDict()
@@ -208,7 +175,7 @@ class BSCWebSocketMonitor:
 
         
         self.session = requests.Session()
-        # 配置连接池和重试策略（降低并发，配合令牌桶和线程池）
+        # 配置连接池和重试策略（降低并发）
         retry_strategy = Retry(
             total=3,
             backoff_factor=0.3,
@@ -230,9 +197,7 @@ class BSCWebSocketMonitor:
         # 速率限制（防止429限流）
         self.rate_limit_lock = threading.Lock()
         self.last_rpc_time = 0
-        # min_rpc_interval 已降低到最小值，主要流控交给令牌桶
-        # 此值仅作为备用保护层，基本不起作用
-        self.min_rpc_interval = 0.001  # 1ms 象征性间隔，主流控靠令牌桶
+        self.min_rpc_interval = 0.001  # 1ms 象征性间隔，Chainstack无限制
         self.rate_limit_429_count = 0  # 429错误计数
         self.rate_limit_backoff_until = 0  # 退避截止时间（秒）
         self.rate_limit_consecutive_429 = 0  # 连续429次数
@@ -613,21 +578,15 @@ class BSCWebSocketMonitor:
     
     def rpc_call(self, method: str, params: list):
         """
-        发送 HTTP RPC 请求（带令牌桶 + 429处理 + 慢调用监控）
+        发送 HTTP RPC 请求（带429处理 + 慢调用监控）
         
         优化：
-        1. 令牌桶（主流控）：全局流量控制（100 req/s，容量20），冷启动避免突发
-        2. 最小间隔（备用）：象征性1ms间隔，主要流控交给令牌桶
-        3. 429检测：检测限流错误并指数退避
-        4. 退避机制：连续429时延长退避时间（最高120s）
-        5. 统计监控：记录429次数和慢调用
+        1. 最小间隔：象征性1ms间隔（Chainstack无限制）
+        2. 429检测：检测限流错误并指数退避
+        3. 退避机制：连续429时延长退避时间（最高16s）
+        4. 统计监控：记录429次数和慢调用
         """
         self.rpc_id += 1
-        
-        # === 阶段0: 令牌桶限流（全局流量控制）===
-        wait_time = self.token_bucket.acquire()
-        if wait_time > 0:
-            time.sleep(wait_time)
         
         # === 阶段1: 速率限制（防止429） ===
         with self.rate_limit_lock:
@@ -1204,17 +1163,6 @@ class BSCWebSocketMonitor:
         else:
             return f"{value:.8f}"
     
-    def format_number(self, value: float) -> str:
-        """格式化数字（K/M/B）"""
-        if value >= 1_000_000_000:
-            return f"{value/1_000_000_000:.2f}B"
-        elif value >= 1_000_000:
-            return f"{value/1_000_000:.2f}M"
-        elif value >= 1_000:
-            return f"{value/1_000:.2f}K"
-        else:
-            return f"{value:.2f}"
-    
     def first_layer_filter(self, usd_value: float, is_internal: bool) -> bool:
         """第一层过滤：金额"""
         threshold = self.min_amount_internal if is_internal else self.min_amount_external
@@ -1569,15 +1517,39 @@ class BSCWebSocketMonitor:
             await self._handle_swap_with_receipt_fallback(tx_hash, pair_address)
             return
         
-        # 🚀 优先路径：尝试使用 DBotX API 获取交易对信息
-        dbotx_api = DBotXAPI()
-        pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
-        
+        # 🚀 优先路径：尝试使用 DBotX API 获取交易对信息（复用连接池）
         mint = None
         base_mint = None
         base_symbol = None
         token_symbol = None
         use_api_data = False  # 标记是否使用 API 完整数据
+        pair_info_raw = None
+        
+        # 🚀 优化：检查"无数据pair"缓存
+        no_data_key = f"no_data_pair:{pair_address}"
+        skip_api = False  # 标记是否跳过API调用
+        
+        if self.redis_client:
+            try:
+                if self.redis_client.get(no_data_key):
+                    skip_api = True
+                    logger.debug(f"⏭️  [缓存命中] pair无API数据，跳过API直接走RPC: {pair_address[:10]}...")
+            except Exception as e:
+                logger.debug(f"Redis查询失败: {e}")
+        
+        # 如果缓存未命中，尝试API
+        if not skip_api:
+            dbotx_api = self.get_thread_dbotx_api()
+            pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
+            
+            # 🔍 调试：打印API返回的完整字段（仅打印前3个，避免刷屏）
+            if pair_info_raw is not None and hasattr(self, '_api_debug_count'):
+                if self._api_debug_count < 3:
+                    logger.info(f"🔍 [调试] API返回字段: {list(pair_info_raw.keys())[:20]}")
+                    self._api_debug_count += 1
+            elif pair_info_raw is not None and not hasattr(self, '_api_debug_count'):
+                self._api_debug_count = 1
+                logger.info(f"🔍 [调试] API返回的所有字段名: {list(pair_info_raw.keys())}")
         
         # 检查 API 返回（可能是 None、空字典 {}、或有数据的字典）
         if pair_info_raw is not None:  # 排除 None
@@ -1590,28 +1562,43 @@ class BSCWebSocketMonitor:
             # 注意：空字典 {} 会进入这个分支，但 mint/base_mint 会是空字符串
             if mint and base_mint:  # 两者都非空才使用 API 数据
                 use_api_data = True
-                logger.debug(f"✅ API 数据完整: {pair_address[:10]}... (mint={mint[:10]}, base={base_mint[:10]})")
+                logger.info(f"⚡ [快速路径] API数据完整: {pair_address[:10]}... (mint={mint[:10]}, base={base_mint[:10]})")
             else:
-                logger.info(f"⚠️  API 数据不完整（空字典或缺少字段），准备降级到 RPC: {pair_address[:10]}...")
+                logger.info(f"🔄 [降级] API数据不完整（空字典或缺字段）: {pair_address[:10]}... → 使用RPC")
+                # 🚀 缓存无数据pair（1小时），避免重复RPC查询
+                if self.redis_client:
+                    try:
+                        self.redis_client.set(no_data_key, "1", ex=3600)
+                        logger.debug(f"✅ 已缓存无数据pair: {pair_address[:10]}...")
+                    except Exception as e:
+                        logger.debug(f"Redis写入失败: {e}")
         else:
-            logger.info(f"⚠️  API 返回 None，准备降级到 RPC: {pair_address[:10]}...")
+            logger.info(f"🔄 [降级] API返回None: {pair_address[:10]}... → 使用RPC")
+            # 🚀 缓存无数据pair（1小时）
+            if self.redis_client:
+                try:
+                    self.redis_client.set(no_data_key, "1", ex=3600)
+                    logger.debug(f"✅ 已缓存无数据pair: {pair_address[:10]}...")
+                except Exception as e:
+                    logger.debug(f"Redis写入失败: {e}")
         
         # 🔄 降级路径：API 失败或数据不完整，使用 RPC 获取 token0/token1
+        pair_info_rpc = None  # RPC获取的pair信息
         if not use_api_data:
-            logger.info(f"🔄 [降级] 使用 RPC 获取 token0/token1: {pair_address[:10]}...")
             
             # 使用原来的 RPC 方式
-            pair_info = self.get_pair_full_info(pair_address)
-            if not pair_info:
+            pair_info_rpc = self.get_pair_full_info(pair_address)
+            if not pair_info_rpc:
                 logger.debug(f"⏭️  RPC 也失败，跳过: {pair_address[:10]}...")
-                return
-            
-            mint = pair_info['token0'].lower()  # 根据测试，token0 = mint
-            base_mint = pair_info['token1'].lower()  # token1 = baseMint
-            token_symbol = pair_info.get('symbol0', '???')
-            base_symbol = pair_info.get('symbol1', '???')
+            return
+        
+            mint = pair_info_rpc['token0'].lower()  # 根据测试，token0 = mint
+            base_mint = pair_info_rpc['token1'].lower()  # token1 = baseMint
+            token_symbol = pair_info_rpc.get('symbol0', '???')
+            base_symbol = pair_info_rpc.get('symbol1', '???')
             
             # 标记为降级模式（后续需要调用 second_layer_filter）
+            # 注意：保持 pair_info_raw = None 用于判断，但后续使用 pair_info_rpc 获取数据
             pair_info_raw = None
         
         # 快速过滤：检查基础货币是否是我们关注的稳定币
@@ -1631,7 +1618,13 @@ class BSCWebSocketMonitor:
         quote_amount = 0
         base_amount = 0
         quote_decimals = 18  # 稳定币精度默认18
-        base_decimals = pair_info_raw.get('decimals', 18)  # 主代币精度
+        # 🔧 修复：RPC路径下从 pair_info_rpc 获取精度，API路径从 pair_info_raw 获取
+        if pair_info_raw:
+            base_decimals = pair_info_raw.get('decimals', 18)  # API路径
+        elif pair_info_rpc:
+            base_decimals = pair_info_rpc.get('decimals0', 18)  # RPC路径
+        else:
+            base_decimals = 18  # 兜底
         quote_symbol = base_symbol
         base_symbol = token_symbol
         
@@ -1736,7 +1729,7 @@ class BSCWebSocketMonitor:
             # ============================================
             # 快速路径：直接使用 API 返回的数据进行第二层判断
             # ============================================
-            logger.debug(f"⚡ [快速路径] 使用 API 数据进行第二层判断")
+            logger.info(f"⚡ [快速路径] 使用API数据进行第二层检查: {base_token[:10]}...")
             
             token_price_usd = pair_info_raw.get('tokenPriceUsd', 0)
             market_cap = pair_info_raw.get('marketCap', 0)
@@ -1825,25 +1818,32 @@ class BSCWebSocketMonitor:
             }
         else:
             # ============================================
-            # 降级路径：使用 second_layer_filter（再次调用 API）
+            # 降级路径：如果 no_data_pair 已缓存，避免再次调用 API
             # ============================================
-            logger.info(f"🔄 [降级路径] 调用 second_layer_filter")
-            
-            # 构造 launchpad_info（兼容 second_layer_filter）
-            launchpad_info = {
-                'launchpad': 'fourmeme',
-                'launchpad_status': 1,  # 外盘
-                'pair_address': pair_address
-            }
-            
-            # 调用统一的第二层过滤
-            token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
-            
-            if not token_data:
-                logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
+            if skip_api:
+                # 缓存命中：pair 无API数据，跳过 second_layer_filter（避免再次调用API）
+                # 直接返回，不发送告警（因为无法获取准确指标）
+                logger.info(f"⏭️  [彻底跳过] pair已缓存为无数据，RPC也无法提供完整指标: {base_token[:10]}...")
                 return
-            
-            logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
+            else:
+                # 缓存未命中：正常调用 second_layer_filter（会调用一次API）
+                logger.info(f"🔄 [降级路径] 调用second_layer_filter获取指标: {base_token[:10]}...")
+                
+                # 构造 launchpad_info（兼容 second_layer_filter）
+                launchpad_info = {
+                    'launchpad': 'fourmeme',
+                    'launchpad_status': 1,  # 外盘
+                    'pair_address': pair_address
+                }
+                
+                # 调用统一的第二层过滤
+                token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
+                
+                if not token_data:
+                    logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
+                    return
+                
+                logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
         
         # 🔒 关键：检查冷却期（只读，不设置）
         # 避免为已在冷却期的代币构建消息
@@ -1869,8 +1869,8 @@ class BSCWebSocketMonitor:
         # 获取时间间隔（用于日志显示）
         time_interval = self.time_interval_internal if is_internal else self.time_interval_external
         
-        volume_str = self.format_number(volume)
-        market_cap_str = self.format_number(market_cap)
+        volume_str = format_number(volume)
+        market_cap_str = format_number(market_cap)
         
         price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
         
@@ -1989,12 +1989,139 @@ class BSCWebSocketMonitor:
         """处理 Fourmeme Proxy 事件（内盘）"""
         tx_hash = log.get("transactionHash")
         addr = log.get("address", "").lower()
+        topics = log.get("topics", [])
         
         proxy_type = "主Proxy" if addr == self.FOURMEME_PROXY[0] else "Try Buy"
         
         try:
             dbotx_api = self.get_thread_dbotx_api()
             
+            # ========== 快速路径：Custom Events（TokenPurchase/Sale）==========
+            if topics and topics[0] in self.FOURMEME_CUSTOM_EVENTS:
+                try:
+                    # TokenPurchase/Sale 事件格式：
+                    # event TokenPurchase(address indexed token, address indexed buyer, uint256 cost, uint256 amount)
+                    # topics[0]: event signature
+                    # topics[1]: token address (indexed)
+                    # topics[2]: buyer address (indexed)  
+                    # data: cost (uint256) + amount (uint256)
+                    
+                    if len(topics) < 3:
+                        logger.debug(f"⚠️ Custom Event topics不足: {len(topics)}")
+                        # 继续走兜底逻辑
+                    else:
+                        target_token = ("0x" + topics[1][-40:]).lower()
+                        buyer = ("0x" + topics[2][-40:]).lower()
+                        
+                        # 解码 data
+                        # TokenPurchase事件完整格式：8个非索引参数
+                        # (address indexed token, address indexed buyer, 
+                        #  address payToken, uint256 payAmount, uint256 getAmount, 
+                        #  uint256 curvePrice, uint256 protocolFee, uint256 subjectFee, 
+                        #  uint256 referralFee, uint256 supply)
+                        data = log.get("data", "0x")
+                        if data and len(data) >= 66:
+                            try:
+                                # 使用eth_abi解码（如果可用）
+                                if HAS_ETH_ABI:
+                                    try:
+                                        decoded = eth_abi_decode(['address', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256'], bytes.fromhex(data[2:]))
+                                        pay_token = decoded[0]  # 支付代币地址
+                                        cost = decoded[1]  # 支付金额
+                                        amount = decoded[2]  # 获得代币数量
+                                    except:
+                                        # Fallback: 手动解析前2个uint256
+                                        cost = int(data[2:66], 16) if len(data) >= 66 else 0
+                                        amount = int(data[66:130], 16) if len(data) >= 130 else 0
+                                else:
+                                    # Fallback: 手动解析
+                                    # 跳过第一个address(32字节)，取第2、3个uint256
+                                    cost = int(data[66:130], 16) if len(data) >= 130 else 0
+                                    amount = int(data[130:194], 16) if len(data) >= 194 else 0
+                                
+                                if cost > 0:
+                                    logger.info(f"⚡ [内盘快速] Custom Event: {tx_hash[:10]}...")
+                                    logger.info(f"   Token: {target_token[:10]}... | Buyer: {buyer[:10]}...")
+                                    logger.info(f"   Cost: {cost} (raw) | Amount: {amount} (raw)")
+                                    
+                                    # 直接处理（跳过 receipt！）
+                                    # 假设 cost 是 USDT（18 decimals），如果是 WBNB 需要进一步判断
+                                    quote_token = self.USDT  # 默认 USDT，可以根据实际情况调整
+                                    quote_amount = cost
+                                    quote_symbol = "USDT"
+                                    target_amount = amount
+                                    
+                                    # 获取 token symbol 和 decimals
+                                    target_symbol = self.get_token_symbol(target_token)
+                                    quote_decimals = self.get_decimals(quote_token)
+                                    target_decimals = self.get_decimals(target_token)
+                                    
+                                    # 计算 USD 价值（cost 就是支付的 USDT）
+                                    quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
+                                    usd_value = float(quote_value)  # USDT ≈ $1
+                                    
+                                    # 第一层过滤：金额检查
+                                    if not self.first_layer_filter(usd_value, is_internal=True):
+                                        logger.debug(f"⏭️  [内盘快速] 金额不足: {target_symbol} (${usd_value:.2f})")
+                                        return
+                                    
+                                    logger.info(f"✅ [内盘快速] {target_symbol} 买入 ${usd_value:.2f}")
+                                    
+                                    # 冷却期检查（只读）
+                                    if not await self.check_alert_cooldown_readonly(target_token):
+                                        logger.info(f"⏳ [内盘快速] 冷却期内，跳过: {target_token[:10]}...")
+                                        return
+                                    
+                                    # 获取 launchpad 信息（轻量 API 调用）
+                                    launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
+                                    if not launchpad_info:
+                                        # Fallback：构造基础信息
+                                        launchpad_info = {
+                                            'launchpad': 'fourmeme',
+                                            'pair_address': None
+                                        }
+                                    
+                                    pair_address = launchpad_info.get('pair_address')
+                                    if not pair_address:
+                                        logger.debug(f"⚠️ [内盘快速] 无pair地址: {target_token[:10]}...")
+                                        return
+                                    
+                                    # 第二层过滤（获取市值等）
+                                    token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True)
+                                    if not token_data:
+                                        logger.debug(f"⏭️  [内盘快速] 未通过第二层过滤: {target_token[:10]}...")
+                                        return
+                                    
+                                    # 设置冷却期（原子操作）
+                                    if not await self.check_and_set_alert_cooldown(target_token):
+                                        logger.info(f"⏳ [内盘快速] 冷却期内（竞态），跳过: {target_token[:10]}...")
+                                        return
+                                    
+                                    # 构建并发送告警
+                                    await self._send_internal_alert(
+                                        tx_hash=tx_hash,
+                                        target_token=target_token,
+                                        target_symbol=target_symbol,
+                                        target_amount=target_amount,
+                                        target_decimals=target_decimals,
+                                        quote_symbol=quote_symbol,
+                                        quote_amount=quote_amount,
+                                        quote_decimals=quote_decimals,
+                                        usd_value=usd_value,
+                                        token_data=token_data,
+                                        proxy_type=proxy_type
+                                    )
+                                    
+                                    logger.info(f"📤 [内盘快速] 告警已发送: {target_symbol} ${usd_value:.2f}")
+                                    return  # ⚡ 快速返回，不走 receipt 逻辑
+                            except Exception as e:
+                                logger.debug(f"Custom Event 解码失败: {e}")
+                                # 继续走兜底逻辑
+                except Exception as e:
+                    logger.debug(f"Custom Event 快速路径失败: {e}")
+                    # 继续走兜底逻辑
+            
+            # ========== 兜底路径：从 Receipt 解析 Transfer ==========
             # 获取交易回执（使用缓存）
             receipt, tx_info = self.get_receipt_cached(tx_hash)
             if not receipt:
@@ -2167,8 +2294,8 @@ class BSCWebSocketMonitor:
             # 获取时间间隔（用于日志显示）
             time_interval = self.time_interval_internal if is_internal else self.time_interval_external
             
-            volume_str = self.format_number(volume)
-            market_cap_str = self.format_number(market_cap)
+            volume_str = format_number(volume)
+            market_cap_str = format_number(market_cap)
             
             price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
             
@@ -2259,6 +2386,154 @@ class BSCWebSocketMonitor:
         except Exception as e:
             logger.error(f"❌ 处理内盘交易出错: {e}")
     
+    async def _send_internal_alert(
+        self,
+        tx_hash: str,
+        target_token: str,
+        target_symbol: str,
+        target_amount: int,
+        target_decimals: int,
+        quote_symbol: str,
+        quote_amount: int,
+        quote_decimals: int,
+        usd_value: float,
+        token_data: dict,
+        proxy_type: str
+    ):
+        """发送内盘告警（供快速路径和兜底路径共用）"""
+        try:
+            # 格式化金额
+            quote_formatted = self.format_amount(quote_amount, quote_decimals)
+            target_formatted = self.format_amount(target_amount, target_decimals)
+            
+            # 提取 token_data
+            pool_emoji = token_data['pool_emoji']
+            pool_type = token_data['pool_type']
+            is_internal = token_data.get('is_internal', True)
+            symbol = token_data.get('symbol', target_symbol)
+            price_change = token_data.get('price_change', 0)
+            volume = token_data.get('volume', 0)
+            market_cap = token_data.get('market_cap', 0)
+            price = token_data.get('price', 0)
+            
+            # 格式化数字（使用已导入的format_number）
+            volume_str = format_number(volume)
+            market_cap_str = format_number(market_cap)
+            price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
+            
+            # 获取时间间隔
+            time_interval = self.time_interval_internal if is_internal else self.time_interval_external
+            
+            # 构建告警原因
+            triggered_events = token_data.get('triggered_events', [])
+            alert_reasons = []
+            for event in triggered_events:
+                if hasattr(event, 'description'):
+                    alert_reasons.append(event.description)
+                elif isinstance(event, dict):
+                    if event.get('event') == 'priceChange':
+                        alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
+                    elif event.get('event') == 'volume':
+                        alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
+            
+            if not alert_reasons:
+                alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
+            
+            # 构建消息
+            message = f"""<b>{pool_emoji} BSC 信号</b>
+
+💰 代币: {symbol}
+📝 名称: {symbol}
+🔗 合约: <code>{target_token}</code>
+
+📊 <b>实时数据</b>
+💵 当前价格: {price_str}
+💎 市值: ${market_cap_str}
+🏊 状态: {pool_emoji} {pool_type}
+
+📉 <b>交易数据</b>
+💰 本次买入: {quote_formatted} {quote_symbol} (≈${usd_value:.2f})
+📊 {time_interval}交易量: ${volume_str}
+📈 {time_interval}涨跌幅: {price_change:+.2f}%
+
+🔔 <b>触发原因</b>
+{chr(10).join(alert_reasons)}
+"""
+            
+            # 使用现有方法发送（会自动创建GMGN+Axiom按钮）
+            send_success = await self.send_alert(message, target_token)
+            
+            # 记录到数据库（使用现有recorder）
+            if hasattr(self, 'alert_recorder') and self.alert_recorder:
+                try:
+                    await self.alert_recorder.write_bsc_alert(
+                        token=target_token,
+                        symbol=symbol,
+                        tx_hash=tx_hash,
+                        pool_type=pool_type,
+                        price_change=price_change,
+                        volume=volume,
+                        market_cap=market_cap,
+                        amount=usd_value,
+                        alert_reason=", ".join(alert_reasons),
+                        notify_error=None if send_success else "Telegram发送失败"
+                    )
+                except Exception as e:
+                    logger.debug(f"记录告警到数据库失败: {e}")
+            
+            logger.info(f"✅ [内盘] 告警已发送: {symbol} ${usd_value:.2f}")
+            
+        except Exception as e:
+            logger.error(f"❌ 发送内盘告警失败: {e}")
+    
+    async def _event_consumer(self, worker_id: int):
+        """
+        事件消费者（从队列取事件并处理）
+        
+        架构：Queue → Consumer (3并发) → RPC (Chainstack无限制)
+        """
+        logger.info(f"🔄 消费者#{worker_id} 已启动")
+        
+        while not self.should_stop:
+            try:
+                # 从队列取事件（带超时，避免阻塞停止信号）
+                priority, sequence, event_data = await asyncio.wait_for(
+                    self.event_queue.get(),
+                    timeout=1.0
+                )
+                
+                event_type = event_data['type']
+                result = event_data['result']
+                
+                # ========== 处理事件 ==========
+                if event_type == 'proxy':
+                    await self.handle_proxy_event(result)
+                elif event_type == 'swap':
+                    await self.handle_swap_event(result)
+                
+                self.event_queue.task_done()
+                
+            except asyncio.TimeoutError:
+                # 队列为空，继续等待
+                continue
+            except Exception as e:
+                logger.error(f"❌ 消费者#{worker_id} 处理错误: {e}")
+                logger.debug(f"错误堆栈: {traceback.format_exc()}")
+        
+        logger.info(f"🛑 消费者#{worker_id} 已停止")
+    
+    async def start_consumers(self):
+        """启动所有消费者任务"""
+        logger.info(f"🚀 启动 {self.consumer_count} 个消费者...")
+        
+        self.consumer_tasks = [
+            asyncio.create_task(self._event_consumer(i))
+            for i in range(self.consumer_count)
+        ]
+        
+        # 等待所有消费者完成（或被取消）
+        await asyncio.gather(*self.consumer_tasks, return_exceptions=True)
+    
     def health_check_loop(self):
         """健康检查循环（每分钟输出一次状态）"""
         while not self.should_stop:
@@ -2332,6 +2607,21 @@ class BSCWebSocketMonitor:
                         logger.info(f"      └─ ⚠️ 429限流: {self.rate_limit_429_count} 次 ({rate_429:.2f}%, 连续{self.rate_limit_consecutive_429}次)")
                     else:
                         logger.info(f"      └─ ✅ 无429限流")
+                
+                # 队列统计（事件缓冲监控）
+                if self.event_queue:
+                    try:
+                        queue_size = self.event_queue.qsize()
+                        queue_usage = (queue_size / self.queue_max_size * 100) if self.queue_max_size > 0 else 0
+                        logger.info(f"   事件队列: {queue_size}/{self.queue_max_size} ({queue_usage:.1f}%)")
+                        logger.info(f"      ├─ 历史峰值: {self.queue_current_max}")
+                        logger.info(f"      ├─ 消费者: {self.consumer_count} 个")
+                        if self.queue_overflow_count > 0:
+                            logger.warning(f"      └─ ⚠️ 溢出丢弃: {self.queue_overflow_count} 条")
+                        else:
+                            logger.info(f"      └─ ✅ 无溢出")
+                    except Exception as e:
+                        logger.debug(f"队列统计失败: {e}")
                 
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
@@ -2425,30 +2715,45 @@ class BSCWebSocketMonitor:
             if not topic0:
                 return
             
-            # Fourmeme 自定义事件（内盘，含内部调用）
-            if topic0 in self.FOURMEME_CUSTOM_EVENTS:
-                self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
+            # ========== 队列架构：事件入队（立即返回，不阻塞）==========
             
-            # Swap 事件（外盘）
+            # 1️⃣ Fourmeme Proxy 的所有事件（内盘交易）
+            if addr == self.FOURMEME_PROXY[0].lower():
+                priority = 0  # 内盘：高优先级
+                event_type = 'proxy'
+            
+            # 2️⃣ Swap 事件（外盘：PancakeSwap V2）
             elif topic0 == self.TOPIC_V2_SWAP:
-                self.executor.submit(self._run_async_in_thread, self.handle_swap_event, result)
+                priority = 1  # 外盘：低优先级
+                event_type = 'swap'
             
-            # Proxy 事件（内盘，直接调用）
-            elif addr in self.FOURMEME_PROXY:
-                self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
+            # 其他事件：忽略
+            else:
+                return
             
-            # Transfer 兜底（防止fourmeme升级/换topic）
-            elif topic0 == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef":
-                # Transfer事件格式: Transfer(address indexed from, address indexed to, uint256 value)
-                # topics[1] = from (padded), topics[2] = to (padded)
-                if len(topics) >= 3:
-                    # 提取from和to地址（去掉padding的0）
-                    from_addr = ("0x" + topics[1][-40:]).lower() if len(topics[1]) >= 40 else ""
-                    to_addr = ("0x" + topics[2][-40:]).lower() if len(topics[2]) >= 40 else ""
+            # 放入队列（非阻塞）
+            if self.event_queue:
+                try:
+                    event_data = {'type': event_type, 'result': result}
+                    # 使用序列号防止dict比较（priority相同时比较sequence而非dict）
+                    self.queue_sequence += 1
+                    self.event_queue.put_nowait((priority, self.queue_sequence, event_data))
                     
-                    # 检查from或to是否是Proxy地址
-                    if from_addr in self.FOURMEME_PROXY or to_addr in self.FOURMEME_PROXY:
-                        self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
+                    # 更新队列深度统计
+                    current_size = self.event_queue.qsize()
+                    if current_size > self.queue_current_max:
+                        self.queue_current_max = current_size
+                    
+                except asyncio.QueueFull:
+                    self.queue_overflow_count += 1
+                    if self.queue_overflow_count % 100 == 1:  # 每100次警告一次
+                        logger.warning(f"⚠️ 队列已满({self.queue_max_size})，丢弃消息（累计:{self.queue_overflow_count}）")
+            else:
+                # 降级：队列未初始化，直接用线程池（兼容旧逻辑）
+                if event_type == 'proxy':
+                    self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
+                else:
+                    self.executor.submit(self._run_async_in_thread, self.handle_swap_event, result)
         
         except Exception as e:
             logger.error(f"❌ 处理消息出错: {e}")
@@ -2471,40 +2776,36 @@ class BSCWebSocketMonitor:
         
         self.reconnect_count += 1
         
-        # 订阅 Proxy 事件
-        for idx, proxy_addr in enumerate(self.FOURMEME_PROXY, start=1):
-            ws.send(json.dumps({
-                "jsonrpc": "2.0",
-                "id": idx,
-                "method": "eth_subscribe",
-                "params": ["logs", {"address": proxy_addr}]
-            }))
-            logger.info(f"✓ 订阅 Proxy #{idx}: {proxy_addr}")
+        # ========== 优化后的订阅策略 ==========
         
-        # 订阅 Swap 事件
-        swap_id = len(self.FOURMEME_PROXY) + 1
+        # 1️⃣ 订阅 Fourmeme Proxy 的所有事件（捕获内盘交易）
+        # 注意：Transfer事件是Token合约发出的，不是Proxy发出的
+        # 所以需要订阅Proxy的所有事件，然后在handle_proxy_event中过滤
         ws.send(json.dumps({
             "jsonrpc": "2.0",
-            "id": swap_id,
+            "id": 1,
+            "method": "eth_subscribe",
+            "params": ["logs", {
+                "address": [self.FOURMEME_PROXY[0]]  # 只订阅主Proxy（TryBuy已废弃）
+                # 不限制topics - 捕获所有事件（TokenPurchase/TokenSale等）
+            }]
+        }))
+        logger.info(f"✓ 订阅 Fourmeme Proxy 所有事件（内盘）")
+        logger.info(f"  监听地址: {self.FOURMEME_PROXY[0][:10]}...")
+        logger.info(f"  捕获: TokenPurchase/TokenSale/Custom Events")
+        
+        # 2️⃣ 订阅 PancakeSwap V2 Swap 事件（外盘交易）
+        ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": 2,
             "method": "eth_subscribe",
             "params": ["logs", {"topics": [self.TOPIC_V2_SWAP]}]
         }))
-        logger.info(f"✓ 订阅 PancakeV2 Swap")
+        logger.info(f"✓ 订阅 PancakeV2 Swap 事件（外盘）")
         
-        # 订阅 Fourmeme 自定义事件（捕获内部调用）
-        custom_event_id = swap_id + 1
-        ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "id": custom_event_id,
-            "method": "eth_subscribe",
-            "params": ["logs", {
-                "address": self.FOURMEME_PROXY,
-                "topics": [self.FOURMEME_CUSTOM_EVENTS]
-            }]
-        }))
-        logger.info(f"✓ 订阅 Fourmeme 自定义事件（含内部调用）")
-        
-        logger.info("✅ 已订阅事件监听")
+        logger.info("✅ 订阅完成")
+        logger.info(f"   内盘: Proxy所有事件 (TokenPurchase/Sale等) → {self.FOURMEME_PROXY[0][:10]}...")
+        logger.info(f"   外盘: 全链Swap事件 → PancakeSwap V2")
         logger.info(f"📱 Telegram 频道: {self.bsc_channel_id}")
         logger.info(f"⏳ 等待链上交易...")
     
@@ -2650,6 +2951,15 @@ class BSCWebSocketMonitor:
         # 加载配置
         await self.load_config_from_redis()
         
+        # ========== 初始化队列架构 ==========
+        logger.info("🔄 初始化事件队列...")
+        self.event_queue = asyncio.PriorityQueue(maxsize=self.queue_max_size)
+        logger.info(f"✅ 队列已创建: 容量{self.queue_max_size}, 消费者{self.consumer_count}个")
+        
+        # 启动消费者任务
+        consumer_task = asyncio.create_task(self.start_consumers())
+        logger.info(f"✅ 消费者任务已启动")
+        
         # 注册信号处理
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -2717,6 +3027,20 @@ class BSCWebSocketMonitor:
             logger.info("⚠️  收到中断信号")
         finally:
             self.should_stop = True
+            
+            # 取消消费者任务
+            if hasattr(self, 'consumer_tasks') and self.consumer_tasks:
+                logger.info("🛑 正在停止消费者...")
+                for task in self.consumer_tasks:
+                    task.cancel()
+                # 等待所有消费者停止
+                try:
+                    await asyncio.gather(*self.consumer_tasks, return_exceptions=True)
+                    logger.info("✅ 所有消费者已停止")
+                except Exception as e:
+                    logger.debug(f"停止消费者异常: {e}")
+            
+            # 关闭WebSocket
             if self.ws:
                 self.ws.close()
             

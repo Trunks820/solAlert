@@ -33,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 async def main():
     """主函数"""
-    # WebSocket 和 RPC 配置（Chainstack）
-    # NodeReal 端点（BSC官方合作伙伴，替代 Chainstack）
-    WS_URL = "wss://bsc-mainnet.nodereal.io/ws/v1/eabfba52010f4271ad675f5dab4295a8"
-    RPC_URL = "https://bsc-mainnet.nodereal.io/v1/eabfba52010f4271ad675f5dab4295a8"
+    # WebSocket 和 RPC 配置
+    # Chainstack 端点（25 RPS限制，已配置队列+令牌桶适配）
+    WS_URL = "wss://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
+    RPC_URL = "https://bsc-mainnet.core.chainstack.com/f8232bc60aa7c6a22d5803ab5f15200e"
     
 
     logger.info("="*80)
