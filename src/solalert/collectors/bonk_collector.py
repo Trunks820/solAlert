@@ -13,7 +13,8 @@ from urllib3.util.retry import Retry
 from .base import BaseCollector
 from ..repositories.token_repo import TokenRepository
 
-logger = logging.getLogger(__name__)
+# 使用统一的层级logger命名
+logger = logging.getLogger('solalert.collectors.bonk')
 
 
 class BonkCollector(BaseCollector):

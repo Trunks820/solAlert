@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
 
 from ..core.config import GMGN_COOKIE_CONFIG, HTTP_PROXY_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.api.gmgn_api')
 
 
 class GmgnAPI:

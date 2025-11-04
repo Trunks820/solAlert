@@ -10,7 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..core.config import TELEGRAM_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.api.telegram_api')
 
 
 class TelegramAPI:

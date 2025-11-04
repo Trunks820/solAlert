@@ -22,34 +22,18 @@ from datetime import datetime
 from ..collectors.bsc_collector import BSCBlockCollector
 from ..core.redis_client import get_redis
 from ..core.database import get_db
+from ..core.formatters import format_number
 from ..notifiers.alert_recorder import get_alert_recorder
 from ..notifiers.manager import get_notification_manager
 from ..api.dbotx_api import DBotXAPI
 from .trigger_logic import TriggerLogic
 
-logger = logging.getLogger(__name__)
+# 使用统一的层级logger命名
+logger = logging.getLogger('solalert.monitor.bsc_block')
 
 
 class BSCMonitor:
     """BSC 链上交易监控器"""
-    
-    @staticmethod
-    def format_number(value: float) -> str:
-        """
-        格式化数字，自动添加 K/M 后缀
-        
-        Args:
-            value: 数值
-            
-        Returns:
-            格式化后的字符串
-        """
-        if value >= 1_000_000:
-            return f"{value / 1_000_000:.2f}M"
-        elif value >= 1_000:
-            return f"{value / 1_000:.2f}K"
-        else:
-            return f"{value:.0f}"
     
     def __init__(self, config: Dict):
         """
@@ -914,9 +898,9 @@ class BSCMonitor:
             pool_status = "🟢 已迁移外盘"
         
         # 格式化数字（使用 K/M 后缀）
-        single_max_str = self.format_number(single_max)
-        total_sum_str = self.format_number(total_sum)
-        market_cap_str = self.format_number(market_cap)
+        single_max_str = format_number(single_max)
+        total_sum_str = format_number(total_sum)
+        market_cap_str = format_number(market_cap)
         
         message = f"""<b>🟢 BSC 链上信号 (Fourmeme)</b>
 

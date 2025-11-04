@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any
 
 from ..core.database import get_db
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.repositories.token_repo')
 
 
 class TokenRepository:

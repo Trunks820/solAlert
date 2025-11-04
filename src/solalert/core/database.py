@@ -12,7 +12,7 @@ import threading
 import time
 from .config import DB_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.core.database')
 
 
 def _get_db_connection_config():

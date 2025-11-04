@@ -91,8 +91,15 @@ class SolFieldMapper:
         if not field_key:
             return 0.0
         
-        # 返回字段值
-        return float(data.get(field_key, 0))
+        # 🚀 健壮处理：防止 None 值
+        value = data.get(field_key, 0)
+        if value is None:
+            return 0.0
+        
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
     
     @classmethod
     def extract_price_change(
@@ -110,7 +117,9 @@ class SolFieldMapper:
         Returns:
             价格变化百分比（如 5.23 表示 +5.23%）
         """
-        return cls.get_field_value(data, 'price_change', time_interval) * 100
+        # 🚀 健壮处理：防止 None * 100
+        price_change = cls.get_field_value(data, 'price_change', time_interval)
+        return price_change * 100 if price_change is not None else 0.0
     
     @classmethod
     def extract_volume(
@@ -168,8 +177,8 @@ class SolFieldMapper:
         """
         # 基础数据
         pair = data.get('p', '')
-        price = data.get('tp', 0)
-        market_cap = data.get('mp', 0)
+        price = data.get('tp', 0) or 0
+        market_cap = data.get('mp', 0) or 0
         
         # 价格变化
         price_change = cls.extract_price_change(data, time_interval)
@@ -177,14 +186,15 @@ class SolFieldMapper:
         # 交易量数据
         volume_data = cls.extract_volume(data, time_interval)
         
-        # TOP10持仓
-        top10_percent = data.get('t10', 0) * 100
+        # 🚀 TOP10持仓 - 健壮处理 None 值
+        t10_value = data.get('t10', 0)
+        top10_percent = (t10_value * 100) if t10_value is not None else 0.0
         
         # 流动性
-        liquidity = data.get('tr', 0)
+        liquidity = data.get('tr', 0) or 0
         
         # 持有者数量
-        holders = data.get('h', 0)
+        holders = data.get('h', 0) or 0
         
         return {
             'pair': pair,

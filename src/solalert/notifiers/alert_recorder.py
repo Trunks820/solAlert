@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 from ..core.database import get_db
 from ..core.config import WEBSOCKET_PUSH_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.notifiers.alert_recorder')
 
 
 class AlertRecorder:

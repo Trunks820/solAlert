@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.collectors.base')
 
 
 class BaseCollector(ABC):

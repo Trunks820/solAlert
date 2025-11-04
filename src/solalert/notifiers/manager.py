@@ -13,7 +13,7 @@ from .telegram import TelegramNotifier
 from .wechat import WeChatNotifier
 from ..core.config import TELEGRAM_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.notifiers')
 
 
 class NotificationManager:

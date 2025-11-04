@@ -8,7 +8,7 @@ import json
 import logging
 from .config import REDIS_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.core.redis')
 
 
 class RedisClient:

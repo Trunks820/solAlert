@@ -16,7 +16,7 @@ from telegram.error import TelegramError, BadRequest, Forbidden, TimedOut, Netwo
 from .base import BaseNotifier
 from ..core.config import TELEGRAM_CONFIG
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('solalert.notifiers.telegram')
 
 
 class TelegramQueue:

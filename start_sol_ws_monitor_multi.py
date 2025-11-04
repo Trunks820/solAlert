@@ -75,7 +75,8 @@ logging.basicConfig(
 if sys.platform == 'win32':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-logger = logging.getLogger(__name__)
+# 使用统一的层级logger命名
+logger = logging.getLogger('solalert.monitor.sol_ws')
 
 
 def load_batch_data(batch_id: int) -> tuple:

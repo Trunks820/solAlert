@@ -16,7 +16,8 @@ from ..core.config import TELEGRAM_CONFIG
 from ..core.database import get_db
 from ..repositories.token_repo import TokenRepository
 
-logger = logging.getLogger(__name__)
+# 使用统一的层级logger命名
+logger = logging.getLogger('solalert.collectors.pump')
 
 # 北京时间时区
 BEIJING_TZ = timezone(timedelta(hours=8))

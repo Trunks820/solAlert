@@ -9,6 +9,7 @@ from typing import Dict, Any, Tuple, List, Optional
 from datetime import datetime
 
 from .sol_field_mapper import SolFieldMapper
+from ..core.formatters import format_number
 
 # Telegram 按钮支持
 try:
@@ -280,6 +281,10 @@ class SolAlertChecker:
         # 🚀 CA 链接：蓝色文本 + 可点击复制 + 点击跳转solscan
         ca_link = f'<a href="https://solscan.io/token/{ca}"><code>{ca}</code></a>'
         
+        # 格式化市值和流动性
+        market_cap_str = format_number(metrics['market_cap'], include_dollar=True)
+        liquidity_str = format_number(metrics['liquidity'], include_dollar=True)
+        
         message = f"""<b>🔔 SOL WebSocket 实时告警</b>
 
 💰 Token: <b>{token_symbol}</b>
@@ -288,9 +293,9 @@ class SolAlertChecker:
 🏷️ 模板: {template_name}
 
 💵 当前价格: ${metrics['price']:.10f}
-💎 市值: ${metrics['market_cap']:,.0f}
+💎 市值: {market_cap_str}
 📈 价格变化: {metrics['price_change']:+.2f}%
-💧 流动性: ${metrics['liquidity']:,.0f}
+💧 流动性: {liquidity_str}
 👥 持有者: {metrics['holders']}
 📊 TOP10持仓: {metrics['top10_percent']:.2f}%
 
