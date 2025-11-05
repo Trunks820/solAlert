@@ -199,7 +199,7 @@ def get_logging_config() -> Dict[str, Any]:
     """
     生成统一的日志配置字典
     """
-    # 确保日志目录存在
+        # 确保日志目录存在
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR, exist_ok=True)
     

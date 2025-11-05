@@ -25,6 +25,13 @@ from solalert.tasks.twitter_push_sync import TwitterPushSyncService
 from solalert.monitor.token_monitor import TokenMonitorEngine
 from solalert.monitor.bsc_websocket_monitor import BSCWebSocketMonitor
 
+# Prometheus Metrics
+try:
+    from prometheus_client import start_http_server as prometheus_start_http_server
+    HAS_PROMETHEUS = True
+except ImportError:
+    HAS_PROMETHEUS = False
+
 # SOL WS监控（单独导入，避免循环导入）
 def import_sol_ws_monitor():
     """延迟导入SOL WS监控模块"""
@@ -343,6 +350,16 @@ def main():
     
     # 打印横幅
     print_banner()
+    
+    # 启动 Prometheus Metrics Server（所有模块共享）
+    if HAS_PROMETHEUS:
+        try:
+            prometheus_start_http_server(8001)
+            logger.info(f"📊 Prometheus Metrics: http://0.0.0.0:8001/metrics")
+        except Exception as e:
+            logger.warning(f"⚠️ Prometheus Server 启动失败: {e}")
+    else:
+        logger.info("⚠️ Prometheus未安装，Metrics功能不可用（可选）")
     
     # 检查依赖
     if not args.no_check:

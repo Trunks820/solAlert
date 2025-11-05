@@ -1,0 +1,183 @@
+{
+  "dashboard": {
+    "title": "solAlert - BSC WebSocket Monitor",
+    "tags": ["solalert", "bsc", "blockchain", "monitor"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 1,
+    "refresh": "10s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "消息处理速率",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "rate(bsc_ws_messages_total[1m])",
+            "legendFormat": "消息/秒",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "消息数/秒"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 2,
+        "title": "第一层过滤通过率",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "rate(bsc_ws_first_layer_pass_total{type=\"internal\"}[5m])",
+            "legendFormat": "内盘通过/分钟",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(bsc_ws_first_layer_pass_total{type=\"external\"}[5m])",
+            "legendFormat": "外盘通过/分钟",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "第二层检查统计",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "rate(bsc_ws_second_layer_check_total{type=\"internal\"}[5m])",
+            "legendFormat": "内盘检查/分钟",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(bsc_ws_second_layer_check_total{type=\"external\"}[5m])",
+            "legendFormat": "外盘检查/分钟",
+            "refId": "B"
+          },
+          {
+            "expr": "rate(bsc_ws_second_layer_pass_total{type=\"internal\"}[5m])",
+            "legendFormat": "内盘通过/分钟",
+            "refId": "C"
+          },
+          {
+            "expr": "rate(bsc_ws_second_layer_pass_total{type=\"external\"}[5m])",
+            "legendFormat": "外盘通过/分钟",
+            "refId": "D"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "告警发送成功率",
+        "type": "singlestat",
+        "gridPos": {"h": 8, "w": 6, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "rate(bsc_ws_alerts_total{status=\"success\"}[5m]) / (rate(bsc_ws_alerts_total{status=\"success\"}[5m]) + rate(bsc_ws_alerts_total{status=\"failure\"}[5m])) * 100",
+            "refId": "A"
+          }
+        ],
+        "format": "percent",
+        "valueName": "current",
+        "thresholds": "80,95",
+        "colors": ["#d44a3a", "#e0b400", "#299c46"]
+      },
+      {
+        "id": 5,
+        "title": "缓存命中率",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 6, "x": 18, "y": 8},
+        "targets": [
+          {
+            "expr": "rate(bsc_ws_cache_hits_total{cache_type=\"receipt\"}[5m])",
+            "legendFormat": "回执缓存命中/分钟",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "时间窗口退让次数",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "rate(bsc_ws_fallback_total{original=\"1m\",fallback=\"5m\"}[5m])",
+            "legendFormat": "1m→5m 退让/分钟",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(bsc_ws_fallback_total{original=\"5m\",fallback=\"1h\"}[5m])",
+            "legendFormat": "5m→1h 退让/分钟",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "WebSocket 连接状态",
+        "type": "singlestat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
+        "targets": [
+          {
+            "expr": "bsc_ws_connections",
+            "refId": "A"
+          }
+        ],
+        "valueName": "current",
+        "thresholds": "0,1",
+        "colors": ["#d44a3a", "#299c46", "#299c46"]
+      },
+      {
+        "id": 8,
+        "title": "缓存大小",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 6, "x": 18, "y": 16},
+        "targets": [
+          {
+            "expr": "bsc_ws_cache_size{cache_type=\"receipt\"}",
+            "legendFormat": "回执缓存",
+            "refId": "A"
+          },
+          {
+            "expr": "bsc_ws_cache_size{cache_type=\"dedup\"}",
+            "legendFormat": "去重缓存",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "事件处理耗时分布（P50/P95/P99）",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(bsc_ws_processing_time_seconds_bucket[5m]))",
+            "legendFormat": "P50",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(bsc_ws_processing_time_seconds_bucket[5m]))",
+            "legendFormat": "P95",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(bsc_ws_processing_time_seconds_bucket[5m]))",
+            "legendFormat": "P99",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "耗时（秒）"},
+          {"format": "short"}
+        ]
+      }
+    ]
+  }
+}
+

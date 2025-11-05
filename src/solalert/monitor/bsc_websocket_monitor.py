@@ -33,6 +33,14 @@ from ..notifiers.alert_recorder import get_alert_recorder
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Prometheus Metrics
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server, REGISTRY
+    HAS_PROMETHEUS = True
+except ImportError:
+    HAS_PROMETHEUS = False
+    Counter = Gauge = Histogram = None
+
 
 # 可选依赖：eth_abi（用于 Multicall2）
 try:
@@ -236,6 +244,70 @@ class BSCWebSocketMonitor:
         self.eth_call_cache_hits = 0  # 命中计数
         self.eth_call_cache_lock = threading.Lock()  # 线程安全锁
         
+        # ========== Prometheus Metrics ==========
+        if HAS_PROMETHEUS:
+            try:
+                # Counter（计数器）- 只增不减
+                self.metrics_messages = Counter(
+                    'bsc_messages_total', 
+                    'WebSocket接收的总消息数'
+                )
+                self.metrics_first_layer_pass = Counter(
+                    'bsc_first_layer_pass_total', 
+                    '第一层过滤通过次数',
+                    ['type']  # type: internal/external
+                )
+                self.metrics_second_layer_check = Counter(
+                    'bsc_second_layer_check_total', 
+                    '第二层检查次数',
+                    ['type']  # type: internal/external
+                )
+                self.metrics_second_layer_pass = Counter(
+                    'bsc_second_layer_pass_total', 
+                    '第二层检查通过次数',
+                    ['type']  # type: internal/external
+                )
+                self.metrics_alerts = Counter(
+                    'bsc_alerts_total', 
+                    '告警发送次数',
+                    ['status']  # status: success/failure
+                )
+                self.metrics_cache_hits = Counter(
+                    'bsc_cache_hits_total', 
+                    '缓存命中次数',
+                    ['cache_type']  # cache_type: receipt/eth_call/non_fourmeme
+                )
+                self.metrics_fallback = Counter(
+                    'bsc_time_window_fallback_total',
+                    '时间窗口退让次数',
+                    ['original', 'fallback']  # 1m->5m, 5m->1h
+                )
+                
+                # Gauge（仪表）- 可增可减
+                self.metrics_connections = Gauge(
+                    'bsc_websocket_connections', 
+                    'WebSocket连接数'
+                )
+                self.metrics_cache_size = Gauge(
+                    'bsc_cache_size', 
+                    '缓存大小',
+                    ['cache_type']  # cache_type: seen_txs/receipt/eth_call
+                )
+                
+                # Histogram（直方图）- 延迟分布
+                self.metrics_processing_time = Histogram(
+                    'bsc_processing_seconds',
+                    '事件处理耗时（秒）',
+                    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+                )
+                
+                logger.info("✅ Prometheus Metrics 已启用")
+            except Exception as e:
+                logger.error(f"❌ Prometheus Metrics 初始化失败: {e}")
+                HAS_PROMETHEUS = False
+        else:
+            logger.warning("⚠️ Prometheus Metrics 未安装")
+        
     async def load_config_from_redis(self):
         """从 Redis 加载配置"""
         try:
@@ -411,6 +483,8 @@ class BSCWebSocketMonitor:
                     # 验证数据完整性
                     if receipt and isinstance(receipt, dict) and receipt.get("logs"):
                         self.receipt_cache_hits += 1
+                        if HAS_PROMETHEUS:
+                            self.metrics_cache_hits.labels(cache_type='receipt').inc()
                         logger.debug(f"✅ 回执缓存命中: {tx_hash[:10]}... (命中#{self.receipt_cache_hits})")
                         return receipt, tx_info
                     else:
@@ -1483,6 +1557,9 @@ class BSCWebSocketMonitor:
                                 'fallback': fallback_interval,
                                 'reason': f'{original_interval}数据为0'
                             }
+                            # Prometheus: 时间窗口退让计数
+                            if HAS_PROMETHEUS:
+                                self.metrics_fallback.labels(original=original_interval, fallback=fallback_interval).inc()
                             logger.info(f"   ✅ 退让成功: 使用{fallback_interval}数据 (涨幅{price_change:+.2f}%, 交易量${volume:,.2f})")
                         else:
                             logger.info(f"   ❌ {fallback_interval}数据也为0，无法退让")
@@ -1503,8 +1580,12 @@ class BSCWebSocketMonitor:
             # 第二层检查计数
             if is_internal:
                 self.second_layer_check_internal += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_second_layer_check.labels(type='internal').inc()
             else:
                 self.second_layer_check_external += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_second_layer_check.labels(type='external').inc()
             
             logger.info(f"🔎 [第二层检查] {pool_emoji}{pool_type} {symbol} ({token_address})")
             logger.info(f"   ├─ {time_interval}涨幅: {price_change:+.2f}%")
@@ -1545,8 +1626,12 @@ class BSCWebSocketMonitor:
             # 第二层通过计数
             if is_internal:
                 self.second_layer_pass_internal += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_second_layer_pass.labels(type='internal').inc()
             else:
                 self.second_layer_pass_external += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_second_layer_pass.labels(type='external').inc()
             
             token_data['pool_type'] = pool_type
             token_data['is_internal'] = is_internal
@@ -1728,6 +1813,10 @@ class BSCWebSocketMonitor:
         logger.info(f"✅ [外盘] 通过第一层: {base_symbol} (${usd_value:.2f}) [{cn_time}] - {base_token[:10]}...")
         self.first_layer_pass_external += 1  # 外盘第一层计数
         
+        # Prometheus: 第一层通过计数
+        if HAS_PROMETHEUS:
+            self.metrics_first_layer_pass.labels(type='external').inc()
+        
         # 🚀 优化：先检查 Redis 缓存（非fourmeme token黑名单）
         if self.redis_client:
             try:
@@ -1849,12 +1938,19 @@ class BSCWebSocketMonitor:
                             'fallback': fallback_interval,
                             'reason': f'{original_interval}数据为0'
                         }
+                        # Prometheus: 时间窗口退让计数
+                        if HAS_PROMETHEUS:
+                            self.metrics_fallback.labels(original=original_interval, fallback=fallback_interval).inc()
                         logger.info(f"   ✅ 退让成功: 使用{fallback_interval}数据 (涨幅{price_change:+.2f}%, 交易量${volume:,.2f})")
                     else:
                         logger.info(f"   ❌ {fallback_interval}数据也为0，无法退让")
             
             # 获取外盘配置（从 external_events_config 读取）
             external_config = self.external_events_config
+            
+            # Prometheus: 外盘快速路径第二层检查计数
+            if HAS_PROMETHEUS:
+                self.metrics_second_layer_check.labels(type='external').inc()
             
             # 第二层判断：涨跌幅和交易量
             min_price_change = external_config.get('priceChange', {}).get('risePercent', 50)  # 默认50%
@@ -1906,6 +2002,8 @@ class BSCWebSocketMonitor:
             
             # 外盘快速路径通过第二层计数
             self.second_layer_pass_external += 1
+            if HAS_PROMETHEUS:
+                self.metrics_second_layer_pass.labels(type='external').inc()
             
             # 构建 token_data（兼容原有格式）
             token_data = {
@@ -1943,13 +2041,13 @@ class BSCWebSocketMonitor:
                 }
                 
                 # 调用统一的第二层过滤
-                token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
+        token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
                 
-                if not token_data:
-                    logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
-                    return
-                
-                logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
+        if not token_data:
+            logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
+            return
+        
+        logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
         
         # 🔒 关键：检查冷却期（只读，不设置）
         # 避免为已在冷却期的代币构建消息
@@ -2046,10 +2144,16 @@ class BSCWebSocketMonitor:
         
         if send_success:
             # ✅ 播报成功，设置冷却期
+            self.alert_success_count += 1
+            if HAS_PROMETHEUS:
+                self.metrics_alerts.labels(status='success').inc()
             await self.check_and_set_alert_cooldown(base_token)
             logger.info(f"✅ 已设置冷却期: {base_token[:10]}... ({self.cooldown_minutes}分钟)")
         else:
             # ❌ 播报失败，不设置冷却期，允许下次重试
+            self.alert_fail_count += 1
+            if HAS_PROMETHEUS:
+                self.metrics_alerts.labels(status='failure').inc()
             logger.warning(f"⚠️  播报失败，未设置冷却期: {base_token[:10]}...")
         
         # 记录到数据库并推送WebSocket（无论通知是否成功）
@@ -2347,6 +2451,10 @@ class BSCWebSocketMonitor:
             logger.info(f"✅ [内盘] 通过第一层: {target_symbol} (${usd_value:.2f}) [{cn_time}]")
             self.first_layer_pass_internal += 1  # 内盘第一层计数
             
+            # Prometheus: 第一层通过计数
+            if HAS_PROMETHEUS:
+                self.metrics_first_layer_pass.labels(type='internal').inc()
+            
             # 获取 launchpad 信息
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
             if not launchpad_info:
@@ -2482,10 +2590,16 @@ class BSCWebSocketMonitor:
             
             if send_success:
                 # ✅ 播报成功，设置冷却期
+                self.alert_success_count += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_alerts.labels(status='success').inc()
                 await self.check_and_set_alert_cooldown(target_token)
                 logger.info(f"✅ 已设置冷却期: {target_token[:10]}... ({self.cooldown_minutes}分钟)")
             else:
                 # ❌ 播报失败，不设置冷却期，允许下次重试
+                self.alert_fail_count += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_alerts.labels(status='failure').inc()
                 logger.warning(f"⚠️  播报失败，未设置冷却期: {target_token[:10]}...")
             
             # 记录到数据库并推送WebSocket（无论通知是否成功）
@@ -2731,6 +2845,10 @@ class BSCWebSocketMonitor:
             self.last_message_time = time.time()
             self.message_count += 1
             
+            # Prometheus: 消息计数
+            if HAS_PROMETHEUS:
+                self.metrics_messages.inc()
+            
             msg = json.loads(message)
             
             # 跳过订阅确认（包含id但不包含method的消息）
@@ -2853,7 +2971,7 @@ class BSCWebSocketMonitor:
                 "address": [self.FOURMEME_PROXY[0]]  # 只订阅主Proxy（TryBuy已废弃）
                 # 不限制topics - 捕获所有事件（TokenPurchase/TokenSale等）
             }]
-        }))
+            }))
         logger.info(f"✓ 订阅 Fourmeme Proxy 所有事件（内盘）")
         logger.info(f"  监听地址: {self.FOURMEME_PROXY[0][:10]}...")
         logger.info(f"  捕获: TokenPurchase/TokenSale/Custom Events")

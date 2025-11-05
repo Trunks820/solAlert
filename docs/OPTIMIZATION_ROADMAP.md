@@ -169,79 +169,167 @@ def get_thread_dbotx_api(self) -> DBotXAPI:
 
 ---
 
-### 4. Prometheus Metrics监控 ⭐⭐⭐⭐ (待实施)
+### ~~4. Telegram HTTP API迁移 + 监控优化~~ ✅ 已完成（2025-11-05）
 
-**问题**：
+**原问题**：
+- 📍 Telegram发送架构不统一（BSC直接调用API，SOL使用Notifier）
+- ❌ 健康检查信息价值低（过多技术指标，缺少业务指标）
+- ❌ 废弃文件未清理（BSCMonitor Block监控、Alchemy Webhook）
+
+**✅ 已实施方案（2025-11-05）**：
+
+**1. 统一Telegram发送架构**
+```
+旧架构（不一致）:
+BSC WebSocket → TelegramAPI.send_message() → HTTP API
+SOL WebSocket → TelegramNotifier.send() → Bot API
+
+新架构（统一）:
+所有监控 → TelegramNotifier.send() → HTTP API (kakarot8.fun:8000)
+```
+
+**2. 优化健康检查**
+```
+删除（冗余/价值低）:
+❌ RPC详细统计（各方法调用次数）
+❌ 处理模式说明（已固定架构）
+❌ 线程池统计（固定20线程）
+
+新增（高价值业务指标）:
+✅ 运行时长（X时X分X秒）
+✅ 第一层过滤：通过数、内外盘占比
+✅ 第二层检查：通过率、未通过数、内外盘分布
+✅ 告警发送：成功率、失败数
+```
+
+**3. 代码清理**
+```bash
+删除废弃文件：
+- src/solalert/monitor/bsc_monitor.py           # Block轮询监控
+- src/solalert/api/alchemy_webhook.py           # Alchemy Webhook服务
+- src/solalert/api/webhook_processor.py         # Webhook处理器
+```
+
+**关键改进**：
+- ✅ 架构统一：所有模块使用同一发送接口
+- ✅ 集中管理：发送逻辑、重试、错误处理统一
+- ✅ 监控优化：业务指标为主，快速定位问题
+- ✅ 代码简化：删除~500行废弃代码
+
+**健康检查示例**：
+```
+💓 WebSocket 健康检查
+   运行时长: 2时15分30秒
+   第一层过滤: 通过 161 个
+      ├─ 🔴 内盘: 0 (0.0%)
+      └─ 🟢 外盘: 161 (100.0%)
+   第二层检查: 161 个
+      ├─ ✅ 通过: 0 (0.0%)
+      └─ ❌ 未通过: 161 (100.0%)
+   告警发送: 5 次
+      ├─ ✅ 成功: 5 (100.0%)
+      └─ ❌ 失败: 0 (0.0%)
+```
+
+**状态**：✅ 已部署，Telegram发送测试通过
+
+---
+
+### ~~5. Prometheus Metrics监控~~ ✅ 已完成（2025-11-05）
+
+**原问题**：
 - 当前只有日志，无法实时监控性能指标
 - 问题发现滞后（需要翻日志）
 - 缺少可视化Dashboard
 
-**实施方案（2小时）**：
+**✅ 已实施方案（2025-11-05）**：
 
 **Step 1：安装依赖**
 ```bash
 pip install prometheus-client==0.19.0
 ```
 
-**Step 2：定义关键指标**
+**Step 2：定义核心Metrics（集成在 `bsc_websocket_monitor.py` 中）**
 
-创建 `src/solalert/monitoring/prometheus_metrics.py`：
+**已实现的关键指标**：
+- ✅ `bsc_ws_messages_total` - WebSocket消息总数（Counter）
+- ✅ `bsc_ws_first_layer_pass_total{type="internal|external"}` - 第一层过滤通过数
+- ✅ `bsc_ws_second_layer_check_total{type="internal|external"}` - 第二层检查数
+- ✅ `bsc_ws_second_layer_pass_total{type="internal|external"}` - 第二层通过数
+- ✅ `bsc_ws_alerts_total{status="success|failure"}` - 告警发送统计
+- ✅ `bsc_ws_cache_hits_total{cache_type="receipt"}` - 缓存命中数
+- ✅ `bsc_ws_fallback_total{original="1m|5m",fallback="5m|1h"}` - 时间窗口退让统计
+- ✅ `bsc_ws_connections` - WebSocket连接状态（Gauge）
+- ✅ `bsc_ws_cache_size{cache_type="receipt|dedup"}` - 缓存大小
+- ✅ `bsc_ws_processing_time_seconds` - 事件处理耗时分布（Histogram）
 
-**BSC监控指标**：
-- `bsc_ws_messages_total{event_type, result}` - WebSocket消息数
-- `bsc_ws_messages_processing_seconds{event_type}` - 消息处理耗时
-- `api_requests_total{api, endpoint, status}` - API调用数/成功率
-- `api_request_duration_seconds{api, endpoint}` - API响应时间
-- `bsc_filter_passed_total{layer, market_type}` - 过滤层通过数
-- `bsc_filter_rejected_total{layer, reason}` - 过滤层拒绝数
-- `rpc_calls_total{chain, method, result}` - RPC调用统计
-- `alerts_sent_total{chain, channel, result}` - 告警发送统计
-- `cooldown_hits_total{chain}` - 冷却期命中数
+**Step 3：代码埋点位置**
+- ✅ `on_message()` - 消息总数计数
+- ✅ `handle_swap_event()` / `handle_proxy_event()` - 第一层通过计数
+- ✅ `second_layer_filter()` - 第二层检查/通过计数
+- ✅ `send_alert()` - 告警成功/失败计数
+- ✅ `get_receipt_cached()` - 缓存命中计数
+- ✅ 时间窗口退让逻辑 - 退让次数统计
 
-**SOL监控指标**：
-- `sol_ws_connections_active{batch_id}` - 活跃连接数
-- `sol_ws_reconnects_total{batch_id, reason}` - 重连次数
-- `sol_ws_data_received_total{batch_id, has_data}` - 数据接收统计
+**Step 4：暴露 Metrics 端点**
+- ✅ `start_bsc_websocket_monitor.py` - 启动HTTP server（端口8001）
+- ✅ `main.py` - 全局启动HTTP server（端口8001）
+- ✅ 提供 `GET /metrics` 端点（Prometheus格式）
 
-**系统资源指标**：
-- `database_connections_active` - 活跃数据库连接数
-- `database_connections_idle` - 空闲连接数
-- `database_query_duration_seconds{operation}` - 查询耗时
-- `redis_operations_total{operation, result}` - Redis操作统计
+**Step 5：配置文件和文档**
+- ✅ `prometheus.yml.example` - Prometheus抓取配置示例
+- ✅ `grafana_dashboard_bsc_monitor.json` - Grafana仪表板模板
+- ✅ `test_prometheus_metrics.py` - Metrics功能测试脚本
 
-**Step 3：在代码中埋点**
-- 消息接收入口
-- API调用前后
-- 过滤器判断点
-- 告警发送点
-- 数据库/Redis操作点
+**Step 6：Grafana Dashboard 面板**
+- ✅ 消息处理速率（实时趋势图）
+- ✅ 第一层过滤通过率（内盘/外盘分离显示）
+- ✅ 第二层检查统计（检查vs通过对比）
+- ✅ 告警发送成功率（百分比+颜色阈值）
+- ✅ 缓存命中率趋势
+- ✅ 时间窗口退让次数（1m→5m, 5m→1h）
+- ✅ WebSocket连接状态（实时状态指示）
+- ✅ 缓存大小监控（回执缓存、去重缓存）
+- ✅ 事件处理耗时分布（P50/P95/P99）
 
-**Step 4：暴露metrics端点**
-- 启动HTTP server（端口8000）
-- 提供 `GET /metrics` 端点
-- Prometheus格式输出
+**使用方式**：
+```bash
+# 1. 启动 BSC Monitor（自动启动 Metrics Server）
+python start_bsc_websocket_monitor.py
+# → Prometheus Metrics: http://0.0.0.0:8001/metrics
 
-**Step 5：配置Prometheus采集**
-- 添加 `monitoring/prometheus.yml` 配置
-- 5秒采集间隔
+# 2. 配置 Prometheus 抓取
+cp prometheus.yml.example prometheus.yml
+docker run -p 9090:9090 -v ./prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus
 
-**Step 6：Grafana可视化**
-- 导入预定义Dashboard
-- 实时监控关键指标
-- 配置告警规则
+# 3. 导入 Grafana Dashboard
+# 打开 Grafana → Import → 上传 grafana_dashboard_bsc_monitor.json
 
-**收益**：
-- ✅ 实时性能监控
-- ✅ 可视化Dashboard（Grafana）
-- ✅ 告警规则（API错误率>10%自动告警）
-- ✅ 问题快速定位（哪个环节慢？哪个API频繁失败？）
-- ✅ 历史趋势分析
+# 4. 测试 Metrics 功能
+python test_prometheus_metrics.py
+```
 
-**工作量**：2小时
+**实际收益**：
+- ✅ 实时数值监控（替代日志grep统计）
+- ✅ 可视化Dashboard（一目了然的图表）
+- ✅ 历史趋势分析（Prometheus存储15天数据）
+- ✅ 问题快速定位（哪个环节是瓶颈？）
+- ✅ 退让策略效果可视化（是否频繁退让？）
+- ✅ 告警成功率监控（是否有发送失败？）
+- ✅ 性能基准建立（P50/P95/P99延迟）
+
+**与日志的互补关系**：
+- **Metrics**: 数值统计、趋势分析、实时监控
+- **Logs**: 详细上下文、问题诊断、事件追踪
+- 两者结合，形成完整的可观测性体系
+
+**工作量**：2小时（实际）
+
+**状态**：✅ 已集成，测试通过
 
 ---
 
-### 4. 启用JSON结构化日志 ⭐⭐⭐
+### 6. 启用JSON结构化日志 ⭐⭐⭐
 
 **当前状态**：
 - ✅ 日志系统已支持JSON格式
@@ -289,7 +377,7 @@ ENABLE_JSON_LOGS=true
 
 ---
 
-### 5. 健康检查和优雅关闭 ⭐⭐⭐ (待实施)
+### 7. 健康检查和优雅关闭 ⭐⭐⭐ (待实施)
 
 **问题**：
 - 没有健康检查端点 → K8s/Docker无法判断服务是否正常
@@ -367,7 +455,7 @@ readinessProbe:
 
 ## ⚡ P1 - 重要优化（2周内，5天）
 
-### 6. 完全asyncio化重构 ⭐⭐⭐ (优先级下调)
+### 8. 完全asyncio化重构 ⭐⭐⭐ (优先级下调)
 
 **优先级调整说明**：
 - **原来**：⭐⭐⭐⭐⭐（最高优先级）
@@ -394,7 +482,7 @@ readinessProbe:
 
 ---
 
-### 7. 配置管理集中化 ⭐⭐⭐
+### 9. 配置管理集中化 ⭐⭐⭐
 
 **问题定位**：
 - 📍 `src/solalert/monitor/bsc_websocket_monitor.py:120-200` - 硬编码配置
@@ -478,7 +566,7 @@ alerts:
 
 ---
 
-### 8. 指标降级策略优化 ⭐⭐⭐
+### 10. 指标降级策略优化 ⭐⭐⭐
 
 **问题定位**：
 - 📍 `src/solalert/monitor/bsc_websocket_monitor.py:1863-1869`
@@ -524,7 +612,7 @@ alerts:
 
 ---
 
-### 9. 单元测试 + CI ⭐⭐⭐
+### 11. 单元测试 + CI ⭐⭐⭐
 
 **问题**：
 - 无自动化测试
@@ -620,7 +708,7 @@ pre-commit install
 
 ---
 
-### 10. 业务监控告警 ⭐⭐⭐
+### 12. 业务监控告警 ⭐⭐⭐
 
 **问题**：
 - 只有用户告警（token涨跌），没有系统运维告警
@@ -705,7 +793,7 @@ pre-commit install
 
 ## 📊 P2 - 长期优化（1-3个月）
 
-### 11. Redis Pipeline批量操作 ⭐⭐⭐
+### 13. Redis Pipeline批量操作 ⭐⭐⭐
 
 **问题**：
 - 当前单次Redis操作（get/set/exists）
@@ -734,7 +822,7 @@ pre-commit install
 
 ---
 
-### 12. 数据库慢查询监控和优化 ⭐⭐⭐
+### 14. 数据库慢查询监控和优化 ⭐⭐⭐
 
 **问题**：
 - 不知道哪些SQL慢
@@ -782,7 +870,7 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ---
 
-### 13. 本地LRU缓存 ⭐⭐
+### 15. 本地LRU缓存 ⭐⭐
 
 **问题**：
 - 高频只读数据（如fourmeme黑名单）仍然查Redis
@@ -813,7 +901,7 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ---
 
-### 14. 动态冷却期 ⭐⭐
+### 16. 动态冷却期 ⭐⭐
 
 **问题**：
 - 当前固定3分钟冷却，不够灵活
@@ -845,7 +933,7 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ---
 
-### 15. 告警聚合 ⭐⭐
+### 17. 告警聚合 ⭐⭐
 
 **问题**：
 - 短时间内多个token触发 → 多条消息（刷屏）
@@ -874,7 +962,7 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ---
 
-### 16. 链路追踪（OpenTelemetry）⭐⭐
+### 18. 链路追踪（OpenTelemetry）⭐⭐
 
 **问题**：
 - 无法追踪完整请求链路
@@ -903,7 +991,7 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ---
 
-### 17. Sentry错误追踪 ⭐⭐
+### 19. Sentry错误追踪 ⭐⭐
 
 **问题**：
 - 线上异常需要查日志才能发现
@@ -935,7 +1023,7 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ---
 
-### 18. 配置热更新 ⭐
+### 20. 配置热更新 ⭐
 
 **问题**：
 - 修改配置需要重启服务
@@ -979,14 +1067,17 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 | ~~1. 直接处理模式架构~~ | 1天 | 处理能力2.5x，0丢消息，延迟-80% | ✅ 已部署 |
 | ~~2. API客户端复用~~ | 2小时 | API成功率70%→94% | ✅ 已部署 |
 | ~~3. Chainstack迁移~~ | 1小时 | 删除限流机制，简化代码150行 | ✅ 已部署 |
+| ~~4. Telegram HTTP API + 监控优化~~ | 4小时 | 架构统一，业务监控可视化 | ✅ 已部署 |
 
-**总计：~1.5天，核心性能优化完成**
+**总计：~2天，核心架构优化完成**
 
 **关键成果**：
 - ✅ **队列模式 → 直接处理模式**（经验教训：队列不是银弹！）
 - ✅ **消息丢失率：60% → 0%**
 - ✅ **处理延迟降低80%**
-- ✅ **代码简化360行**（150行限流 + 210行队列）
+- ✅ **代码简化860行**（150行限流 + 210行队列 + 500行废弃）
+- ✅ **Telegram架构统一**（所有模块使用HTTP API）
+- ✅ **健康检查优化**（业务指标为主，价值提升）
 
 ---
 
@@ -994,11 +1085,21 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 | 优化项 | 工作量 | 收益 | 优先级 |
 |--------|--------|------|--------|
-| 4. Prometheus Metrics | 2小时 | 可观测性核心基础 | ⭐⭐⭐⭐ |
-| 5. 健康检查+优雅关闭 | 1小时 | 生产稳定性保障 | ⭐⭐⭐⭐ |
-| 4. JSON日志开启 | 5分钟 | 便于日志采集和分析 | ⭐⭐⭐ |
+| 7. 健康检查+优雅关闭 | 1小时 | 生产稳定性保障 | ⭐⭐⭐⭐ |
+| 6. JSON日志开启 | 5分钟 | 便于日志采集和分析 | ⭐⭐⭐ |
 
-**P0待完成总计：~3小时**
+**P0待完成总计：~1小时**
+
+**P0已完成（2025-11-05）**：
+| 优化项 | 实际工作量 | 核心收益 |
+|--------|-----------|---------|
+| 1. 直接处理模式架构 | 2小时 | 2.5x性能提升，0丢消息 |
+| 2. API客户端资源泄漏修复 | 1小时 | 连接复用，TLS握手节省 |
+| 3. Chainstack迁移+移除限流 | 30分钟 | 无限制RPC，架构简化 |
+| 4. Telegram HTTP API迁移 | 1小时 | 统一通知架构，健康检查优化 |
+| 5. Prometheus Metrics | 2小时 | 实时监控，可视化Dashboard |
+
+**P0已完成总计：~6.5小时**
 
 ---
 
@@ -1006,10 +1107,10 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 | 优化项 | 工作量 | 收益 | 优先级 |
 |--------|--------|------|--------|
-| 7. 配置集中化 | 1天 | 维护性大幅提升 | ⭐⭐⭐⭐ |
-| 8. 指标降级优化 | 5分钟-1天 | 减少漏报 | ⭐⭐⭐ |
-| 9. 单元测试+CI | 1天 | 质量保障 | ⭐⭐⭐⭐ |
-| 10. 业务监控告警 | 1天 | 主动运维 | ⭐⭐⭐ |
+| 9. 配置集中化 | 1天 | 维护性大幅提升 | ⭐⭐⭐⭐ |
+| 10. 指标降级优化 | 5分钟-1天 | 减少漏报 | ⭐⭐⭐ |
+| 11. 单元测试+CI | 1天 | 质量保障 | ⭐⭐⭐⭐ |
+| 12. 业务监控告警 | 1天 | 主动运维 | ⭐⭐⭐ |
 
 **总计：~3天**
 
@@ -1024,15 +1125,15 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 | 优化项 | 工作量 | 收益 | 优先级 |
 |--------|--------|------|--------|
-| 6. 完全asyncio化 | 3天 | 协程更高效（长期目标） | ⭐⭐⭐ |
-| 11. Redis Pipeline | 2天 | 2-5x Redis性能提升 | ⭐⭐⭐ |
-| 12. 数据库慢查询优化 | 3天 | 30-50%数据库负载降低 | ⭐⭐⭐ |
-| 13. 本地LRU缓存 | 1天 | 减少Redis压力 | ⭐⭐ |
-| 14. 动态冷却期 | 1天 | 用户体验提升 | ⭐⭐ |
-| 15. 告警聚合 | 2天 | 避免刷屏 | ⭐⭐ |
-| 16. OpenTelemetry链路追踪 | 2天 | 深度性能分析 | ⭐⭐ |
-| 17. Sentry错误追踪 | 1天 | 主动发现bug | ⭐⭐ |
-| 18. 配置热更新 | 2天 | 零停机配置变更 | ⭐ |
+| 8. 完全asyncio化 | 3天 | 协程更高效（长期目标） | ⭐⭐⭐ |
+| 13. Redis Pipeline | 2天 | 2-5x Redis性能提升 | ⭐⭐⭐ |
+| 14. 数据库慢查询优化 | 3天 | 30-50%数据库负载降低 | ⭐⭐⭐ |
+| 15. 本地LRU缓存 | 1天 | 减少Redis压力 | ⭐⭐ |
+| 16. 动态冷却期 | 1天 | 用户体验提升 | ⭐⭐ |
+| 17. 告警聚合 | 2天 | 避免刷屏 | ⭐⭐ |
+| 18. OpenTelemetry链路追踪 | 2天 | 深度性能分析 | ⭐⭐ |
+| 19. Sentry错误追踪 | 1天 | 主动发现bug | ⭐⭐ |
+| 20. 配置热更新 | 2天 | 零停机配置变更 | ⭐ |
 
 **总计：~17天（按需选择实施）**
 
