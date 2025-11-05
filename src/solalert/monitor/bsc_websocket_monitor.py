@@ -282,6 +282,16 @@ class BSCWebSocketMonitor:
                     '时间窗口退让次数',
                     ['original', 'fallback']  # 1m->5m, 5m->1h
                 )
+                self.metrics_api_calls = Counter(
+                    'bsc_ws_api_calls_total',
+                    'API调用次数',
+                    ['api_type', 'status']  # api_type: dbotx/rpc(无限制), status: success/failure
+                )
+                self.metrics_credits_consumed = Counter(
+                    'bsc_ws_credits_consumed_total',
+                    '消费积分总量',
+                    ['source']  # source: websocket(5分)/dbotx(10分), RPC不计费
+                )
                 
                 # Gauge（仪表）- 可增可减
                 self.metrics_connections = Gauge(
@@ -696,6 +706,10 @@ class BSCWebSocketMonitor:
                 json={"jsonrpc": "2.0", "id": self.rpc_id, "method": method, "params": params},
                 timeout=10
             )
+            
+            # 📊 Prometheus: 记录RPC调用（成功，但不计积分，因为RPC无限制）
+            if HAS_PROMETHEUS:
+                self.metrics_api_calls.labels(api_type='rpc', status='success').inc()
             
             # === 阶段3: 检查429限流 ===
             if resp.status_code == 429:
@@ -1482,6 +1496,16 @@ class BSCWebSocketMonitor:
             # 2. 调用 DBotX API 获取代币指标
             raw_data = await dbotx_api.get_pair_info('bsc', pair_address)
             
+            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+            if HAS_PROMETHEUS:
+                if raw_data:
+                    self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+                else:
+                    self.metrics_api_calls.labels(api_type='dbotx', status='failure').inc()
+                    # 失败也消耗积分
+                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+            
             if not raw_data:
                 logger.debug("第二层过滤-无DBotX数据", extra={"token": token_address[:10]})
                 return None
@@ -1686,6 +1710,16 @@ class BSCWebSocketMonitor:
         if not skip_api:
             dbotx_api = self.get_thread_dbotx_api()
             pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
+            
+            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+            if HAS_PROMETHEUS:
+                if pair_info_raw:
+                    self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+                else:
+                    self.metrics_api_calls.labels(api_type='dbotx', status='failure').inc()
+                    # 失败也消耗积分
+                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
             
             # 🔍 调试：打印API返回的完整字段（仅打印前3个，避免刷屏）
             if pair_info_raw is not None and hasattr(self, '_api_debug_count'):
@@ -2827,6 +2861,12 @@ class BSCWebSocketMonitor:
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
                 logger.info("=" * 80)
                 
+                # 更新缓存大小 Metrics
+                if HAS_PROMETHEUS:
+                    self.metrics_cache_size.labels(cache_type='seen_txs').set(len(self.seen_txs))
+                    self.metrics_cache_size.labels(cache_type='receipt').set(len(self.receipt_cache))
+                    self.metrics_cache_size.labels(cache_type='eth_call').set(len(self.eth_call_cache))
+                
                 # 如果超过10分钟没有消息，主动重连
                 if idle_seconds > 600 and self.ws:
                     logger.warning("⚠️ 检测到10分钟无消息，主动触发重连...")
@@ -2845,9 +2885,10 @@ class BSCWebSocketMonitor:
             self.last_message_time = time.time()
             self.message_count += 1
             
-            # Prometheus: 消息计数
+            # Prometheus: 消息计数 + 积分消费（WebSocket接收消息：5分/次）
             if HAS_PROMETHEUS:
                 self.metrics_messages.inc()
+                self.metrics_credits_consumed.labels(source='websocket').inc(5)
             
             msg = json.loads(message)
             
@@ -2958,6 +2999,10 @@ class BSCWebSocketMonitor:
         
         self.reconnect_count += 1
         
+        # 更新连接状态 Metric
+        if HAS_PROMETHEUS:
+            self.metrics_connections.set(1)  # 1 = 已连接
+        
         # ========== 优化后的订阅策略 ==========
         
         # 1️⃣ 订阅 Fourmeme Proxy 的所有事件（捕获内盘交易）
@@ -2998,6 +3043,10 @@ class BSCWebSocketMonitor:
     
     def on_close(self, ws, close_status_code, close_msg):
         """WebSocket 关闭回调"""
+        # 更新连接状态 Metric
+        if HAS_PROMETHEUS:
+            self.metrics_connections.set(0)  # 0 = 已断开
+        
         if self.should_stop:
             logger.info(f"✅ WebSocket 连接已关闭")
         else:
