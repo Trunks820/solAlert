@@ -1,0 +1,53 @@
+# Prometheus 配置示例
+# 用于抓取 solAlert BSC WebSocket Monitor 的 Metrics
+
+global:
+  scrape_interval: 15s  # 每15秒抓取一次指标
+  evaluation_interval: 15s  # 每15秒评估一次告警规则
+  external_labels:
+    cluster: 'solalert-production'
+    env: 'prod'
+
+# 告警管理器配置（可选）
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - 'alertmanager:9093'
+
+# 告警规则文件（可选）
+rule_files:
+  # - "alert_rules.yml"
+
+# 抓取配置
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # solAlert BSC WebSocket Monitor
+  - job_name: 'solalert_bsc_ws'
+    static_configs:
+      - targets: ['solalert-service:8001']  # Docker 网络中的服务名
+        labels:
+          service: 'bsc_websocket_monitor'
+          chain: 'bsc'
+          component: 'monitor'
+    scrape_interval: 10s  # BSC Monitor 需要更频繁的抓取
+    scrape_timeout: 5s
+    metrics_path: '/metrics'
+    
+  # 可以添加其他服务的监控
+  # - job_name: 'solalert_sol_ws'
+  #   static_configs:
+  #     - targets: ['localhost:8002']
+  #       labels:
+  #         service: 'sol_websocket_monitor'
+  #         chain: 'solana'
+  #         component: 'monitor'
+
+# 可选：远程写入配置（用于长期存储）
+# remote_write:
+#   - url: "http://your-remote-storage:9090/api/v1/write"
+

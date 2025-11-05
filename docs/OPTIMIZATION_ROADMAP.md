@@ -299,7 +299,7 @@ python start_bsc_websocket_monitor.py
 # → Prometheus Metrics: http://0.0.0.0:8001/metrics
 
 # 2. 配置 Prometheus 抓取
-cp prometheus.yml.example prometheus.yml
+cp prometheus.yml prometheus.yml
 docker run -p 9090:9090 -v ./prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus
 
 # 3. 导入 Grafana Dashboard
