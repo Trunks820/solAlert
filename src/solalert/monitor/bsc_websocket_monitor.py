@@ -273,6 +273,10 @@ class BSCWebSocketMonitor:
                     '告警发送次数',
                     ['status']  # status: success/failure
                 )
+                self.metrics_alert_cooldown_blocked = Counter(
+                    'bsc_ws_alert_cooldown_blocked_total',
+                    '冷却期拦截次数（避免重复告警）'
+                )
                 self.metrics_cache_hits = Counter(
                     'bsc_ws_cache_hits_total', 
                     '缓存命中次数',
@@ -2076,10 +2080,12 @@ class BSCWebSocketMonitor:
                 
                 logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
         
-        # 🔒 关键：检查冷却期（只读，不设置）
-        # 避免为已在冷却期的代币构建消息
-        if not await self.check_alert_cooldown_readonly(base_token):
+        # 🔒 关键：原子化检查并设置冷却期（防止竞态条件）
+        # 使用 check_and_set 而不是 check_readonly，避免多线程同时通过检查
+        if not await self.check_and_set_alert_cooldown(base_token):
             self.alert_cooldown_blocked += 1
+            if HAS_PROMETHEUS:
+                self.metrics_alert_cooldown_blocked.inc()
             logger.info(f"⏳ 冷却期内，跳过: {base_token}")
             return
         
@@ -2167,22 +2173,21 @@ class BSCWebSocketMonitor:
             "sell_tax": f"{sell_tax:.1f}%"
         })
         
-        # 🚀 发送推送，成功后才设置冷却期
+        # 🚀 发送推送（冷却期已在前面设置，无论成败都不会重复发送）
         send_success = await self.send_alert(message, base_token)
         
         if send_success:
-            # ✅ 播报成功，设置冷却期
+            # ✅ 播报成功
             self.alert_success_count += 1
             if HAS_PROMETHEUS:
                 self.metrics_alerts.labels(status='success').inc()
-            await self.check_and_set_alert_cooldown(base_token)
-            logger.info(f"✅ 已设置冷却期: {base_token[:10]}... ({self.cooldown_minutes}分钟)")
+            logger.info(f"✅ 告警发送成功: {base_token[:10]}...")
         else:
-            # ❌ 播报失败，不设置冷却期，允许下次重试
+            # ❌ 播报失败（但冷却期已设置，避免重复尝试）
             self.alert_fail_count += 1
             if HAS_PROMETHEUS:
                 self.metrics_alerts.labels(status='failure').inc()
-            logger.warning(f"⚠️  播报失败，未设置冷却期: {base_token[:10]}...")
+            logger.warning(f"⚠️  播报失败: {base_token[:10]}...")
         
         # 记录到数据库并推送WebSocket（无论通知是否成功）
         await asyncio.to_thread(
@@ -2317,6 +2322,8 @@ class BSCWebSocketMonitor:
                                     # 冷却期检查（只读）
                                     if not await self.check_alert_cooldown_readonly(target_token):
                                         self.alert_cooldown_blocked += 1
+                                        if HAS_PROMETHEUS:
+                                            self.metrics_alert_cooldown_blocked.inc()
                                         logger.info(f"⏳ [内盘快速] 冷却期内，跳过: {target_token[:10]}...")
                                         return
                                     
@@ -2343,6 +2350,8 @@ class BSCWebSocketMonitor:
                                     # 设置冷却期（原子操作）
                                     if not await self.check_and_set_alert_cooldown(target_token):
                                         self.alert_cooldown_blocked += 1
+                                        if HAS_PROMETHEUS:
+                                            self.metrics_alert_cooldown_blocked.inc()
                                         logger.info(f"⏳ [内盘快速] 冷却期内（竞态），跳过: {target_token[:10]}...")
                                         return
                                     
@@ -2524,10 +2533,12 @@ class BSCWebSocketMonitor:
                 except:
                     pass
             
-            # 🔒 关键：检查冷却期（只读，不设置）
-            # 避免为已在冷却期的代币构建消息
-            if not await self.check_alert_cooldown_readonly(target_token):
+            # 🔒 关键：原子化检查并设置冷却期（防止竞态条件）
+            # 使用 check_and_set 而不是 check_readonly，避免多线程同时通过检查
+            if not await self.check_and_set_alert_cooldown(target_token):
                 self.alert_cooldown_blocked += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_alert_cooldown_blocked.inc()
                 logger.info(f"⏳ 冷却期内，跳过: {target_token}")
                 return
             
@@ -2616,22 +2627,21 @@ class BSCWebSocketMonitor:
                 "sell_tax": f"{sell_tax:.1f}%"
             })
             
-            # 🚀 发送推送，成功后才设置冷却期
+            # 🚀 发送推送（冷却期已在前面设置，无论成败都不会重复发送）
             send_success = await self.send_alert(message, target_token)
             
             if send_success:
-                # ✅ 播报成功，设置冷却期
+                # ✅ 播报成功
                 self.alert_success_count += 1
                 if HAS_PROMETHEUS:
                     self.metrics_alerts.labels(status='success').inc()
-                await self.check_and_set_alert_cooldown(target_token)
-                logger.info(f"✅ 已设置冷却期: {target_token[:10]}... ({self.cooldown_minutes}分钟)")
+                logger.info(f"✅ 告警发送成功: {target_token[:10]}...")
             else:
-                # ❌ 播报失败，不设置冷却期，允许下次重试
+                # ❌ 播报失败（但冷却期已设置，避免重复尝试）
                 self.alert_fail_count += 1
                 if HAS_PROMETHEUS:
                     self.metrics_alerts.labels(status='failure').inc()
-                logger.warning(f"⚠️  播报失败，未设置冷却期: {target_token[:10]}...")
+                logger.warning(f"⚠️  播报失败: {target_token[:10]}...")
             
             # 记录到数据库并推送WebSocket（无论通知是否成功）
             await asyncio.to_thread(
