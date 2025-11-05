@@ -189,10 +189,10 @@ async def batch_ws_handler(
         try:
             logger.info(f"🔌 [{conn_name}] 正在连接 {WS_URL}...")
             
-            # websockets 12.0 使用 extra_headers
+            # websockets 12.0 使用 additional_headers
             async with websockets.connect(
                 WS_URL,
-                extra_headers=={'x-api-key': API_KEY},
+                additional_headers={'x-api-key': API_KEY},
                 ping_interval=30,
                 ping_timeout=60,
                 close_timeout=10

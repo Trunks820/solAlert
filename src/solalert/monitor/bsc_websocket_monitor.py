@@ -170,6 +170,7 @@ class BSCWebSocketMonitor:
         # 告警发送统计
         self.alert_success_count = 0  # 告警发送成功次数
         self.alert_fail_count = 0  # 告警发送失败次数
+        self.alert_cooldown_blocked = 0  # 冷却期拦截次数
         
         # ========== 直接处理架构（无队列）==========
         # 处理流程：WebSocket → 线程池 → 异步处理（低延迟，高吞吐）
@@ -1497,14 +1498,10 @@ class BSCWebSocketMonitor:
             raw_data = await dbotx_api.get_pair_info('bsc', pair_address)
             
             # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+            # 注意：API返回None是正常业务逻辑（代币未收录），不算失败
             if HAS_PROMETHEUS:
-                if raw_data:
-                    self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
-                else:
-                    self.metrics_api_calls.labels(api_type='dbotx', status='failure').inc()
-                    # 失败也消耗积分
-                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
             
             if not raw_data:
                 logger.debug("第二层过滤-无DBotX数据", extra={"token": token_address[:10]})
@@ -1712,14 +1709,10 @@ class BSCWebSocketMonitor:
             pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
             
             # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+            # 注意：API返回None是正常业务逻辑（代币未收录），不算失败
             if HAS_PROMETHEUS:
-                if pair_info_raw:
-                    self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
-                else:
-                    self.metrics_api_calls.labels(api_type='dbotx', status='failure').inc()
-                    # 失败也消耗积分
-                    self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
             
             # 🔍 调试：打印API返回的完整字段（仅打印前3个，避免刷屏）
             if pair_info_raw is not None and hasattr(self, '_api_debug_count'):
@@ -2086,6 +2079,7 @@ class BSCWebSocketMonitor:
         # 🔒 关键：检查冷却期（只读，不设置）
         # 避免为已在冷却期的代币构建消息
         if not await self.check_alert_cooldown_readonly(base_token):
+            self.alert_cooldown_blocked += 1
             logger.info(f"⏳ 冷却期内，跳过: {base_token}")
             return
         
@@ -2322,6 +2316,7 @@ class BSCWebSocketMonitor:
                                     
                                     # 冷却期检查（只读）
                                     if not await self.check_alert_cooldown_readonly(target_token):
+                                        self.alert_cooldown_blocked += 1
                                         logger.info(f"⏳ [内盘快速] 冷却期内，跳过: {target_token[:10]}...")
                                         return
                                     
@@ -2347,6 +2342,7 @@ class BSCWebSocketMonitor:
                                     
                                     # 设置冷却期（原子操作）
                                     if not await self.check_and_set_alert_cooldown(target_token):
+                                        self.alert_cooldown_blocked += 1
                                         logger.info(f"⏳ [内盘快速] 冷却期内（竞态），跳过: {target_token[:10]}...")
                                         return
                                     
@@ -2531,6 +2527,7 @@ class BSCWebSocketMonitor:
             # 🔒 关键：检查冷却期（只读，不设置）
             # 避免为已在冷却期的代币构建消息
             if not await self.check_alert_cooldown_readonly(target_token):
+                self.alert_cooldown_blocked += 1
                 logger.info(f"⏳ 冷却期内，跳过: {target_token}")
                 return
             
@@ -2851,11 +2848,14 @@ class BSCWebSocketMonitor:
                 
                 # 告警发送统计
                 total_alerts = self.alert_success_count + self.alert_fail_count
+                logger.info(f"   告警统计:")
+                logger.info(f"      ├─ ✅ 发送成功: {self.alert_success_count}")
+                logger.info(f"      ├─ ❌ 发送失败: {self.alert_fail_count}")
+                logger.info(f"      └─ ⏳ 冷却期拦截: {self.alert_cooldown_blocked}")
                 if total_alerts > 0:
+                    total_candidates = total_alerts + self.alert_cooldown_blocked
                     success_rate = (self.alert_success_count / total_alerts * 100)
-                    logger.info(f"   告警发送: {total_alerts} 次")
-                    logger.info(f"      ├─ ✅ 成功: {self.alert_success_count} ({success_rate:.1f}%)")
-                    logger.info(f"      └─ ❌ 失败: {self.alert_fail_count} ({100-success_rate:.1f}%)")
+                    logger.info(f"      总计: {total_candidates} 个候选 → 实际发送 {total_alerts} 个 (成功率 {success_rate:.1f}%)")
                 
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
