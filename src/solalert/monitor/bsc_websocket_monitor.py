@@ -249,54 +249,54 @@ class BSCWebSocketMonitor:
             try:
                 # Counter（计数器）- 只增不减
                 self.metrics_messages = Counter(
-                    'bsc_messages_total', 
+                    'bsc_ws_messages_total', 
                     'WebSocket接收的总消息数'
                 )
                 self.metrics_first_layer_pass = Counter(
-                    'bsc_first_layer_pass_total', 
+                    'bsc_ws_first_layer_pass_total', 
                     '第一层过滤通过次数',
                     ['type']  # type: internal/external
                 )
                 self.metrics_second_layer_check = Counter(
-                    'bsc_second_layer_check_total', 
+                    'bsc_ws_second_layer_check_total', 
                     '第二层检查次数',
                     ['type']  # type: internal/external
                 )
                 self.metrics_second_layer_pass = Counter(
-                    'bsc_second_layer_pass_total', 
+                    'bsc_ws_second_layer_pass_total', 
                     '第二层检查通过次数',
                     ['type']  # type: internal/external
                 )
                 self.metrics_alerts = Counter(
-                    'bsc_alerts_total', 
+                    'bsc_ws_alerts_total', 
                     '告警发送次数',
                     ['status']  # status: success/failure
                 )
                 self.metrics_cache_hits = Counter(
-                    'bsc_cache_hits_total', 
+                    'bsc_ws_cache_hits_total', 
                     '缓存命中次数',
                     ['cache_type']  # cache_type: receipt/eth_call/non_fourmeme
                 )
                 self.metrics_fallback = Counter(
-                    'bsc_time_window_fallback_total',
+                    'bsc_ws_fallback_total',
                     '时间窗口退让次数',
                     ['original', 'fallback']  # 1m->5m, 5m->1h
                 )
                 
                 # Gauge（仪表）- 可增可减
                 self.metrics_connections = Gauge(
-                    'bsc_websocket_connections', 
+                    'bsc_ws_connections', 
                     'WebSocket连接数'
                 )
                 self.metrics_cache_size = Gauge(
-                    'bsc_cache_size', 
+                    'bsc_ws_cache_size', 
                     '缓存大小',
                     ['cache_type']  # cache_type: seen_txs/receipt/eth_call
                 )
                 
                 # Histogram（直方图）- 延迟分布
                 self.metrics_processing_time = Histogram(
-                    'bsc_processing_seconds',
+                    'bsc_ws_processing_time_seconds',
                     '事件处理耗时（秒）',
                     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
                 )
