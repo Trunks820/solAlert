@@ -1853,14 +1853,14 @@ class BSCWebSocketMonitor:
                         logger.debug(f"✅ 已加入黑名单: {base_symbol} - {base_token[:10]}...")
                     except Exception as e:
                         logger.warning(f"⚠️  Redis缓存写入失败: {e}")
-                
-                # 🔍 详细日志：显示判定依据
-                if use_api_data and pair_info_raw:
-                    pre_dex = pair_info_raw.get('preDex', 'N/A')
-                    pool_type = pair_info_raw.get('poolType', 'N/A')
-                    logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | preDex={pre_dex}, poolType={pool_type} | {base_token[:10]}...")
-                else:
-                    logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
+                    
+                    # 🔍 详细日志：显示判定依据
+                    if use_api_data and pair_info_raw:
+                        pre_dex = pair_info_raw.get('preDex', 'N/A')
+                        pool_type = pair_info_raw.get('poolType', 'N/A')
+                        logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | preDex={pre_dex}, poolType={pool_type} | {base_token[:10]}...")
+                    else:
+                        logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
             else:
                 # API 失败，不确定 → 不加黑名单
                 logger.info(f"⚠️  [外盘] fourmeme检查失败（API故障），跳过但不加黑名单: {base_symbol} - {base_token[:10]}...")
