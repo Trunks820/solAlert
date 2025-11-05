@@ -1448,10 +1448,46 @@ class BSCWebSocketMonitor:
             else:
                 top10_holder_check_passed = "未配置"  # Redis未配置，跳过检查
             
-            # 7. 获取指标数据
+            # 7. 获取指标数据 + 时间窗口退让策略
             price_change = token_data.get('price_change', 0)
             volume = token_data.get('volume', 0)
             symbol = token_data.get('symbol', 'Unknown')
+            fallback_info = None  # 用于记录退让信息（给TG播报用）
+            
+            # 时间窗口退让：如果数据为0，自动退让到更长时间窗口
+            if price_change == 0 and volume == 0:
+                original_interval = time_interval
+                fallback_interval = None
+                
+                # 定义退让链（1m→5m停止，5m→1h停止）
+                if time_interval == '1m':
+                    fallback_interval = '5m'
+                elif time_interval == '5m':
+                    fallback_interval = '1h'
+                
+                # 尝试退让
+                if fallback_interval:
+                    logger.info(f"   🔄 {original_interval}数据为0，尝试退让至{fallback_interval}")
+                    fallback_data = dbotx_api.parse_token_data(raw_data, fallback_interval)
+                    if fallback_data:
+                        fallback_price_change = fallback_data.get('price_change', 0)
+                        fallback_volume = fallback_data.get('volume', 0)
+                        
+                        if fallback_price_change != 0 or fallback_volume != 0:
+                            # 退让成功，使用退让数据
+                            price_change = fallback_price_change
+                            volume = fallback_volume
+                            time_interval = fallback_interval  # 更新时间窗口
+                            fallback_info = {
+                                'original': original_interval,
+                                'fallback': fallback_interval,
+                                'reason': f'{original_interval}数据为0'
+                            }
+                            logger.info(f"   ✅ 退让成功: 使用{fallback_interval}数据 (涨幅{price_change:+.2f}%, 交易量${volume:,.2f})")
+                        else:
+                            logger.info(f"   ❌ {fallback_interval}数据也为0，无法退让")
+                    else:
+                        logger.warning(f"   ⚠️ 解析{fallback_interval}数据失败")
             
             # 8. 构造 stats 数据（用于 TriggerLogic）
             stats = {
@@ -1470,7 +1506,7 @@ class BSCWebSocketMonitor:
             else:
                 self.second_layer_check_external += 1
             
-            logger.info(f"🔎 [第二层指标检查] {pool_emoji}{pool_type} {symbol} ({token_address})")
+            logger.info(f"🔎 [第二层检查] {pool_emoji}{pool_type} {symbol} ({token_address})")
             logger.info(f"   ├─ {time_interval}涨幅: {price_change:+.2f}%")
             logger.info(f"   ├─ {time_interval}交易量: ${volume:,.2f}")
             
@@ -1516,6 +1552,7 @@ class BSCWebSocketMonitor:
             token_data['is_internal'] = is_internal
             token_data['pool_emoji'] = pool_emoji
             token_data['triggered_events'] = triggered_events
+            token_data['fallback_info'] = fallback_info  # 时间窗口退让信息
             
             return token_data
         
@@ -1761,7 +1798,9 @@ class BSCWebSocketMonitor:
             # 获取配置的时间间隔
             time_interval = self.time_interval_external  # 外盘
             
-            # 根据时间间隔选择对应的涨跌幅和交易量
+            # 根据时间间隔选择对应的涨跌幅和交易量 + 退让策略
+            fallback_info = None  # 退让信息
+            
             if time_interval == '1m':
                 price_change = pair_info_raw.get('priceChange1m', 0) * 100
                 volume = pair_info_raw.get('buyAndSellVolume1m', 0)
@@ -1774,6 +1813,45 @@ class BSCWebSocketMonitor:
             else:
                 price_change = pair_info_raw.get('priceChange5m', 0) * 100  # 默认5分钟
                 volume = pair_info_raw.get('buyAndSellVolume5m', 0)
+            
+            # 时间窗口退让：如果数据为0，自动退让到更长时间窗口
+            if price_change == 0 and volume == 0:
+                original_interval = time_interval
+                fallback_interval = None
+                
+                # 定义退让链（1m→5m停止，5m→1h停止）
+                if time_interval == '1m':
+                    fallback_interval = '5m'
+                elif time_interval == '5m':
+                    fallback_interval = '1h'
+                
+                # 尝试退让
+                if fallback_interval:
+                    logger.info(f"   🔄 [外盘快速路径] {original_interval}数据为0，尝试退让至{fallback_interval}")
+                    
+                    if fallback_interval == '5m':
+                        fallback_price_change = pair_info_raw.get('priceChange5m', 0) * 100
+                        fallback_volume = pair_info_raw.get('buyAndSellVolume5m', 0)
+                    elif fallback_interval == '1h':
+                        fallback_price_change = pair_info_raw.get('priceChange1h', 0) * 100
+                        fallback_volume = pair_info_raw.get('buyAndSellVolume1h', 0)
+                    else:
+                        fallback_price_change = 0
+                        fallback_volume = 0
+                    
+                    if fallback_price_change != 0 or fallback_volume != 0:
+                        # 退让成功
+                        price_change = fallback_price_change
+                        volume = fallback_volume
+                        time_interval = fallback_interval
+                        fallback_info = {
+                            'original': original_interval,
+                            'fallback': fallback_interval,
+                            'reason': f'{original_interval}数据为0'
+                        }
+                        logger.info(f"   ✅ 退让成功: 使用{fallback_interval}数据 (涨幅{price_change:+.2f}%, 交易量${volume:,.2f})")
+                    else:
+                        logger.info(f"   ❌ {fallback_interval}数据也为0，无法退让")
             
             # 获取外盘配置（从 external_events_config 读取）
             external_config = self.external_events_config
@@ -1790,18 +1868,18 @@ class BSCWebSocketMonitor:
             if price_change_enabled:
                 if price_change >= min_price_change:
                     triggered_events.append({'event': 'priceChange', 'value': price_change})
-                    logger.debug(f"✅ 涨跌幅达标: {price_change:+.2f}% >= {min_price_change}%")
+                    logger.info(f"   ✅ 涨跌幅达标: {price_change:+.2f}% >= {min_price_change}%")
                 else:
-                    logger.debug(f"⏭️  涨跌幅不足: {price_change:.2f}% < {min_price_change}%")
+                    logger.info(f"   ⏭️  涨跌幅不足: {price_change:.2f}% < {min_price_change}%")
             
             # 检查交易量
             volume_enabled = external_config.get('volume', {}).get('enabled', True)
             if volume_enabled:
                 if volume >= min_volume:
                     triggered_events.append({'event': 'volume', 'value': volume})
-                    logger.debug(f"✅ 交易量达标: ${volume:.2f} >= ${min_volume}")
+                    logger.info(f"   ✅ 交易量达标: ${volume:.2f} >= ${min_volume}")
                 else:
-                    logger.debug(f"⏭️  交易量不足: ${volume:.2f} < ${min_volume}")
+                    logger.info(f"   ⏭️  交易量不足: ${volume:.2f} < ${min_volume}")
             
             # 根据触发逻辑判断是否通过第二层
             trigger_logic = self.trigger_logic_external  # 'any' 或 'all'
@@ -1816,12 +1894,12 @@ class BSCWebSocketMonitor:
                 
                 triggered_event_names = {e['event'] for e in triggered_events}
                 if not all(evt in triggered_event_names for evt in required_events):
-                    logger.debug(f"⏭️  未满足'all'触发逻辑（需要所有指标）")
+                    logger.info(f"   ⏭️  未满足'all'触发逻辑（需要所有指标）")
                     return
             elif trigger_logic == 'any':
                 # 只要有一个指标达标即可
                 if not triggered_events:
-                    logger.debug(f"⏭️  未满足'any'触发逻辑（至少一个指标）")
+                    logger.info(f"   ⏭️  未满足'any'触发逻辑（至少一个指标）")
                     return
             
             logger.info(f"✅ 通过第二层: 触发事件={[e['event'] for e in triggered_events]}")
@@ -1841,7 +1919,8 @@ class BSCWebSocketMonitor:
                 'pool_type': pool_type or 'pancake_v2',
                 'pool_emoji': '🔥',
                 'is_internal': False,
-                'triggered_events': triggered_events
+                'triggered_events': triggered_events,
+                'fallback_info': fallback_info  # 时间窗口退让信息
             }
         else:
             # ============================================
@@ -1902,6 +1981,8 @@ class BSCWebSocketMonitor:
         price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
         
         triggered_events = token_data.get('triggered_events', [])
+        fallback_info = token_data.get('fallback_info')  # 获取退让信息
+        
         alert_reasons = []
         for event in triggered_events:
             if hasattr(event, 'description'):
@@ -1911,6 +1992,13 @@ class BSCWebSocketMonitor:
                     alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
                 elif event.get('event') == 'volume':
                     alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
+        
+        # 如果有退让信息，添加到告警原因
+        if fallback_info:
+            original = fallback_info['original']
+            fallback = fallback_info['fallback']
+            reason = fallback_info['reason']
+            alert_reasons.append(f"⚠️ {reason}，采用{fallback}数据")
         
         if not alert_reasons:
             alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
@@ -2257,6 +2345,7 @@ class BSCWebSocketMonitor:
             # 东八区时间
             cn_time = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
             logger.info(f"✅ [内盘] 通过第一层: {target_symbol} (${usd_value:.2f}) [{cn_time}]")
+            self.first_layer_pass_internal += 1  # 内盘第一层计数
             
             # 获取 launchpad 信息
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
@@ -2327,6 +2416,8 @@ class BSCWebSocketMonitor:
             price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
             
             triggered_events = token_data.get('triggered_events', [])
+            fallback_info = token_data.get('fallback_info')  # 获取退让信息
+            
             alert_reasons = []
             for event in triggered_events:
                 if hasattr(event, 'description'):
@@ -2336,6 +2427,13 @@ class BSCWebSocketMonitor:
                         alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
                     elif event.get('event') == 'volume':
                         alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
+            
+            # 如果有退让信息，添加到告警原因
+            if fallback_info:
+                original = fallback_info['original']
+                fallback = fallback_info['fallback']
+                reason = fallback_info['reason']
+                alert_reasons.append(f"⚠️ {reason}，采用{fallback}数据")
             
             if not alert_reasons:
                 alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
@@ -2590,6 +2688,11 @@ class BSCWebSocketMonitor:
                 
                 logger.info(f"   第二层检查: {total_second_check} 个")
                 if total_second_check > 0:
+                    internal_check_pct = (self.second_layer_check_internal / total_second_check * 100) if total_second_check > 0 else 0
+                    external_check_pct = (self.second_layer_check_external / total_second_check * 100) if total_second_check > 0 else 0
+                    logger.info(f"      ├─ 🔴 内盘: {self.second_layer_check_internal} ({internal_check_pct:.1f}%)")
+                    logger.info(f"      └─ 🟢 外盘: {self.second_layer_check_external} ({external_check_pct:.1f}%)")
+                    
                     pass_rate = (total_second_pass / total_second_check * 100)
                     fail_count = total_second_check - total_second_pass
                     fail_rate = 100 - pass_rate
