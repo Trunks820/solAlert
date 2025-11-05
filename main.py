@@ -23,7 +23,6 @@ from solalert.collectors.bonk_collector import BonkCollector
 from solalert.collectors.bsc_collector import BSCBlockCollector
 from solalert.tasks.twitter_push_sync import TwitterPushSyncService
 from solalert.monitor.token_monitor import TokenMonitorEngine
-from solalert.monitor.bsc_monitor import BSCMonitor
 from solalert.monitor.bsc_websocket_monitor import BSCWebSocketMonitor
 
 # SOL WS监控（单独导入，避免循环导入）

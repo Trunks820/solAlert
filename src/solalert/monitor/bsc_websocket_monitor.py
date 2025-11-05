@@ -24,6 +24,7 @@ from functools import lru_cache
 from collections import OrderedDict
 from ..api.telegram_api import TelegramAPI
 from ..api.dbotx_api import DBotXAPI
+from ..notifiers.telegram import TelegramNotifier
 from ..core.redis_client import get_redis
 from ..core.config import TELEGRAM_CONFIG
 from ..core.formatters import format_number
@@ -76,6 +77,9 @@ class BSCWebSocketMonitor:
         self.rpc_url = rpc_url
         self.enable_telegram = enable_telegram
         
+        # 启动时间
+        self.start_time = time.time()
+        
         # Redis
         self.redis_client = get_redis()
         
@@ -107,6 +111,7 @@ class BSCWebSocketMonitor:
         
         # Telegram 配置
         self.bsc_channel_id = str(TELEGRAM_CONFIG.get('bsc_channel_id'))
+        self.telegram_notifier = TelegramNotifier(enabled=self.enable_telegram)
         
         # 冷却期配置
         self.cooldown_minutes = 3.0
@@ -145,6 +150,18 @@ class BSCWebSocketMonitor:
         self.last_message_time = time.time()  # 最后一次收到消息的时间
         self.message_count = 0  # 消息计数器
         self.cache_hit_count = 0  # 非fourmeme缓存命中计数
+        
+        # 第一层/第二层统计（内外盘分别计数）
+        self.first_layer_pass_internal = 0  # 内盘通过第一层
+        self.first_layer_pass_external = 0  # 外盘通过第一层
+        self.second_layer_check_internal = 0  # 内盘第二层检查次数
+        self.second_layer_check_external = 0  # 外盘第二层检查次数
+        self.second_layer_pass_internal = 0  # 内盘通过第二层
+        self.second_layer_pass_external = 0  # 外盘通过第二层
+        
+        # 告警发送统计
+        self.alert_success_count = 0  # 告警发送成功次数
+        self.alert_fail_count = 0  # 告警发送失败次数
         
         # ========== 直接处理架构（无队列）==========
         # 处理流程：WebSocket → 线程池 → 异步处理（低延迟，高吞吐）
@@ -1308,22 +1325,25 @@ class BSCWebSocketMonitor:
         try:
             reply_markup = self.create_token_buttons(token_address)
             
-            result = await TelegramAPI.send_message(
-                chat_id=self.bsc_channel_id,
+            result = await self.telegram_notifier.send(
+                target=self.bsc_channel_id,
                 message=message,
                 parse_mode="HTML",
                 reply_markup=reply_markup
             )
             
-            if result.get('success'):
+            if result:
                 logger.info(f"✅ Telegram通知已发送 - {token_address[:10]}...")
+                self.alert_success_count += 1  # 发送成功计数
                 return True
             else:
-                logger.error(f"❌ Telegram发送失败 - {token_address[:10]}...: {result.get('error')}")
+                logger.error(f"❌ Telegram发送失败 - {token_address[:10]}...")
+                self.alert_fail_count += 1  # 发送失败计数
                 return False
         
         except Exception as e:
             logger.error(f"❌ 发送通知异常: {e}")
+            self.alert_fail_count += 1  # 异常也算发送失败
             return False
     
     async def check_external_is_fourmeme(self, token_address: str) -> tuple[bool, bool, Optional[Dict]]:
@@ -1444,6 +1464,12 @@ class BSCWebSocketMonitor:
             events_config = self.internal_events_config if is_internal else self.external_events_config
             trigger_logic = self.trigger_logic_internal if is_internal else self.trigger_logic_external
             
+            # 第二层检查计数
+            if is_internal:
+                self.second_layer_check_internal += 1
+            else:
+                self.second_layer_check_external += 1
+            
             logger.info(f"🔎 [第二层指标检查] {pool_emoji}{pool_type} {symbol} ({token_address})")
             logger.info(f"   ├─ {time_interval}涨幅: {price_change:+.2f}%")
             logger.info(f"   ├─ {time_interval}交易量: ${volume:,.2f}")
@@ -1479,6 +1505,12 @@ class BSCWebSocketMonitor:
             
             # 11. 通过筛选，返回数据
             logger.info(f"   ✅ 满足条件！触发 {len(triggered_events)} 个事件")
+            
+            # 第二层通过计数
+            if is_internal:
+                self.second_layer_pass_internal += 1
+            else:
+                self.second_layer_pass_external += 1
             
             token_data['pool_type'] = pool_type
             token_data['is_internal'] = is_internal
@@ -1657,6 +1689,7 @@ class BSCWebSocketMonitor:
         # 东八区时间
         cn_time = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
         logger.info(f"✅ [外盘] 通过第一层: {base_symbol} (${usd_value:.2f}) [{cn_time}] - {base_token[:10]}...")
+        self.first_layer_pass_external += 1  # 外盘第一层计数
         
         # 🚀 优化：先检查 Redis 缓存（非fourmeme token黑名单）
         if self.redis_client:
@@ -1792,6 +1825,9 @@ class BSCWebSocketMonitor:
                     return
             
             logger.info(f"✅ 通过第二层: 触发事件={[e['event'] for e in triggered_events]}")
+            
+            # 外盘快速路径通过第二层计数
+            self.second_layer_pass_external += 1
             
             # 构建 token_data（兼容原有格式）
             token_data = {
@@ -2499,9 +2535,17 @@ class BSCWebSocketMonitor:
                             self.seen_txs.popitem(last=False)  # 弹出最老的
                     logger.info(f"🧹 去重缓存清理: 移除 {cleanup_count} 条旧记录 ({seen_txs_size} → {len(self.seen_txs)})")
                 
+                # 计算运行时长
+                running_seconds = int(time.time() - self.start_time)
+                running_hours = running_seconds // 3600
+                running_minutes = (running_seconds % 3600) // 60
+                running_secs = running_seconds % 60
+                uptime_str = f"{running_hours}时{running_minutes}分{running_secs}秒" if running_hours > 0 else f"{running_minutes}分{running_secs}秒"
+                
                 logger.info("=" * 80)
                 logger.info("💓 WebSocket 健康检查")
                 logger.info(f"   状态: {'🟢 运行中' if self.ws and not self.should_stop else '🔴 已停止'}")
+                logger.info(f"   运行时长: {uptime_str}")
                 logger.info(f"   重连次数: {self.reconnect_count}")
                 logger.info(f"   回补次数: {self.backfill_count} (冷却期: {self.backfill_cooldown}s)")
                 logger.info(f"   消息总数: {self.message_count}")
@@ -2532,30 +2576,35 @@ class BSCWebSocketMonitor:
                 logger.info(f"   eth_call缓存: {len(self.eth_call_cache)} 条 (命中 {self.eth_call_cache_hits} 次, 节省RPC)")
                 logger.info(f"   非fourmeme缓存: {self.cache_hit_count} 次（节省API调用）")
                 
-                # RPC 调用统计（本次运行累计）
-                total_rpc_calls = sum(self.rpc_stats.values())
-                if total_rpc_calls > 0:
-                    running_hours = (time.time() - self.rpc_stats_start_time) / 3600
-                    rpc_per_hour = total_rpc_calls / running_hours if running_hours > 0 else 0
-                    daily_projection = rpc_per_hour * 24
-                    
-                    logger.info(f"   RPC统计（累计）: {total_rpc_calls} 次 ({rpc_per_hour:.0f}/小时, 日推算:{daily_projection/1_000_000:.2f}M)")
-                    # 显示 Top 3 方法
-                    top_methods = sorted(self.rpc_stats.items(), key=lambda x: x[1], reverse=True)[:3]
-                    for method, count in top_methods:
-                        logger.info(f"      ├─ {method}: {count} 次")
-                    
-                    # 429限流统计
-                    if self.rate_limit_429_count > 0:
-                        rate_429 = (self.rate_limit_429_count / total_rpc_calls * 100) if total_rpc_calls > 0 else 0
-                        logger.info(f"      └─ ⚠️ 429限流: {self.rate_limit_429_count} 次 ({rate_429:.2f}%, 连续{self.rate_limit_consecutive_429}次)")
-                    else:
-                        logger.info(f"      └─ ✅ 无429限流")
+                # 第一层/第二层统计
+                total_first_layer = self.first_layer_pass_internal + self.first_layer_pass_external
+                total_second_check = self.second_layer_check_internal + self.second_layer_check_external
+                total_second_pass = self.second_layer_pass_internal + self.second_layer_pass_external
                 
-                # 线程池统计（直接处理模式）
-                logger.info(f"   处理模式: 🚀 直接处理（无队列缓冲）")
-                logger.info(f"   线程池: {self.executor._max_workers} 个工作线程")
-                logger.info(f"      └─ 处理方式: WebSocket → 线程池 → 异步处理（低延迟）")
+                logger.info(f"   第一层过滤: 通过 {total_first_layer} 个")
+                if total_first_layer > 0:
+                    internal_pct = (self.first_layer_pass_internal / total_first_layer * 100)
+                    external_pct = (self.first_layer_pass_external / total_first_layer * 100)
+                    logger.info(f"      ├─ 🔴 内盘: {self.first_layer_pass_internal} ({internal_pct:.1f}%)")
+                    logger.info(f"      └─ 🟢 外盘: {self.first_layer_pass_external} ({external_pct:.1f}%)")
+                
+                logger.info(f"   第二层检查: {total_second_check} 个")
+                if total_second_check > 0:
+                    pass_rate = (total_second_pass / total_second_check * 100)
+                    fail_count = total_second_check - total_second_pass
+                    fail_rate = 100 - pass_rate
+                    logger.info(f"      ├─ ✅ 通过: {total_second_pass} ({pass_rate:.1f}%)")
+                    logger.info(f"      │  ├─ 🔴 内盘: {self.second_layer_pass_internal}")
+                    logger.info(f"      │  └─ 🟢 外盘: {self.second_layer_pass_external}")
+                    logger.info(f"      └─ ❌ 未通过: {fail_count} ({fail_rate:.1f}%)")
+                
+                # 告警发送统计
+                total_alerts = self.alert_success_count + self.alert_fail_count
+                if total_alerts > 0:
+                    success_rate = (self.alert_success_count / total_alerts * 100)
+                    logger.info(f"   告警发送: {total_alerts} 次")
+                    logger.info(f"      ├─ ✅ 成功: {self.alert_success_count} ({success_rate:.1f}%)")
+                    logger.info(f"      └─ ❌ 失败: {self.alert_fail_count} ({100-success_rate:.1f}%)")
                 
                 logger.info(f"   上次消息: {idle_seconds}秒前")
                 logger.info(f"   空闲警告: {'⚠️ 超过5分钟无消息！' if idle_seconds > 300 else '✅ 正常'}")
