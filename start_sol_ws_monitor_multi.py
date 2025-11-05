@@ -192,7 +192,7 @@ async def batch_ws_handler(
             # websockets 12.0 使用 extra_headers
             async with websockets.connect(
                 WS_URL,
-                additional_headers={'x-api-key': API_KEY},
+                extra_headers=={'x-api-key': API_KEY},
                 ping_interval=30,
                 ping_timeout=60,
                 close_timeout=10
