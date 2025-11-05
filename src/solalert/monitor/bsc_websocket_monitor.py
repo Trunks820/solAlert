@@ -261,12 +261,12 @@ class BSCWebSocketMonitor:
                 self.metrics_second_layer_check = Counter(
                     'bsc_ws_second_layer_check_total', 
                     '第二层检查次数',
-                    ['type']  # type: internal/external
+                    ['type', 'path']  # type: internal/external, path: fast/fallback
                 )
                 self.metrics_second_layer_pass = Counter(
                     'bsc_ws_second_layer_pass_total', 
                     '第二层检查通过次数',
-                    ['type']  # type: internal/external
+                    ['type', 'path']  # type: internal/external, path: fast/fallback
                 )
                 self.metrics_alerts = Counter(
                     'bsc_ws_alerts_total', 
@@ -282,6 +282,15 @@ class BSCWebSocketMonitor:
                     '缓存命中次数',
                     ['cache_type']  # cache_type: receipt/eth_call/non_fourmeme
                 )
+                self.metrics_non_fourmeme = Counter(
+                    'bsc_ws_non_fourmeme_total',
+                    '非fourmeme跳过次数（API首判+缓存）',
+                    ['source']  # source: api_first_check/cache_hit
+                )
+                self.metrics_fourmeme_fast_path = Counter(
+                    'bsc_ws_fourmeme_fast_path_total',
+                    'fourmeme快速路径使用次数（API数据完整）'
+                )
                 self.metrics_fallback = Counter(
                     'bsc_ws_fallback_total',
                     '时间窗口退让次数',
@@ -296,6 +305,15 @@ class BSCWebSocketMonitor:
                     'bsc_ws_credits_consumed_total',
                     '消费积分总量（仅DBotX API）',
                     ['source']  # source: dbotx(10分), BSC WebSocket/RPC使用Chainstack不计费
+                )
+                
+                # Histogram（直方图）- 统计分布
+                from prometheus_client import Histogram
+                self.metrics_processing_time = Histogram(
+                    'bsc_ws_processing_time_seconds',
+                    '消息处理耗时（秒）',
+                    ['stage'],  # stage: first_layer/second_layer/alert
+                    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
                 )
                 
                 # Gauge（仪表）- 可增可减
@@ -1487,9 +1505,14 @@ class BSCWebSocketMonitor:
         token_address: str,
         pair_address: str,
         launchpad_info: Dict,
-        is_internal: bool
+        is_internal: bool,
+        path: str = 'fallback'
     ) -> Optional[Dict]:
-        """第二层过滤：指标检查"""
+        """
+        第二层过滤：指标检查
+        Args:
+            path: 'fast' 或 'fallback'，用于Prometheus标签
+        """
         dbotx_api = self.get_thread_dbotx_api()
         
         try:
@@ -1606,11 +1629,11 @@ class BSCWebSocketMonitor:
             if is_internal:
                 self.second_layer_check_internal += 1
                 if HAS_PROMETHEUS:
-                    self.metrics_second_layer_check.labels(type='internal').inc()
+                    self.metrics_second_layer_check.labels(type='internal', path=path).inc()
             else:
                 self.second_layer_check_external += 1
                 if HAS_PROMETHEUS:
-                    self.metrics_second_layer_check.labels(type='external').inc()
+                    self.metrics_second_layer_check.labels(type='external', path=path).inc()
             
             logger.info(f"🔎 [第二层检查] {pool_emoji}{pool_type} {symbol} ({token_address})")
             logger.info(f"   ├─ {time_interval}涨幅: {price_change:+.2f}%")
@@ -1652,11 +1675,11 @@ class BSCWebSocketMonitor:
             if is_internal:
                 self.second_layer_pass_internal += 1
                 if HAS_PROMETHEUS:
-                    self.metrics_second_layer_pass.labels(type='internal').inc()
+                    self.metrics_second_layer_pass.labels(type='internal', path=path).inc()
             else:
                 self.second_layer_pass_external += 1
                 if HAS_PROMETHEUS:
-                    self.metrics_second_layer_pass.labels(type='external').inc()
+                    self.metrics_second_layer_pass.labels(type='external', path=path).inc()
             
             token_data['pool_type'] = pool_type
             token_data['is_internal'] = is_internal
@@ -1855,6 +1878,11 @@ class BSCWebSocketMonitor:
                 if is_cached_non_fourmeme:
                     self.cache_hit_count += 1
                     logger.info(f"⏭️  [外盘] 非fourmeme (缓存命中 #{self.cache_hit_count}): {base_symbol} (${usd_value:.2f}) - {base_token[:10]}...")
+                    
+                    # 📊 Prometheus: 缓存命中非fourmeme
+                    if HAS_PROMETHEUS:
+                        self.metrics_non_fourmeme.labels(source='cache_hit').inc()
+                    
                     return
             except Exception as e:
                 logger.warning(f"⚠️  Redis缓存查询失败: {e}")
@@ -1876,6 +1904,10 @@ class BSCWebSocketMonitor:
         
         if not is_fourmeme:
             if is_confirmed:
+                # 📊 Prometheus: API首次判断为非fourmeme
+                if HAS_PROMETHEUS:
+                    self.metrics_non_fourmeme.labels(source='api_first_check').inc()
+                
                 # 确认不是fourmeme → 加入Redis黑名单（30天过期）
                 if self.redis_client:
                     try:
@@ -1911,6 +1943,10 @@ class BSCWebSocketMonitor:
             # 快速路径：直接使用 API 返回的数据进行第二层判断
             # ============================================
             logger.info(f"⚡ [快速路径] 使用API数据进行第二层检查: {base_token[:10]}...")
+            
+            # 📊 Prometheus: 快速路径使用
+            if HAS_PROMETHEUS:
+                self.metrics_fourmeme_fast_path.inc()
             
             token_price_usd = pair_info_raw.get('tokenPriceUsd', 0)
             market_cap = pair_info_raw.get('marketCap', 0)
@@ -1981,7 +2017,7 @@ class BSCWebSocketMonitor:
             
             # Prometheus: 外盘快速路径第二层检查计数
             if HAS_PROMETHEUS:
-                self.metrics_second_layer_check.labels(type='external').inc()
+                self.metrics_second_layer_check.labels(type='external', path='fast').inc()
             
             # 第二层判断：涨跌幅和交易量
             min_price_change = external_config.get('priceChange', {}).get('risePercent', 50)  # 默认50%
@@ -2034,7 +2070,7 @@ class BSCWebSocketMonitor:
             # 外盘快速路径通过第二层计数
             self.second_layer_pass_external += 1
             if HAS_PROMETHEUS:
-                self.metrics_second_layer_pass.labels(type='external').inc()
+                self.metrics_second_layer_pass.labels(type='external', path='fast').inc()
             
             # 构建 token_data（兼容原有格式）
             token_data = {
