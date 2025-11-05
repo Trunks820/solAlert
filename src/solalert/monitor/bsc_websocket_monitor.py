@@ -334,7 +334,48 @@ class BSCWebSocketMonitor:
                     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
                 )
                 
-                logger.info("✅ Prometheus Metrics 已启用")
+                # ========== 指标初始化：预创建所有标签组合，避免 Grafana 查询空值 ==========
+                # 初始化所有 Counter（inc(0) 不影响实际值）
+                self.metrics_first_layer_pass.labels(type='internal').inc(0)
+                self.metrics_first_layer_pass.labels(type='external').inc(0)
+                
+                self.metrics_second_layer_check.labels(type='internal', path='fast').inc(0)
+                self.metrics_second_layer_check.labels(type='internal', path='fallback').inc(0)
+                self.metrics_second_layer_check.labels(type='external', path='fast').inc(0)
+                self.metrics_second_layer_check.labels(type='external', path='fallback').inc(0)
+                
+                self.metrics_second_layer_pass.labels(type='internal', path='fast').inc(0)
+                self.metrics_second_layer_pass.labels(type='internal', path='fallback').inc(0)
+                self.metrics_second_layer_pass.labels(type='external', path='fast').inc(0)
+                self.metrics_second_layer_pass.labels(type='external', path='fallback').inc(0)
+                
+                self.metrics_alerts.labels(status='success').inc(0)
+                self.metrics_alerts.labels(status='failure').inc(0)
+                
+                self.metrics_cache_hits.labels(cache_type='receipt').inc(0)
+                self.metrics_cache_hits.labels(cache_type='eth_call').inc(0)
+                self.metrics_cache_hits.labels(cache_type='non_fourmeme').inc(0)
+                
+                self.metrics_non_fourmeme.labels(source='api_first_check').inc(0)
+                self.metrics_non_fourmeme.labels(source='cache_hit').inc(0)
+                
+                self.metrics_fallback.labels(original='1m', fallback='5m').inc(0)
+                self.metrics_fallback.labels(original='5m', fallback='1h').inc(0)
+                
+                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc(0)
+                self.metrics_api_calls.labels(api_type='dbotx', status='failure').inc(0)
+                self.metrics_api_calls.labels(api_type='rpc', status='success').inc(0)
+                self.metrics_api_calls.labels(api_type='rpc', status='failure').inc(0)
+                
+                self.metrics_credits_consumed.labels(source='dbotx').inc(0)
+                
+                # 初始化 Gauge（连接状态初始为 0=断开）
+                self.metrics_connections.set(0)
+                self.metrics_cache_size.labels(cache_type='seen_txs').set(0)
+                self.metrics_cache_size.labels(cache_type='receipt').set(0)
+                self.metrics_cache_size.labels(cache_type='eth_call').set(0)
+                
+                logger.info("✅ Prometheus Metrics 已启用（所有标签已初始化）")
             except Exception as e:
                 logger.error(f"❌ Prometheus Metrics 初始化失败: {e}")
                 # 注意：不修改 HAS_PROMETHEUS，因为它是模块级全局常量
