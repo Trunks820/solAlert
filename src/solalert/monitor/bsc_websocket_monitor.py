@@ -289,8 +289,8 @@ class BSCWebSocketMonitor:
                 )
                 self.metrics_credits_consumed = Counter(
                     'bsc_ws_credits_consumed_total',
-                    '消费积分总量',
-                    ['source']  # source: websocket(5分)/dbotx(10分), RPC不计费
+                    '消费积分总量（仅DBotX API）',
+                    ['source']  # source: dbotx(10分), BSC WebSocket/RPC使用Chainstack不计费
                 )
                 
                 # Gauge（仪表）- 可增可减
@@ -2075,13 +2075,13 @@ class BSCWebSocketMonitor:
                 }
                 
                 # 调用统一的第二层过滤
-        token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
+                token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
                 
-        if not token_data:
-            logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
-            return
-        
-        logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
+                if not token_data:
+                    logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
+                    return
+                
+                logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
         
         # 🔒 关键：检查冷却期（只读，不设置）
         # 避免为已在冷却期的代币构建消息
@@ -2885,10 +2885,9 @@ class BSCWebSocketMonitor:
             self.last_message_time = time.time()
             self.message_count += 1
             
-            # Prometheus: 消息计数 + 积分消费（WebSocket接收消息：5分/次）
+            # Prometheus: 消息计数（BSC WebSocket使用Chainstack，无限制，不消耗积分）
             if HAS_PROMETHEUS:
                 self.metrics_messages.inc()
-                self.metrics_credits_consumed.labels(source='websocket').inc(5)
             
             msg = json.loads(message)
             
