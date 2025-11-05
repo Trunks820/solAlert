@@ -304,7 +304,7 @@ class BSCWebSocketMonitor:
                 logger.info("✅ Prometheus Metrics 已启用")
             except Exception as e:
                 logger.error(f"❌ Prometheus Metrics 初始化失败: {e}")
-                HAS_PROMETHEUS = False
+                # 注意：不修改 HAS_PROMETHEUS，因为它是模块级全局常量
         else:
             logger.warning("⚠️ Prometheus Metrics 未安装")
         
