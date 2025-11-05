@@ -18,7 +18,8 @@ httpx[socks]==0.25.2
 brotli==1.1.0  # 用于解压 Brotli 压缩的响应
 
 # WebSocket Client
-websocket-client==1.7.0
+websocket-client==1.7.0  # 同步WebSocket (BSC监控使用)
+websockets==12.0  # 异步WebSocket (SOL监控使用)
 
 # Web3 for ABI encoding
 eth-abi==4.2.1

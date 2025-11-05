@@ -189,13 +189,30 @@ async def batch_ws_handler(
         try:
             logger.info(f"🔌 [{conn_name}] 正在连接 {WS_URL}...")
             
-            async with websockets.connect(
-                WS_URL,
-                extra_headers={'x-api-key': API_KEY},
-                ping_interval=30,
-                ping_timeout=60,
-                close_timeout=10
-            ) as ws:
+            # 兼容不同版本的 websockets 库
+            ws_kwargs = {
+                'ping_interval': 30,
+                'ping_timeout': 60,
+                'close_timeout': 10
+            }
+            
+            # 尝试使用 additional_headers (websockets 11+)
+            try:
+                ws_kwargs['additional_headers'] = {'x-api-key': API_KEY}
+                ws = await websockets.connect(WS_URL, **ws_kwargs)
+            except TypeError:
+                # fallback: 使用 extra_headers (websockets 10.x)
+                ws_kwargs.pop('additional_headers')
+                ws_kwargs['extra_headers'] = {'x-api-key': API_KEY}
+                try:
+                    ws = await websockets.connect(WS_URL, **ws_kwargs)
+                except TypeError:
+                    # fallback: 不支持 headers，直接连接（需要在URL中带token）
+                    ws_kwargs.pop('extra_headers')
+                    url_with_key = f"{WS_URL}?x-api-key={API_KEY}"
+                    ws = await websockets.connect(url_with_key, **ws_kwargs)
+            
+            async with ws:
                 logger.info(f"✅ [{conn_name}] 已连接")
                 stats[batch_id]['status'] = 'connected'
                 
