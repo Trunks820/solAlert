@@ -352,13 +352,20 @@ class SolWebSocketConnection:
         """
         ca = config['ca']
         token_symbol = config.get('token_symbol', 'Unknown')
+        template_name = config.get('template_name', '未知')
+        
+        # 🚀 显示配置信息
+        config_info = self.alert_checker.format_config_summary(config)
         
         logger.info(f"\n{'='*80}")
         logger.info(f"🔔 告警触发！")
         logger.info(f"{'='*80}")
         logger.info(f"Token: {token_symbol} ({ca[:10]}...{ca[-6:]})")
+        logger.info(f"📋 模板: {template_name}")
+        logger.info(f"⚙️  配置: {config_info}")
         logger.info(f"价格变化: {metrics['price_change']:+.2f}%")
         logger.info(f"交易量: ${metrics['total_volume']:,.0f}")
+        logger.info(f"✨ 触发原因:")
         for reason in reasons:
             logger.info(f"  • {reason}")
         logger.info(f"{'='*80}\n")

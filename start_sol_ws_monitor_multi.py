@@ -154,7 +154,18 @@ async def batch_ws_handler(
         logger.error(f"❌ [{conn_name}] 无数据")
         return
     
-    logger.info(f"✅ [{conn_name}] 加载 {len(pairs)} 个pair（配置已缓存到内存）")
+    # 🚀 显示批次配置详情
+    if pairs:
+        # 获取第一个配置作为代表（一个批次通常使用相同模板）
+        first_config = next(iter(pair_to_full_config.values()))
+        config_summary = alert_checker.format_config_summary(first_config)
+        template_name = first_config.get('template_name', '未知模板')
+        
+        logger.info(f"✅ [{conn_name}] 加载 {len(pairs)} 个pair（配置已缓存到内存）")
+        logger.info(f"   📋 模板: {template_name}")
+        logger.info(f"   ⚙️  配置: {config_summary}")
+    else:
+        logger.info(f"✅ [{conn_name}] 加载 {len(pairs)} 个pair（配置已缓存到内存）")
     
     # 统计
     message_count = 0
@@ -306,11 +317,17 @@ async def batch_ws_handler(
                                 )
                                 
                                 if should_alert:
+                                    # 🚀 显示配置信息
+                                    config_info = alert_checker.format_config_summary(full_config)
+                                    template_name = full_config.get('template_name', '未知')
+                                    
                                     logger.info(
                                         f"🔔 [{conn_name}] {symbol} 告警触发！"
-                                        f"涨跌幅:{pc1m:+.2f}% 交易量:${volume:,.0f} | "
-                                        f"原因: {', '.join(reasons)}"
+                                        f"涨跌幅:{pc1m:+.2f}% 交易量:${volume:,.0f}"
                                     )
+                                    logger.info(f"   📋 模板: {template_name}")
+                                    logger.info(f"   ⚙️  配置: {config_info}")
+                                    logger.info(f"   ✨ 原因: {', '.join(reasons)}")
                                     
                                     # 格式化消息
                                     msg_text = alert_checker.format_alert_message(

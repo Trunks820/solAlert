@@ -64,10 +64,11 @@ class SolAlertChecker:
             logger.debug(f"数据无效，跳过检查")
             return False, [], {}
         
-        # 2. 提取配置
+        # 2. 提取配置（兼容 triggerLogic 和 trigger_logic 两种命名）
         time_interval = config.get('time_interval', '1m')
         events_config_str = config.get('events_config', '{}')
-        trigger_logic = config.get('trigger_logic', 'any')
+        # 兼容驼峰(Redis)和蛇形(Database)命名
+        trigger_logic = config.get('trigger_logic') or config.get('triggerLogic', 'any')
         ca = config.get('ca', '')
         
         # 解析events_config
@@ -254,6 +255,58 @@ class SolAlertChecker:
         
         logger.debug(f"设置冷却期: {ca[:10]}... ({cooldown_seconds}秒)")
     
+    def format_config_summary(self, config: Dict[str, Any]) -> str:
+        """
+        格式化配置摘要（用于日志和 TG 通知）
+        
+        Args:
+            config: 配置字典
+        
+        Returns:
+            配置摘要字符串
+        """
+        time_interval = config.get('time_interval', '1m')
+        trigger_logic = config.get('trigger_logic') or config.get('triggerLogic', 'any')
+        trigger_logic_cn = 'any' if trigger_logic == 'any' else '全部'
+        events_config_str = config.get('events_config', '{}')
+        
+        # 解析监控条件
+        try:
+            events_config = json.loads(events_config_str)
+        except json.JSONDecodeError:
+            return f"时间:{time_interval} | 触发:{trigger_logic_cn}"
+        
+        conditions = []
+        
+        # 价格变化条件
+        price_change = events_config.get('priceChange', {})
+        if price_change.get('enabled'):
+            rise = price_change.get('risePercent')
+            fall = price_change.get('fallPercent')
+            if rise and fall:
+                conditions.append(f"价格±{rise}/{fall}%")
+            elif rise:
+                conditions.append(f"价格↑{rise}%")
+            elif fall:
+                conditions.append(f"价格↓{fall}%")
+        
+        # 交易量条件
+        volume = events_config.get('volume', {})
+        if volume.get('enabled'):
+            threshold = volume.get('threshold', 0)
+            if threshold > 0:
+                conditions.append(f"交易量>${threshold:,.0f}")
+        
+        # 持有者条件（如果未来支持）
+        holders = events_config.get('holders', {})
+        if holders.get('enabled'):
+            conditions.append("持有者数变化")
+        
+        if not conditions:
+            conditions.append("无条件")
+        
+        return f"时间:{time_interval} | 触发:{trigger_logic_cn} | 条件:{' & '.join(conditions)}"
+    
     def format_alert_message(
         self,
         config: Dict[str, Any],
@@ -277,6 +330,40 @@ class SolAlertChecker:
         template_name = config.get('template_name', '')
         time_interval = config.get('time_interval', '1m')
         
+        # 🚀 获取配置摘要
+        config_summary = self.format_config_summary(config)
+        
+        # 🚀 提取触发逻辑和监控条件
+        trigger_logic = config.get('trigger_logic') or config.get('triggerLogic', 'any')
+        trigger_logic_cn = '任一条件' if trigger_logic == 'any' else '全部条件'
+        events_config_str = config.get('events_config', '{}')
+        
+        # 解析events_config以显示详细配置
+        try:
+            events_config = json.loads(events_config_str)
+        except json.JSONDecodeError:
+            events_config = {}
+        
+        monitor_conditions = []
+        price_change = events_config.get('priceChange', {})
+        if price_change.get('enabled'):
+            rise = price_change.get('risePercent')
+            fall = price_change.get('fallPercent')
+            if rise and fall:
+                monitor_conditions.append(f"  • 价格变化: ±{rise}% / ±{fall}%")
+            elif rise:
+                monitor_conditions.append(f"  • 价格上涨: >{rise}%")
+            elif fall:
+                monitor_conditions.append(f"  • 价格下跌: >{fall}%")
+        
+        volume = events_config.get('volume', {})
+        if volume.get('enabled'):
+            threshold = volume.get('threshold', 0)
+            if threshold > 0:
+                monitor_conditions.append(f"  • 交易量: >${threshold:,.0f}")
+        
+        monitor_str = '\n'.join(monitor_conditions) if monitor_conditions else '  • 无特定条件'
+        
         # 构造消息（HTML格式）
         # 🚀 CA 链接：蓝色文本 + 可点击复制 + 点击跳转solscan
         ca_link = f'<a href="https://solscan.io/token/{ca}"><code>{ca}</code></a>'
@@ -291,6 +378,12 @@ class SolAlertChecker:
 📝 名称: {token_name}
 🔗 CA: {ca_link}
 🏷️ 模板: {template_name}
+
+📊 <b>监控配置</b>
+⏰ 时间窗口: {time_interval}
+🎯 触发逻辑: {trigger_logic_cn}
+🔍 监控条件:
+{monitor_str}
 
 💵 当前价格: ${metrics['price']:.10f}
 💎 市值: {market_cap_str}
