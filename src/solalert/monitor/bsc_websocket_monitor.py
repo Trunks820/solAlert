@@ -374,8 +374,6 @@ class BSCWebSocketMonitor:
                 self.metrics_cache_size.labels(cache_type='seen_txs').set(0)
                 self.metrics_cache_size.labels(cache_type='receipt').set(0)
                 self.metrics_cache_size.labels(cache_type='eth_call').set(0)
-                
-                logger.info("✅ Prometheus Metrics 已启用（所有标签已初始化）")
             except Exception as e:
                 logger.error(f"❌ Prometheus Metrics 初始化失败: {e}")
                 # 注意：不修改 HAS_PROMETHEUS，因为它是模块级全局常量
@@ -404,8 +402,6 @@ class BSCWebSocketMonitor:
                 self.cumulative_min_amount_internal = config.get('cumulative_min_amount_usd', 500)
                 self.time_interval_internal = config.get('timeInterval', '1m')  # 内盘时间间隔
                 self.trigger_logic_internal = config.get('triggerLogic', 'any')  # 内盘触发逻辑
-                
-                logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 累计>={self.cumulative_min_amount_internal}U, 时间间隔={self.time_interval_internal}")
                 # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
                 threshold = config.get('topHoldersThreshold')
                 self.top_holders_threshold_internal = float(threshold) if threshold is not None else None
@@ -449,8 +445,6 @@ class BSCWebSocketMonitor:
                 self.time_interval_external = config.get('timeInterval', '5m')  # 外盘时间间隔
                 self.trigger_logic_external = config.get('triggerLogic', 'any')  # 外盘触发逻辑
                 
-                logger.info(f"📊 外盘配置: 单笔>={self.min_amount_external}U, 累计>={self.cumulative_min_amount_external}U, 时间间隔={self.time_interval_external}")
-                
                 # topHoldersThreshold：如果配置了就启用检查，否则为None（不检查）
                 threshold = config.get('topHoldersThreshold')
                 self.top_holders_threshold_external = float(threshold) if threshold is not None else None  
@@ -482,17 +476,8 @@ class BSCWebSocketMonitor:
         self.global_min_amount = min(self.min_amount_internal, self.min_amount_external)
         logger.info(f"🔍 全局最小过滤阈值: {self.global_min_amount}U（取内外盘最小值，提前过滤小额交易）")
         
-        # 打印最终配置信息
-        logger.info(f"📊 内盘配置: 单笔>={self.min_amount_internal}U, 累计>={self.cumulative_min_amount_internal}U, 涨幅>={self.internal_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.internal_events_config.get('volume', {}).get('threshold')}, 触发逻辑={self.trigger_logic_internal}")
-        logger.info(f"📊 外盘配置: 单笔>={self.min_amount_external}U, 累计>={self.cumulative_min_amount_external}U, 涨幅>={self.external_events_config.get('priceChange', {}).get('risePercent')}%, 交易量>=${self.external_events_config.get('volume', {}).get('threshold')}, 触发逻辑={self.trigger_logic_external}")
-        
-        # 性能优化说明
-        logger.info("✨ 性能优化: 已启用三层缓存架构 (L1: 内存LRU / L2: Redis持久化 / L3: Multicall3批量查询)")
-        logger.info(f"✨ Multicall3: {self.MULTICALL2_ADDRESS} (跨链通用地址)")
-        logger.info(f"✨ eth-abi 状态: {'✅ 已安装' if HAS_ETH_ABI else '❌ 未安装（将使用手动编码）'}")
-        logger.info("✨ 支持代币: USDT, USDC, WBNB (可扩展)")
-        logger.info("✨ 优化效果: 缓存命中0次RPC / 全miss仅1次Multicall3 (vs 旧版6次eth_call)")
-        
+        # 配置已加载（详细配置可在 main.py 启动时查看）
+
         # 预加载 WBNB 价格（在线程池中执行，避免阻塞事件循环）
         self.wbnb_price = await asyncio.to_thread(self.get_wbnb_price)
         logger.info(f"💰 WBNB 价格: ${self.wbnb_price:.2f}")
@@ -508,9 +493,6 @@ class BSCWebSocketMonitor:
                 ttl = self.redis_client.client.ttl(self.NON_FOURMEME_KEY)
                 if ttl == -1:  # -1 表示没有过期时间
                     self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
-                    logger.info(f"📊 非fourmeme缓存: {cache_size} 个token (已设置30天过期)")
-                else:
-                    logger.info(f"📊 非fourmeme缓存: {cache_size} 个token (剩余{ttl // 86400}天)")
             except Exception as e:
                 logger.debug(f"获取缓存统计失败: {e}")
     
@@ -873,7 +855,6 @@ class BSCWebSocketMonitor:
                         else:
                             results.append(None)
                     
-                    logger.info(f"✅ Multicall2 批量查询成功 (eth_abi): {len(results)} 个调用")
                     return results
                 except Exception as decode_error:
                     logger.warning(f"⚠️ eth_abi 解码失败: {decode_error}, 回退到逐个调用")
@@ -935,7 +916,6 @@ class BSCWebSocketMonitor:
             }, "latest"])
             
             if not result or result == "0x":
-                logger.warning("⚠️ Multicall2 返回空结果 (manual)，回退到逐个调用")
                 logger.debug(f"Full data len: {len(full_data)}, first 100: {full_data[:100]}")
                 return self._fallback_individual_calls(calls)
             
@@ -970,7 +950,6 @@ class BSCWebSocketMonitor:
                 else:
                     results.append(None)
             
-            logger.info(f"✅ Multicall2 批量查询成功 (manual): {len(results)} 个调用")
             return results
             
         except Exception as e:
@@ -1785,12 +1764,10 @@ class BSCWebSocketMonitor:
             # 🔍 调试：打印API返回的完整字段（仅打印前3个，避免刷屏）
             if pair_info_raw is not None and hasattr(self, '_api_debug_count'):
                 if self._api_debug_count < 3:
-                    logger.info(f"🔍 [调试] API返回字段: {list(pair_info_raw.keys())[:20]}")
                     self._api_debug_count += 1
             elif pair_info_raw is not None and not hasattr(self, '_api_debug_count'):
                 self._api_debug_count = 1
-                logger.info(f"🔍 [调试] API返回的所有字段名: {list(pair_info_raw.keys())}")
-        
+
         # 检查 API 返回（可能是 None、空字典 {}、或有数据的字典）
         if pair_info_raw is not None:  # 排除 None
             mint = pair_info_raw.get('mint', '').lower()
@@ -1802,23 +1779,18 @@ class BSCWebSocketMonitor:
             # 注意：空字典 {} 会进入这个分支，但 mint/base_mint 会是空字符串
             if mint and base_mint:  # 两者都非空才使用 API 数据
                 use_api_data = True
-                logger.info(f"⚡ [快速路径] API数据完整: {pair_address[:10]}... (mint={mint[:10]}, base={base_mint[:10]})")
             else:
-                logger.info(f"🔄 [降级] API数据不完整（空字典或缺字段）: {pair_address[:10]}... → 使用RPC")
                 # 🚀 缓存无数据pair（1小时），避免重复RPC查询
                 if self.redis_client:
                     try:
                         self.redis_client.set(no_data_key, "1", ex=3600)
-                        logger.debug(f"✅ 已缓存无数据pair: {pair_address[:10]}...")
                     except Exception as e:
                         logger.debug(f"Redis写入失败: {e}")
         else:
-            logger.info(f"🔄 [降级] API返回None: {pair_address[:10]}... → 使用RPC")
             # 🚀 缓存无数据pair（1小时）
             if self.redis_client:
                 try:
                     self.redis_client.set(no_data_key, "1", ex=3600)
-                    logger.debug(f"✅ 已缓存无数据pair: {pair_address[:10]}...")
                 except Exception as e:
                     logger.debug(f"Redis写入失败: {e}")
         
@@ -1829,7 +1801,7 @@ class BSCWebSocketMonitor:
             # 使用原来的 RPC 方式
             pair_info_rpc = self.get_pair_full_info(pair_address)
             if not pair_info_rpc:
-                logger.debug(f"⏭️  RPC 也失败，跳过: {pair_address[:10]}...")
+                logger.debug(f"⏭️  RPC 也失败，跳过: {pair_address}")
             return
         
             mint = pair_info_rpc['token0'].lower()  # 根据测试，token0 = mint
@@ -1940,7 +1912,6 @@ class BSCWebSocketMonitor:
             is_confirmed = True
         else:
             # 降级路径：使用原有的 API 检查
-            logger.debug(f"🔄 [降级] 调用 check_external_is_fourmeme: {base_token[:10]}...")
             is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
         
         if not is_fourmeme:
@@ -1983,7 +1954,7 @@ class BSCWebSocketMonitor:
             # ============================================
             # 快速路径：直接使用 API 返回的数据进行第二层判断
             # ============================================
-            logger.info(f"⚡ [快速路径] 使用API数据进行第二层检查: {base_token[:10]}...")
+            logger.info(f"⚡ [快速路径] 使用API数据进行第二层检查: {base_token}")
             
             # 📊 Prometheus: 快速路径使用
             if HAS_PROMETHEUS:
@@ -2024,8 +1995,7 @@ class BSCWebSocketMonitor:
                 
                 # 尝试退让
                 if fallback_interval:
-                    logger.info(f"   🔄 [外盘快速路径] {original_interval}数据为0，尝试退让至{fallback_interval}")
-                    
+
                     if fallback_interval == '5m':
                         fallback_price_change = pair_info_raw.get('priceChange5m', 0) * 100
                         fallback_volume = pair_info_raw.get('buyAndSellVolume5m', 0)
@@ -2049,7 +2019,6 @@ class BSCWebSocketMonitor:
                         # Prometheus: 时间窗口退让计数
                         if HAS_PROMETHEUS:
                             self.metrics_fallback.labels(original=original_interval, fallback=fallback_interval).inc()
-                        logger.info(f"   ✅ 退让成功: 使用{fallback_interval}数据 (涨幅{price_change:+.2f}%, 交易量${volume:,.2f})")
                     else:
                         logger.info(f"   ❌ {fallback_interval}数据也为0，无法退让")
             
@@ -2135,12 +2104,10 @@ class BSCWebSocketMonitor:
             if skip_api:
                 # 缓存命中：pair 无API数据，跳过 second_layer_filter（避免再次调用API）
                 # 直接返回，不发送告警（因为无法获取准确指标）
-                logger.info(f"⏭️  [彻底跳过] pair已缓存为无数据，RPC也无法提供完整指标: {base_token[:10]}...")
                 return
             else:
                 # 缓存未命中：正常调用 second_layer_filter（会调用一次API）
-                logger.info(f"🔄 [降级路径] 调用second_layer_filter获取指标: {base_token[:10]}...")
-                
+
                 # 构造 launchpad_info（兼容 second_layer_filter）
                 launchpad_info = {
                     'launchpad': 'fourmeme',
@@ -2152,7 +2119,6 @@ class BSCWebSocketMonitor:
                 token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
                 
                 if not token_data:
-                    logger.info(f"⏭️  [降级路径] 第二层过滤未通过: {base_token[:10]}...")
                     return
                 
                 logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
@@ -2369,10 +2335,6 @@ class BSCWebSocketMonitor:
                                     amount = int(data[130:194], 16) if len(data) >= 194 else 0
                                 
                                 if cost > 0:
-                                    logger.info(f"⚡ [内盘快速] Custom Event: {tx_hash[:10]}...")
-                                    logger.info(f"   Token: {target_token[:10]}... | Buyer: {buyer[:10]}...")
-                                    logger.info(f"   Cost: {cost} (raw) | Amount: {amount} (raw)")
-                                    
                                     # 直接处理（跳过 receipt！）
                                     # 假设 cost 是 USDT（18 decimals），如果是 WBNB 需要进一步判断
                                     quote_token = self.USDT  # 默认 USDT，可以根据实际情况调整
@@ -2553,10 +2515,7 @@ class BSCWebSocketMonitor:
                 usd_value = float(quote_value) * wbnb_price
             else:
                 usd_value = float(quote_value)
-            
-            # 🔍 调试日志：内盘 tx 详情
-            logger.info(f"🔍 内盘tx: hash={tx_hash}, proxy={proxy_type}, input_BNB={quote_amount / 10**quote_decimals:.4f}, usd={usd_value:.2f}, token={target_token}")
-            
+
             # 第一层过滤
             if not self.first_layer_filter(usd_value, is_internal=True):
                 logger.debug(f"⏭️  内盘金额不足: {target_symbol} (${usd_value:.2f}) - {target_token[:10]}...")
@@ -3104,9 +3063,6 @@ class BSCWebSocketMonitor:
             }]
             }))
         logger.info(f"✓ 订阅 Fourmeme Proxy 所有事件（内盘）")
-        logger.info(f"  监听地址: {self.FOURMEME_PROXY[0][:10]}...")
-        logger.info(f"  捕获: TokenPurchase/TokenSale/Custom Events")
-        
         # 2️⃣ 订阅 PancakeSwap V2 Swap 事件（外盘交易）
         ws.send(json.dumps({
             "jsonrpc": "2.0",
@@ -3267,13 +3223,7 @@ class BSCWebSocketMonitor:
         """启动监控"""
         # 加载配置
         await self.load_config_from_redis()
-        
-        # ========== 直接处理模式 ==========
-        logger.info("🚀 使用直接处理模式（无队列缓冲，线程池直接处理）")
-        logger.info(f"✅ 线程池: {self.executor._max_workers} 个工作线程")
-        logger.info(f"   架构: WebSocket → 线程池({self.executor._max_workers}线程) → 异步处理")
-        logger.info(f"   特点: 低延迟、高并发、无缓冲积压")
-        
+
         # 注册信号处理
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
