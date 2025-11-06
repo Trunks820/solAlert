@@ -1802,7 +1802,7 @@ class BSCWebSocketMonitor:
             pair_info_rpc = self.get_pair_full_info(pair_address)
             if not pair_info_rpc:
                 logger.debug(f"⏭️  RPC 也失败，跳过: {pair_address}")
-            return
+                return  # 🐛 修复：return应该在if内部
         
             mint = pair_info_rpc['token0'].lower()  # 根据测试，token0 = mint
             base_mint = pair_info_rpc['token1'].lower()  # token1 = baseMint

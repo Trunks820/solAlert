@@ -81,6 +81,16 @@ class SolAlertChecker:
         # 3. 提取监控指标
         metrics = self.field_mapper.extract_all_metrics(data, time_interval)
         
+        # 3.1 添加历史最高市值（ATH）到 metrics
+        historical_high_cap = float(config.get('market_cap', 0))
+        metrics['historical_high_cap'] = historical_high_cap
+        
+        # 3.2 计算当前市值占ATH的比例
+        if historical_high_cap > 0:
+            metrics['ath_ratio'] = (metrics['market_cap'] / historical_high_cap) * 100
+        else:
+            metrics['ath_ratio'] = 0
+        
         # 4. 检查各项条件
         triggered_conditions = []
         
@@ -371,6 +381,8 @@ class SolAlertChecker:
         # 格式化市值和流动性
         market_cap_str = format_number(metrics['market_cap'], include_dollar=True)
         liquidity_str = format_number(metrics['liquidity'], include_dollar=True)
+        historical_high_cap_str = format_number(metrics.get('historical_high_cap', 0), include_dollar=True)
+        ath_ratio = metrics.get('ath_ratio', 0)
         
         message = f"""<b>🔔 SOL WebSocket 实时告警</b>
 
@@ -385,8 +397,9 @@ class SolAlertChecker:
 🔍 监控条件:
 {monitor_str}
 
-💵 当前价格: ${metrics['price']:.10f}
-💎 市值: {market_cap_str}
+💵 当前价格: <b>${metrics['price']:.10f}</b>
+💎 当前市值: <b>{market_cap_str}</b>
+🏆 历史最高: {historical_high_cap_str} ({ath_ratio:.1f}%)
 📈 价格变化: {metrics['price_change']:+.2f}%
 💧 流动性: {liquidity_str}
 👥 持有者: {metrics['holders']}

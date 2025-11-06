@@ -322,6 +322,7 @@ async def batch_ws_handler(
                                 ca = full_config['ca']
                                 symbol = full_config['token_symbol']
                                 template_name = full_config.get('template_name', 'Unknown')
+                                historical_high_cap = float(full_config.get('market_cap', 0))  # 历史最高市值(ATH)
 
                                 # 🚀 健壮的数据验证（防止 None 值导致 TypeError）
                                 try:
@@ -330,12 +331,15 @@ async def batch_ws_handler(
                                     pc1h_raw = to_float(item.get('pc1h'), 0)
                                     volume_raw = to_float(item.get('bsv'), 0)
                                     price = to_float(item.get('tp'), 0)
-                                    market_cap = to_float(item.get('mp'), 0)
+                                    current_market_cap = to_float(item.get('mp'), 0)
                                     
                                     pc1m = (pc1m_raw if pc1m_raw is not None else 0) * 100
                                     pc5m = (pc5m_raw if pc5m_raw is not None else 0) * 100
                                     pc1h = (pc1h_raw if pc1h_raw is not None else 0) * 100
                                     volume = volume_raw if volume_raw is not None else 0
+                                    
+                                    # 计算距离历史最高市值的比例
+                                    ath_ratio = (current_market_cap / historical_high_cap * 100) if historical_high_cap > 0 else 0
                                 except (TypeError, ValueError) as e:
                                     logger.debug(f"⚠️  [{conn_name}] 数据转换失败: {e}, 跳过")
                                     continue
@@ -344,7 +348,7 @@ async def batch_ws_handler(
                                 data_logger.debug(
                                     f"Batch{batch_id} | {symbol:8s} | {ca} | "
                                     f"模板:{template_name} | "
-                                    f"价格:${price:.10f} | 市值:${market_cap:,.0f} | "
+                                    f"价格:${price:.10f} | 当前市值:${current_market_cap:,.0f} | ATH:${historical_high_cap:,.0f} ({ath_ratio:.1f}%) | "
                                     f"1m:{pc1m:+7.2f}% | 5m:{pc5m:+7.2f}% | 1h:{pc1h:+7.2f}% | "
                                     f"交易量:${volume:,.0f}"
                                 )
@@ -375,7 +379,7 @@ async def batch_ws_handler(
                                     data_logger.debug(
                                         f"🔔 ALERT | Batch{batch_id} | {symbol:8s} | {ca} | "
                                         f"模板:{template_name} | "
-                                        f"价格:${price:.10f} | 市值:${market_cap:,.0f} | "
+                                        f"价格:${price:.10f} | 当前市值:${current_market_cap:,.0f} | ATH:${historical_high_cap:,.0f} ({ath_ratio:.1f}%) | "
                                         f"1m:{pc1m:+7.2f}% | 5m:{pc5m:+7.2f}% | 1h:{pc1h:+7.2f}% | "
                                         f"交易量:${volume:,.0f} | "
                                         f"原因: {', '.join(reasons)}"
