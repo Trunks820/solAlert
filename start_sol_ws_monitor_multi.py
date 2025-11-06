@@ -62,21 +62,54 @@ def to_float(value, default=0.0):
 BATCHES_PER_GROUP = 7  # 每组启动7个连接
 GROUP_START_DELAY = 3  # 组间启动延迟（秒）
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/sol_ws_monitor.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# 🚀 配置 SOL WS 专用日志（独立于 solalert.log）
+logger = logging.getLogger('solalert.monitor.sol_ws')
+logger.setLevel(logging.INFO)
+
+# 清除现有 handlers（避免重复）
+logger.handlers.clear()
+
+# 添加文件 handler（sol_ws_monitor.log）
+file_handler = logging.FileHandler('logs/sol_ws_monitor.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(name)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+# 添加控制台 handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [🟢SOL_WS ] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# 不传播到父 logger（避免重复记录到 solalert.log）
+logger.propagate = False
+
+# 📊 配置原始数据记录器（用于回测分析）
+data_logger = logging.getLogger('solalert.monitor.sol_ws.raw_data')
+data_logger.setLevel(logging.DEBUG)
+data_logger.handlers.clear()
+
+# 原始数据单独记录到 sol_ws_raw_data.log
+raw_data_handler = logging.FileHandler('logs/sol_ws_raw_data.log', encoding='utf-8')
+raw_data_handler.setLevel(logging.DEBUG)
+raw_data_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+data_logger.addHandler(raw_data_handler)
+data_logger.propagate = False  # 不传播到父 logger
 
 # 修复 Windows 控制台 emoji 显示问题
 if sys.platform == 'win32':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-# 使用统一的层级logger命名
-logger = logging.getLogger('solalert.monitor.sol_ws')
 
 
 def load_batch_data(batch_id: int) -> tuple:
@@ -288,16 +321,33 @@ async def batch_ws_handler(
                                 
                                 ca = full_config['ca']
                                 symbol = full_config['token_symbol']
+                                template_name = full_config.get('template_name', 'Unknown')
 
                                 # 🚀 健壮的数据验证（防止 None 值导致 TypeError）
                                 try:
                                     pc1m_raw = to_float(item.get('pc1m'), 0)
+                                    pc5m_raw = to_float(item.get('pc5m'), 0)
+                                    pc1h_raw = to_float(item.get('pc1h'), 0)
                                     volume_raw = to_float(item.get('bsv'), 0)
+                                    price = to_float(item.get('tp'), 0)
+                                    market_cap = to_float(item.get('mp'), 0)
+                                    
                                     pc1m = (pc1m_raw if pc1m_raw is not None else 0) * 100
+                                    pc5m = (pc5m_raw if pc5m_raw is not None else 0) * 100
+                                    pc1h = (pc1h_raw if pc1h_raw is not None else 0) * 100
                                     volume = volume_raw if volume_raw is not None else 0
                                 except (TypeError, ValueError) as e:
                                     logger.debug(f"⚠️  [{conn_name}] 数据转换失败: {e}, 跳过")
                                     continue
+                                
+                                # 📊 记录所有原始数据（用于回测分析）
+                                data_logger.debug(
+                                    f"Batch{batch_id} | {symbol:8s} | {ca} | "
+                                    f"模板:{template_name} | "
+                                    f"价格:${price:.10f} | 市值:${market_cap:,.0f} | "
+                                    f"1m:{pc1m:+7.2f}% | 5m:{pc5m:+7.2f}% | 1h:{pc1h:+7.2f}% | "
+                                    f"交易量:${volume:,.0f}"
+                                )
                                 
                                 # 📊 详细日志：显示收到的数据（每5条输出一次汇总）
                                 if data_count % 5 == 0:
@@ -320,6 +370,16 @@ async def batch_ws_handler(
                                     # 🚀 显示配置信息
                                     config_info = alert_checker.format_config_summary(full_config)
                                     template_name = full_config.get('template_name', '未知')
+                                    
+                                    # 📊 记录告警触发到原始数据日志（方便回测对比）
+                                    data_logger.debug(
+                                        f"🔔 ALERT | Batch{batch_id} | {symbol:8s} | {ca} | "
+                                        f"模板:{template_name} | "
+                                        f"价格:${price:.10f} | 市值:${market_cap:,.0f} | "
+                                        f"1m:{pc1m:+7.2f}% | 5m:{pc5m:+7.2f}% | 1h:{pc1h:+7.2f}% | "
+                                        f"交易量:${volume:,.0f} | "
+                                        f"原因: {', '.join(reasons)}"
+                                    )
                                     
                                     logger.info(
                                         f"🔔 [{conn_name}] {symbol} 告警触发！"
