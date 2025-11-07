@@ -536,6 +536,31 @@ class BSCWebSocketMonitor:
         except Exception as e:
             logger.error(f"❌ 恢复Prometheus指标失败: {e}")
     
+    def _save_all_metrics_to_redis(self):
+        """批量保存所有Prometheus指标到Redis（定期调用）"""
+        if not HAS_PROMETHEUS or not self.redis_client:
+            return
+        
+        try:
+            # 从Prometheus获取当前值并保存到Redis
+            from prometheus_client import REGISTRY
+            
+            for metric in REGISTRY.collect():
+                if metric.name.startswith('bsc_ws_'):
+                    for sample in metric.samples:
+                        # 只保存Counter类型（累计值）
+                        if sample.name.endswith('_total') or sample.name == 'bsc_ws_messages':
+                            # 构造Redis key
+                            labels_str = ':'.join(f"{sample.labels[k]}" for k in sorted(sample.labels.keys())) if sample.labels else ''
+                            redis_key = f"prometheus:{sample.name}" + (f":{labels_str}" if labels_str else '')
+                            
+                            # 保存到Redis（7天过期）
+                            self.redis_client.set(redis_key, str(int(sample.value)), ex=86400*7)
+            
+            logger.debug("💾 Prometheus指标已批量保存到Redis")
+        except Exception as e:
+            logger.debug(f"批量保存指标失败: {e}")
+    
     def _save_metric_to_redis(self, metric_name: str, value: int):
         """保存指标到Redis（异步，避免阻塞）"""
         if not self.redis_client:
@@ -1887,9 +1912,13 @@ class BSCWebSocketMonitor:
         else:
             usd_value = float(quote_value)
         
-        # 第一层过滤
+        # 第一层过滤（计时）
+        start_time = time.time()
         if not self.first_layer_filter(usd_value, is_internal=False):
             return
+        first_layer_time = time.time() - start_time
+        if HAS_PROMETHEUS:
+            self.metrics_processing_time.labels(stage='first_layer').observe(first_layer_time)
         
         # 东八区时间
         cn_time = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
@@ -1961,6 +1990,7 @@ class BSCWebSocketMonitor:
             # ============================================
             # 阶段5：第二层过滤（使用API返回的指标数据）
             # ============================================
+            second_layer_start = time.time()
             logger.info(f"⚡ 使用DBotX API数据进行第二层检查: {base_token}")
             
             token_price_usd = pair_info_raw.get('tokenPriceUsd', 0)
@@ -2079,6 +2109,11 @@ class BSCWebSocketMonitor:
                     return
             
             logger.info(f"✅ 通过第二层: 触发事件={[e['event'] for e in triggered_events]}")
+            
+            # 记录第二层处理耗时
+            second_layer_time = time.time() - second_layer_start
+            if HAS_PROMETHEUS:
+                self.metrics_processing_time.labels(stage='second_layer').observe(second_layer_time)
             
             # 外盘通过第二层计数
             self.second_layer_pass_external += 1
@@ -2199,7 +2234,11 @@ class BSCWebSocketMonitor:
         })
         
         # 🚀 发送推送（冷却期已在前面设置，无论成败都不会重复发送）
+        alert_start = time.time()
         send_success = await self.send_alert(message, base_token)
+        alert_time = time.time() - alert_start
+        if HAS_PROMETHEUS:
+            self.metrics_processing_time.labels(stage='alert').observe(alert_time)
         
         if send_success:
             # ✅ 播报成功
@@ -2654,7 +2693,11 @@ class BSCWebSocketMonitor:
             })
             
             # 🚀 发送推送（冷却期已在前面设置，无论成败都不会重复发送）
+            alert_start = time.time()
             send_success = await self.send_alert(message, target_token)
+            alert_time = time.time() - alert_start
+            if HAS_PROMETHEUS:
+                self.metrics_processing_time.labels(stage='alert').observe(alert_time)
             
             if send_success:
                 # ✅ 播报成功
@@ -3193,6 +3236,14 @@ class BSCWebSocketMonitor:
         logger.info("\n⚠️  收到停止信号，正在关闭...")
         self.should_stop = True
         
+        # 退出前保存一次指标到Redis
+        if HAS_PROMETHEUS and self.redis_client:
+            try:
+                self._save_all_metrics_to_redis()
+                logger.info("💾 退出前保存Prometheus指标完成")
+            except Exception as e:
+                logger.error(f"❌ 退出前保存指标失败: {e}")
+        
         if self.ws:
             self.ws.close()
         
@@ -3209,6 +3260,17 @@ class BSCWebSocketMonitor:
 
         os._exit(0)
     
+    async def _periodic_save_metrics(self):
+        """后台任务：每5分钟保存一次指标到Redis"""
+        while not self.should_stop:
+            try:
+                await asyncio.sleep(300)  # 5分钟
+                if not self.should_stop:
+                    await asyncio.to_thread(self._save_all_metrics_to_redis)
+                    logger.info("💾 定期保存Prometheus指标到Redis")
+            except Exception as e:
+                logger.error(f"❌ 定期保存指标失败: {e}")
+    
     async def start(self):
         """启动监控"""
         # 加载配置
@@ -3217,6 +3279,11 @@ class BSCWebSocketMonitor:
         # 注册信号处理
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
+        
+        # 启动定期保存指标任务
+        if HAS_PROMETHEUS and self.redis_client:
+            asyncio.create_task(self._periodic_save_metrics())
+            logger.info("✅ 启动Prometheus指标定期保存任务（每5分钟）")
         
         # 创建 WebSocket（添加 ping/pong 心跳保活）
         websocket.enableTrace(False)
