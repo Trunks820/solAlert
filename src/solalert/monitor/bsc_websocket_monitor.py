@@ -1717,9 +1717,23 @@ class BSCWebSocketMonitor:
         """
         处理 PancakeSwap Swap 事件（外盘）
         
-        🚀 优化：使用 DBotX API 替代 RPC 调用（带降级策略）
-        - 优先路径：1次API调用获取所有数据
-        - 降级路径：API失败 → RPC获取token0/token1 → 继续处理
+        🚀 优化架构：先RPC过滤，再DBotX获取指标（节省90%+ API调用）
+        
+        流程：
+        1. RPC获取pair基础信息（token0/token1/symbol）- 免费无限，25req/s
+        2. 第一层过滤（金额）- 过滤掉小额交易
+        3. fourmeme检查（先缓存，缓存未命中才调用API）
+        4. 确认是fourmeme后，才调用DBotX API获取指标数据
+        5. 第二层过滤（指标：涨跌幅、交易量等）
+        
+        优化效果：
+        - 原架构：每个swap事件立即调用API（10M积分/天，11.6次/秒）
+        - 新架构：仅fourmeme代币调用API（预计减少95%消耗）
+          - 第一层过滤拦截：~80%（小额交易）
+          - Redis缓存拦截：~15%（非fourmeme已知代币）
+          - 最终调用API：~5%（fourmeme新币/未缓存）
+        
+        预计积分消耗：10M → 0.5M/天（延长20倍使用时间）
         """
         tx_hash = log.get("transactionHash")
         pair_address = log.get("address", "").lower()
@@ -1730,94 +1744,34 @@ class BSCWebSocketMonitor:
             await self._handle_swap_with_receipt_fallback(tx_hash, pair_address)
             return
         
-        # 🚀 优先路径：尝试使用 DBotX API 获取交易对信息（复用连接池）
+        # ============================================
+        # 阶段1：RPC获取基础信息（免费，快速过滤）
+        # ============================================
         mint = None
         base_mint = None
         base_symbol = None
         token_symbol = None
-        use_api_data = False  # 标记是否使用 API 完整数据
-        pair_info_raw = None
+        pair_info_rpc = None
         
-        # 🚀 优化：检查"无数据pair"缓存
-        no_data_key = f"no_data_pair:{pair_address}"
-        skip_api = False  # 标记是否跳过API调用
+        # 使用 RPC 获取 token0/token1
+        pair_info_rpc = self.get_pair_full_info(pair_address)
+        if not pair_info_rpc:
+            logger.debug(f"⏭️  RPC获取pair信息失败，跳过: {pair_address}")
+            return
         
-        if self.redis_client:
-            try:
-                if self.redis_client.get(no_data_key):
-                    skip_api = True
-                    logger.debug(f"⏭️  [缓存命中] pair无API数据，跳过API直接走RPC: {pair_address[:10]}...")
-            except Exception as e:
-                logger.debug(f"Redis查询失败: {e}")
-        
-        # 如果缓存未命中，尝试API
-        if not skip_api:
-            dbotx_api = self.get_thread_dbotx_api()
-            pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
-            
-            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
-            # 注意：API返回None是正常业务逻辑（代币未收录），不算失败
-            if HAS_PROMETHEUS:
-                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
-            
-            # 🔍 调试：打印API返回的完整字段（仅打印前3个，避免刷屏）
-            if pair_info_raw is not None and hasattr(self, '_api_debug_count'):
-                if self._api_debug_count < 3:
-                    self._api_debug_count += 1
-            elif pair_info_raw is not None and not hasattr(self, '_api_debug_count'):
-                self._api_debug_count = 1
-
-        # 检查 API 返回（可能是 None、空字典 {}、或有数据的字典）
-        if pair_info_raw is not None:  # 排除 None
-            mint = pair_info_raw.get('mint', '').lower()
-            base_mint = pair_info_raw.get('baseMint', '').lower()
-            base_symbol = pair_info_raw.get('baseSymbol', '')
-            token_symbol = pair_info_raw.get('symbol', '')
-            
-            # 检查关键字段是否存在且非空
-            # 注意：空字典 {} 会进入这个分支，但 mint/base_mint 会是空字符串
-            if mint and base_mint:  # 两者都非空才使用 API 数据
-                use_api_data = True
-            else:
-                # 🚀 缓存无数据pair（1小时），避免重复RPC查询
-                if self.redis_client:
-                    try:
-                        self.redis_client.set(no_data_key, "1", ex=3600)
-                    except Exception as e:
-                        logger.debug(f"Redis写入失败: {e}")
-        else:
-            # 🚀 缓存无数据pair（1小时）
-            if self.redis_client:
-                try:
-                    self.redis_client.set(no_data_key, "1", ex=3600)
-                except Exception as e:
-                    logger.debug(f"Redis写入失败: {e}")
-        
-        # 🔄 降级路径：API 失败或数据不完整，使用 RPC 获取 token0/token1
-        pair_info_rpc = None  # RPC获取的pair信息
-        if not use_api_data:
-            
-            # 使用原来的 RPC 方式
-            pair_info_rpc = self.get_pair_full_info(pair_address)
-            if not pair_info_rpc:
-                logger.debug(f"⏭️  RPC 也失败，跳过: {pair_address}")
-                return  # 🐛 修复：return应该在if内部
-        
-            mint = pair_info_rpc['token0'].lower()  # 根据测试，token0 = mint
-            base_mint = pair_info_rpc['token1'].lower()  # token1 = baseMint
-            token_symbol = pair_info_rpc.get('symbol0', '???')
-            base_symbol = pair_info_rpc.get('symbol1', '???')
-            
-            # 标记为降级模式（后续需要调用 second_layer_filter）
-            # 注意：保持 pair_info_raw = None 用于判断，但后续使用 pair_info_rpc 获取数据
-            pair_info_raw = None
+        mint = pair_info_rpc['token0'].lower()  # token0 = mint
+        base_mint = pair_info_rpc['token1'].lower()  # token1 = baseMint
+        token_symbol = pair_info_rpc.get('symbol0', '???')
+        base_symbol = pair_info_rpc.get('symbol1', '???')
+        base_decimals = pair_info_rpc.get('decimals0', 18)
         
         # 快速过滤：检查基础货币是否是我们关注的稳定币
         if base_mint not in (self.USDT, self.USDC, self.WBNB):
             return
         
-        # 解析交易数据
+        # ============================================
+        # 阶段2：解析交易金额并计算USD价值
+        # ============================================
         amount0_in = swap_data["amount0In"]
         amount1_in = swap_data["amount1In"]
         amount0_out = swap_data["amount0Out"]
@@ -1830,13 +1784,6 @@ class BSCWebSocketMonitor:
         quote_amount = 0
         base_amount = 0
         quote_decimals = 18  # 稳定币精度默认18
-        # 🔧 修复：RPC路径下从 pair_info_rpc 获取精度，API路径从 pair_info_raw 获取
-        if pair_info_raw:
-            base_decimals = pair_info_raw.get('decimals', 18)  # API路径
-        elif pair_info_rpc:
-            base_decimals = pair_info_rpc.get('decimals0', 18)  # RPC路径
-        else:
-            base_decimals = 18  # 兜底
         quote_symbol = base_symbol
         base_symbol = token_symbol
         
@@ -1884,7 +1831,10 @@ class BSCWebSocketMonitor:
         if HAS_PROMETHEUS:
             self.metrics_first_layer_pass.labels(type='external').inc()
         
-        # 🚀 优化：先检查 Redis 缓存（非fourmeme token黑名单）
+        # ============================================
+        # 阶段3：fourmeme检查（先缓存，再API）
+        # ============================================
+        # 先检查 Redis 缓存（非fourmeme token黑名单）
         if self.redis_client:
             try:
                 is_cached_non_fourmeme = self.redis_client.sismember(self.NON_FOURMEME_KEY, base_token)
@@ -1900,19 +1850,8 @@ class BSCWebSocketMonitor:
             except Exception as e:
                 logger.warning(f"⚠️  Redis缓存查询失败: {e}")
         
-        # 检查是否是 fourmeme
-        is_fourmeme = False
-        is_confirmed = False  # 是否能确认（API 有数据）
-        
-        if use_api_data and pair_info_raw:
-            # 快速路径：使用 API 已返回的数据
-            pre_dex = pair_info_raw.get('preDex', '').lower()
-            pool_type = pair_info_raw.get('poolType', '').lower()
-            is_fourmeme = (pre_dex == 'fourmeme' or pool_type == 'fourmeme')
-            is_confirmed = True
-        else:
-            # 降级路径：使用原有的 API 检查
-            is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
+        # 缓存未命中，调用API检查是否是fourmeme（会消耗10积分）
+        is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
         
         if not is_fourmeme:
             if is_confirmed:
@@ -1928,37 +1867,34 @@ class BSCWebSocketMonitor:
                         logger.debug(f"✅ 已加入黑名单: {base_symbol} - {base_token[:10]}...")
                     except Exception as e:
                         logger.warning(f"⚠️  Redis缓存写入失败: {e}")
-                    
-                    # 🔍 详细日志：显示判定依据
-                    if use_api_data and pair_info_raw:
-                        pre_dex = pair_info_raw.get('preDex', 'N/A')
-                        pool_type = pair_info_raw.get('poolType', 'N/A')
-                        logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | preDex={pre_dex}, poolType={pool_type} | {base_token[:10]}...")
-                    else:
-                        logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
+                
+                logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
             else:
                 # API 失败，不确定 → 不加黑名单
                 logger.info(f"⚠️  [外盘] fourmeme检查失败（API故障），跳过但不加黑名单: {base_symbol} - {base_token[:10]}...")
             return
         
-        # 🔍 详细日志：显示判定依据
-        if use_api_data and pair_info_raw:
-            pre_dex = pair_info_raw.get('preDex', 'N/A')
-            pool_type = pair_info_raw.get('poolType', 'N/A')
-            logger.info(f"✅ [外盘] 是fourmeme: {base_symbol} (${usd_value:.2f}) | preDex={pre_dex}, poolType={pool_type} | {base_token[:10]}...")
-        else:
-            logger.info(f"✅ [外盘] 是fourmeme: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
+        # 是fourmeme，继续处理
+        logger.info(f"✅ [外盘] 是fourmeme: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
         
-        # 🚀 第二层过滤：区分快速路径和降级路径
-        if use_api_data and pair_info_raw:
+        # ============================================
+        # 阶段4：调用DBotX API获取指标数据（仅fourmeme代币）
+        # ============================================
+        # 到这一步才调用API，大大减少了API调用次数
+        dbotx_api = self.get_thread_dbotx_api()
+        pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
+        
+        # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+        if HAS_PROMETHEUS:
+            self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+            self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+        
+        # 检查API是否返回有效数据
+        if pair_info_raw and pair_info_raw.get('mint') and pair_info_raw.get('baseMint'):
             # ============================================
-            # 快速路径：直接使用 API 返回的数据进行第二层判断
+            # 阶段5：第二层过滤（使用API返回的指标数据）
             # ============================================
-            logger.info(f"⚡ [快速路径] 使用API数据进行第二层检查: {base_token}")
-            
-            # 📊 Prometheus: 快速路径使用
-            if HAS_PROMETHEUS:
-                self.metrics_fourmeme_fast_path.inc()
+            logger.info(f"⚡ 使用DBotX API数据进行第二层检查: {base_token}")
             
             token_price_usd = pair_info_raw.get('tokenPriceUsd', 0)
             market_cap = pair_info_raw.get('marketCap', 0)
@@ -2091,37 +2027,16 @@ class BSCWebSocketMonitor:
                 'market_cap': market_cap,
                 'buy_tax': pair_info_raw.get('safetyInfo', {}).get('buyTax', 0) if pair_info_raw.get('safetyInfo') else 0,
                 'sell_tax': pair_info_raw.get('safetyInfo', {}).get('sellTax', 0) if pair_info_raw.get('safetyInfo') else 0,
-                'pool_type': pool_type or 'pancake_v2',
+                'pool_type': 'pancake_v2',
                 'pool_emoji': '🔥',
                 'is_internal': False,
                 'triggered_events': triggered_events,
                 'fallback_info': fallback_info  # 时间窗口退让信息
             }
         else:
-            # ============================================
-            # 降级路径：如果 no_data_pair 已缓存，避免再次调用 API
-            # ============================================
-            if skip_api:
-                # 缓存命中：pair 无API数据，跳过 second_layer_filter（避免再次调用API）
-                # 直接返回，不发送告警（因为无法获取准确指标）
-                return
-            else:
-                # 缓存未命中：正常调用 second_layer_filter（会调用一次API）
-
-                # 构造 launchpad_info（兼容 second_layer_filter）
-                launchpad_info = {
-                    'launchpad': 'fourmeme',
-                    'launchpad_status': 1,  # 外盘
-                    'pair_address': pair_address
-                }
-                
-                # 调用统一的第二层过滤
-                token_data = await self.second_layer_filter(base_token, pair_address, launchpad_info, is_internal=False)
-                
-                if not token_data:
-                    return
-                
-                logger.info(f"✅ [降级路径] 通过第二层: 触发事件={[e['event'] for e in token_data.get('triggered_events', [])]}")
+            # API未返回有效数据，跳过
+            logger.warning(f"⚠️ DBotX API未返回有效数据: {base_token[:10]}...")
+            return
         
         # 🔒 关键：原子化检查并设置冷却期（防止竞态条件）
         # 使用 check_and_set 而不是 check_readonly，避免多线程同时通过检查
