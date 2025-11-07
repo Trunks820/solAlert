@@ -303,6 +303,9 @@ class BSCWebSocketMonitor:
                     ['source']  # source: dbotx(10分), BSC WebSocket/RPC使用Chainstack不计费
                 )
                 
+                # 🔄 从Redis恢复历史累计值（重启后继续累加）
+                self._restore_metrics_from_redis()
+                
                 # Histogram（直方图）- 统计分布
                 from prometheus_client import Histogram
                 self.metrics_processing_time = Histogram(
@@ -323,27 +326,16 @@ class BSCWebSocketMonitor:
                     ['cache_type']  # cache_type: seen_txs/receipt/eth_call
                 )
                 
-                # Histogram（直方图）- 延迟分布
-                self.metrics_processing_time = Histogram(
-                    'bsc_ws_processing_time_seconds',
-                    '事件处理耗时（秒）',
-                    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
-                )
-                
                 # ========== 指标初始化：预创建所有标签组合，避免 Grafana 查询空值 ==========
                 # 初始化所有 Counter（inc(0) 不影响实际值）
                 self.metrics_first_layer_pass.labels(type='internal').inc(0)
                 self.metrics_first_layer_pass.labels(type='external').inc(0)
                 
-                self.metrics_second_layer_check.labels(type='internal', path='fast').inc(0)
                 self.metrics_second_layer_check.labels(type='internal', path='fallback').inc(0)
-                self.metrics_second_layer_check.labels(type='external', path='fast').inc(0)
-                self.metrics_second_layer_check.labels(type='external', path='fallback').inc(0)
+                self.metrics_second_layer_check.labels(type='external', path='api').inc(0)
                 
-                self.metrics_second_layer_pass.labels(type='internal', path='fast').inc(0)
                 self.metrics_second_layer_pass.labels(type='internal', path='fallback').inc(0)
-                self.metrics_second_layer_pass.labels(type='external', path='fast').inc(0)
-                self.metrics_second_layer_pass.labels(type='external', path='fallback').inc(0)
+                self.metrics_second_layer_pass.labels(type='external', path='api').inc(0)
                 
                 self.metrics_alerts.labels(status='success').inc(0)
                 self.metrics_alerts.labels(status='failure').inc(0)
@@ -491,6 +483,86 @@ class BSCWebSocketMonitor:
                     self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
             except Exception as e:
                 logger.debug(f"获取缓存统计失败: {e}")
+    
+    def _restore_metrics_from_redis(self):
+        """从Redis恢复Prometheus指标的历史累计值"""
+        if not self.redis_client:
+            logger.warning("⚠️ Redis未连接，无法恢复指标")
+            return
+        
+        try:
+            # 恢复积分消耗（最重要的指标）
+            credits_key = 'prometheus:bsc_ws_credits_consumed_total:dbotx'
+            saved_credits = self.redis_client.get(credits_key)
+            if saved_credits:
+                try:
+                    credits_value = int(saved_credits)
+                    if credits_value > 0:
+                        self.metrics_credits_consumed.labels(source='dbotx').inc(credits_value)
+                        logger.info(f"✅ 恢复积分消耗：{credits_value}")
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"⚠️ 积分数据格式错误: {e}")
+            
+            # 恢复API调用次数
+            api_calls_map = {
+                'prometheus:bsc_ws_api_calls_total:dbotx:success': ('dbotx', 'success'),
+                'prometheus:bsc_ws_api_calls_total:dbotx:failure': ('dbotx', 'failure'),
+                'prometheus:bsc_ws_api_calls_total:rpc:success': ('rpc', 'success'),
+                'prometheus:bsc_ws_api_calls_total:rpc:failure': ('rpc', 'failure'),
+            }
+            for key, (api_type, status) in api_calls_map.items():
+                saved_value = self.redis_client.get(key)
+                if saved_value:
+                    try:
+                        value = int(saved_value)
+                        if value > 0:
+                            self.metrics_api_calls.labels(api_type=api_type, status=status).inc(value)
+                    except (ValueError, TypeError):
+                        pass
+            
+            # 恢复告警次数
+            for status in ['success', 'failure']:
+                key = f'prometheus:bsc_ws_alerts_total:{status}'
+                saved_value = self.redis_client.get(key)
+                if saved_value:
+                    try:
+                        value = int(saved_value)
+                        if value > 0:
+                            self.metrics_alerts.labels(status=status).inc(value)
+                    except (ValueError, TypeError):
+                        pass
+            
+            logger.info("✅ Prometheus指标恢复完成")
+        except Exception as e:
+            logger.error(f"❌ 恢复Prometheus指标失败: {e}")
+    
+    def _save_metric_to_redis(self, metric_name: str, value: int):
+        """保存指标到Redis（异步，避免阻塞）"""
+        if not self.redis_client:
+            return
+        
+        try:
+            self.redis_client.set(metric_name, str(value), ex=86400*7)  # 保留7天
+        except Exception as e:
+            logger.debug(f"保存指标到Redis失败: {e}")
+    
+    def _inc_credits_and_save(self, amount: int = 10):
+        """增加积分并保存到Redis（持久化）"""
+        if HAS_PROMETHEUS:
+            # 1. 增加Prometheus Counter
+            self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+            self.metrics_credits_consumed.labels(source='dbotx').inc(amount)
+            
+            # 2. 保存到Redis（每次都保存，确保重启后能恢复）
+            if self.redis_client:
+                try:
+                    # 使用Redis的INCR原子操作
+                    key = 'prometheus:bsc_ws_credits_consumed_total:dbotx'
+                    new_value = self.redis_client.client.incr(key, amount)
+                    self.redis_client.client.expire(key, 86400*7)  # 7天过期
+                    logger.debug(f"💾 积分已保存到Redis: {new_value}")
+                except Exception as e:
+                    logger.debug(f"保存积分到Redis失败: {e}")
     
     def get_thread_dbotx_api(self) -> DBotXAPI:
         """获取当前线程的 DBotX API 实例"""
@@ -1493,10 +1565,8 @@ class BSCWebSocketMonitor:
         try:
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', token_address)
             
-            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
-            if HAS_PROMETHEUS:
-                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
+            self._inc_credits_and_save(10)
             
             if not launchpad_info:
                 # API失败或无数据，结果不确定
@@ -1545,11 +1615,9 @@ class BSCWebSocketMonitor:
             # 2. 调用 DBotX API 获取代币指标
             raw_data = await dbotx_api.get_pair_info('bsc', pair_address)
             
-            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
             # 注意：API返回None是正常业务逻辑（代币未收录），不算失败
-            if HAS_PROMETHEUS:
-                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+            self._inc_credits_and_save(10)
             
             if not raw_data:
                 logger.debug("第二层过滤-无DBotX数据", extra={"token": token_address[:10]})
@@ -1885,10 +1953,8 @@ class BSCWebSocketMonitor:
         dbotx_api = self.get_thread_dbotx_api()
         pair_info_raw = await dbotx_api.get_pair_info('bsc', pair_address)
         
-        # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
-        if HAS_PROMETHEUS:
-            self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-            self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+        # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
+        self._inc_credits_and_save(10)
         
         # 检查API是否返回有效数据
         if pair_info_raw and pair_info_raw.get('mint') and pair_info_raw.get('baseMint'):
@@ -2285,10 +2351,8 @@ class BSCWebSocketMonitor:
                                     # 获取 launchpad 信息（轻量 API 调用）
                                     launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
                                     
-                                    # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
-                                    if HAS_PROMETHEUS:
-                                        self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-                                        self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+                                    # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
+                                    self._inc_credits_and_save(10)
                                     
                                     if not launchpad_info:
                                         # Fallback：构造基础信息
@@ -2455,10 +2519,8 @@ class BSCWebSocketMonitor:
             # 获取 launchpad 信息
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
             
-            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
-            if HAS_PROMETHEUS:
-                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
-                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
+            self._inc_credits_and_save(10)
             
             if not launchpad_info:
                 logger.warning(f"⚠️ API miss: hash={tx_hash}, token={target_token} - 使用 fallback")
