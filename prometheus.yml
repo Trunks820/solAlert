@@ -38,14 +38,17 @@ scrape_configs:
     scrape_timeout: 5s
     metrics_path: '/metrics'
     
-  # 可以添加其他服务的监控
-  # - job_name: 'solalert_sol_ws'
-  #   static_configs:
-  #     - targets: ['localhost:8002']
-  #       labels:
-  #         service: 'sol_websocket_monitor'
-  #         chain: 'solana'
-  #         component: 'monitor'
+  # solAlert SOL WebSocket Monitor
+  - job_name: 'solalert_sol_ws'
+    static_configs:
+      - targets: ['solalert:8002']  # Docker Compose中的服务名
+        labels:
+          service: 'sol_websocket_monitor'
+          chain: 'solana'
+          component: 'monitor'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    metrics_path: '/metrics'
 
 # 可选：远程写入配置（用于长期存储）
 # remote_write:

@@ -35,9 +35,59 @@ from solalert.monitor.sol_alert_checker import SolAlertChecker
 from solalert.notifiers.telegram import TelegramNotifier
 from solalert.notifiers.wechat import WeChatNotifier
 
+# 🎯 Prometheus 监控
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    HAS_PROMETHEUS = True
+except ImportError:
+    HAS_PROMETHEUS = False
+    print("⚠️  prometheus_client 未安装，监控功能已禁用")
+
 # WebSocket配置
 WS_URL = "wss://api-data-v1.dbotx.com/data/ws/"
 API_KEY = "i1o3elfavv59ds02fggj9rsd0eg8w657"
+PROMETHEUS_PORT = 8002  # SOL链监控端口（BSC是8001）
+
+# 🎯 初始化Prometheus指标
+if HAS_PROMETHEUS:
+    # Counter - 累计计数
+    metrics_ws_messages = Counter(
+        'sol_ws_messages_total',
+        'WebSocket收到的消息总数'
+    )
+    metrics_ws_data = Counter(
+        'sol_ws_data_total',
+        'pairsInfo数据推送总数'
+    )
+    metrics_alerts = Counter(
+        'sol_ws_alerts_total',
+        '告警发送统计',
+        ['status']  # success/failure
+    )
+    metrics_reconnects = Counter(
+        'sol_ws_reconnects_total',
+        'WebSocket重连次数',
+        ['batch_id']
+    )
+    
+    # Gauge - 实时状态
+    metrics_connections = Gauge(
+        'sol_ws_connections',
+        'WebSocket连接数',
+        ['status', 'batch_id']  # status: subscribed/connected/reconnecting/failed
+    )
+    metrics_active_pairs = Gauge(
+        'sol_ws_active_pairs',
+        '活跃pair数量',
+        ['batch_id']
+    )
+    
+    # Histogram - 延迟分布
+    metrics_alert_processing_time = Histogram(
+        'sol_ws_alert_processing_seconds',
+        '告警处理耗时',
+        buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
+    )
 
 
 def to_float(value, default=0.0):
@@ -206,7 +256,7 @@ async def batch_ws_handler(
     alert_count = 0
     received_pairs = set()
     reconnect_count = 0
-    max_reconnects = 100
+    max_reconnects = 999999  # 🚀 SOL链交易量低，允许无限重连
     
     # 🚀 重连指数退避
     reconnect_delay = 1  # 初始延迟
@@ -244,6 +294,10 @@ async def batch_ws_handler(
                 logger.info(f"✅ [{conn_name}] 已连接")
                 stats[batch_id]['status'] = 'connected'
                 
+                # 📊 Prometheus: 连接状态
+                if HAS_PROMETHEUS:
+                    metrics_connections.labels(status='connected', batch_id=batch_id).set(1)
+                
                 # 订阅
                 subscribe_msg = {
                     "method": "subscribe",
@@ -266,13 +320,31 @@ async def batch_ws_handler(
                         message_count += 1
                         stats[batch_id]['messages'] = message_count
                         
+                        # 📊 Prometheus: 消息计数
+                        if HAS_PROMETHEUS:
+                            metrics_ws_messages.inc()
+                        
                         data = json.loads(message)
                         msg_type = data.get('type')
+                        
+                        # 🔍 调试：记录收到的消息类型（每10条输出一次）
+                        if message_count % 10 == 0:
+                            logger.debug(
+                                f"🔍 [{conn_name}] 消息#{message_count} "
+                                f"类型:{msg_type} method:{data.get('method')} "
+                                f"status:{data.get('status')}"
+                            )
                         
                         # 订阅确认
                         if data.get('method') == 'subscribeResponse':
                             logger.info(f"📨 [{conn_name}] 订阅确认")
                             stats[batch_id]['status'] = 'subscribed'
+                            
+                            # 📊 Prometheus: 订阅状态
+                            if HAS_PROMETHEUS:
+                                metrics_connections.labels(status='connected', batch_id=batch_id).set(0)
+                                metrics_connections.labels(status='subscribed', batch_id=batch_id).set(1)
+                            
                             continue
                         
                         # 心跳
@@ -288,23 +360,22 @@ async def batch_ws_handler(
                             )
                             last_heartbeat = datetime.now()
                         
-                        # 🚀 无数据自愈：检测假活连接
+                        # 🚀 无数据自愈：检测假活连接（已禁用，SOL链交易量低是正常现象）
                         now = datetime.now()
-                        if msg_type == 'pairsInfo':
+                        # 🔧 修复：DBotX实际推送的是tokensInfo，不是pairsInfo
+                        if msg_type in ('pairsInfo', 'tokensInfo'):
                             last_data_time = now
                             stats[batch_id]['last_data_time'] = now
-                        elif (now - last_data_time).total_seconds() > no_data_timeout:
-                            logger.warning(
-                                f"⚠️  [{conn_name}] 假活连接：{no_data_timeout}秒无数据，主动断开重连"
-                            )
-                            stats[batch_id]['status'] = 'no_data_restart'
-                            break  # 跳出内层循环，触发重连
-                        
-                        # 数据处理
-                        if msg_type == 'pairsInfo':
+
+                        # 数据处理（支持pairsInfo和tokensInfo两种类型）
+                        if msg_type in ('pairsInfo', 'tokensInfo'):
                             results = data.get('result', [])
                             data_count += 1
                             stats[batch_id]['data'] = data_count
+                            
+                            # 📊 Prometheus: 数据推送计数
+                            if HAS_PROMETHEUS:
+                                metrics_ws_data.inc()
                             
                             for item in results:
                                 pair = item.get('p')
@@ -313,6 +384,10 @@ async def batch_ws_handler(
                                 
                                 received_pairs.add(pair)
                                 stats[batch_id]['active_pairs'] = len(received_pairs)
+                                
+                                # 📊 Prometheus: 活跃pair数量
+                                if HAS_PROMETHEUS:
+                                    metrics_active_pairs.labels(batch_id=batch_id).set(len(received_pairs))
                                 
                                 # 🚀 优化：直接从内存获取完整配置，无需查库
                                 full_config = pair_to_full_config.get(pair)
@@ -435,6 +510,10 @@ async def batch_ws_handler(
                                         stats[batch_id]['alerts'] = alert_count
                                         alert_checker.set_cooldown(ca)
                                         
+                                        # 📊 Prometheus: 告警成功
+                                        if HAS_PROMETHEUS:
+                                            metrics_alerts.labels(status='success').inc()
+                                        
                                         # 📝 保存到数据库
                                         try:
                                             # 准备数据库记录
@@ -517,6 +596,9 @@ async def batch_ws_handler(
                                             logger.warning(f"   ⚠️ WeChat发送失败: {wechat_result}")
                                     else:
                                         logger.error(f"   ❌ 所有通知渠道发送失败")
+                                        # 📊 Prometheus: 告警失败
+                                        if HAS_PROMETHEUS:
+                                            metrics_alerts.labels(status='failure').inc()
                     
                     except asyncio.TimeoutError:
                         continue
@@ -537,6 +619,12 @@ async def batch_ws_handler(
         # 🚀 重连：指数退避 + 抖动
         reconnect_count += 1
         stats[batch_id]['reconnects'] = reconnect_count
+        
+        # 📊 Prometheus: 重连次数
+        if HAS_PROMETHEUS:
+            metrics_reconnects.labels(batch_id=batch_id).inc()
+            metrics_connections.labels(status='subscribed', batch_id=batch_id).set(0)
+            metrics_connections.labels(status='reconnecting', batch_id=batch_id).set(1)
         
         if reconnect_count < max_reconnects:
             # 指数退避：1s → 2s → 4s → 8s → ... → 60s（上限）
@@ -698,6 +786,14 @@ async def print_stats_periodically(stats: dict, interval: int = 300, telegram=No
 
 async def main():
     """主函数：分组启动 21 条 WebSocket 连接"""
+    # 🎯 启动Prometheus HTTP服务器
+    if HAS_PROMETHEUS:
+        try:
+            start_http_server(PROMETHEUS_PORT)
+            logger.info(f"📊 Prometheus metrics 服务已启动: http://0.0.0.0:{PROMETHEUS_PORT}")
+        except Exception as e:
+            logger.warning(f"⚠️  Prometheus启动失败: {e}")
+    
     logger.info("=" * 80)
     logger.info("🚀 SOL WebSocket 监控 - 21条连接版本")
     logger.info("   每个批次一条独立的 WebSocket 连接")
