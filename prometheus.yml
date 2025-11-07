@@ -29,7 +29,7 @@ scrape_configs:
   # solAlert BSC WebSocket Monitor
   - job_name: 'solalert_bsc_ws'
     static_configs:
-      - targets: ['solalert-service:8001']  # Docker 网络中的服务名
+      - targets: ['solalert:8001']  # Docker Compose中的服务名（不是container_name）
         labels:
           service: 'bsc_websocket_monitor'
           chain: 'bsc'

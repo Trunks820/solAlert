@@ -287,10 +287,6 @@ class BSCWebSocketMonitor:
                     '非fourmeme跳过次数（API首判+缓存）',
                     ['source']  # source: api_first_check/cache_hit
                 )
-                self.metrics_fourmeme_fast_path = Counter(
-                    'bsc_ws_fourmeme_fast_path_total',
-                    'fourmeme快速路径使用次数（API数据完整）'
-                )
                 self.metrics_fallback = Counter(
                     'bsc_ws_fallback_total',
                     '时间窗口退让次数',
@@ -1497,6 +1493,11 @@ class BSCWebSocketMonitor:
         try:
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', token_address)
             
+            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+            if HAS_PROMETHEUS:
+                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+            
             if not launchpad_info:
                 # API失败或无数据，结果不确定
                 # 这可能是：1) API故障  2) 网络问题  3) token太新还没数据
@@ -1961,9 +1962,9 @@ class BSCWebSocketMonitor:
             # 获取外盘配置（从 external_events_config 读取）
             external_config = self.external_events_config
             
-            # Prometheus: 外盘快速路径第二层检查计数
+            # Prometheus: 外盘第二层检查计数
             if HAS_PROMETHEUS:
-                self.metrics_second_layer_check.labels(type='external', path='fast').inc()
+                self.metrics_second_layer_check.labels(type='external', path='api').inc()
             
             # 第二层判断：涨跌幅和交易量
             min_price_change = external_config.get('priceChange', {}).get('risePercent', 50)  # 默认50%
@@ -2013,10 +2014,10 @@ class BSCWebSocketMonitor:
             
             logger.info(f"✅ 通过第二层: 触发事件={[e['event'] for e in triggered_events]}")
             
-            # 外盘快速路径通过第二层计数
+            # 外盘通过第二层计数
             self.second_layer_pass_external += 1
             if HAS_PROMETHEUS:
-                self.metrics_second_layer_pass.labels(type='external', path='fast').inc()
+                self.metrics_second_layer_pass.labels(type='external', path='api').inc()
             
             # 构建 token_data（兼容原有格式）
             token_data = {
@@ -2283,6 +2284,12 @@ class BSCWebSocketMonitor:
                                     
                                     # 获取 launchpad 信息（轻量 API 调用）
                                     launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
+                                    
+                                    # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+                                    if HAS_PROMETHEUS:
+                                        self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+                                        self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+                                    
                                     if not launchpad_info:
                                         # Fallback：构造基础信息
                                         launchpad_info = {
@@ -2447,6 +2454,12 @@ class BSCWebSocketMonitor:
             
             # 获取 launchpad 信息
             launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
+            
+            # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）
+            if HAS_PROMETHEUS:
+                self.metrics_api_calls.labels(api_type='dbotx', status='success').inc()
+                self.metrics_credits_consumed.labels(source='dbotx').inc(10)
+            
             if not launchpad_info:
                 logger.warning(f"⚠️ API miss: hash={tx_hash}, token={target_token} - 使用 fallback")
                 # Fallback：构造基础 launchpad_info
