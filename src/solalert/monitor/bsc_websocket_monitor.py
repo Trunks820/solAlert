@@ -1473,6 +1473,17 @@ class BSCWebSocketMonitor:
             # 出错时允许推送（避免误阻止）
             return True
     
+    async def remove_alert_cooldown(self, token_address: str):
+        """
+        删除冷却期记录（用于发送失败后解锁）
+        """
+        redis_key = f"bsc:alert:last:{token_address.lower()}"
+        try:
+            await asyncio.to_thread(self.redis_client.delete, redis_key)
+            logger.debug(f"🔓 已删除冷却期: {token_address}")
+        except Exception as e:
+            logger.error(f"❌ 删除冷却期失败: {e}")
+    
     async def check_alert_cooldown_readonly(self, token_address: str) -> bool:
         """
         只读检查代币是否在冷却期内（不设置冷却期）
@@ -1547,6 +1558,9 @@ class BSCWebSocketMonitor:
             return False
         
         try:
+            # 详细日志：准备发送
+            logger.info(f"📤 准备发送告警: {token_address} -> 频道{self.bsc_channel_id}")
+            
             reply_markup = self.create_token_buttons(token_address)
             
             result = await self.telegram_notifier.send(
@@ -1561,12 +1575,12 @@ class BSCWebSocketMonitor:
                 self.alert_success_count += 1  # 发送成功计数
                 return True
             else:
-                logger.error(f"❌ Telegram发送失败 - {token_address[:10]}...")
+                logger.error(f"❌❌❌ Telegram发送失败 - {token_address} | 频道{self.bsc_channel_id} | telegram_notifier.send返回False")
                 self.alert_fail_count += 1  # 发送失败计数
                 return False
         
         except Exception as e:
-            logger.error(f"❌ 发送通知异常: {e}")
+            logger.error(f"❌❌❌ 发送通知异常: {token_address} | 错误: {e}", exc_info=True)
             self.alert_fail_count += 1  # 异常也算发送失败
             return False
     
@@ -1626,7 +1640,9 @@ class BSCWebSocketMonitor:
         usd_value: float,
         pass_second_layer: bool,
         filter_reason: str = None,
-        token_data: dict = None
+        token_data: dict = None,
+        alert_sent: bool = False,
+        alert_blocked_reason: str = None
     ):
         """
         保存第二层过滤结果到数据库（用于复盘分析）
@@ -1641,6 +1657,8 @@ class BSCWebSocketMonitor:
             pass_second_layer: 是否通过第二层
             filter_reason: 未通过原因
             token_data: 代币数据（如果通过）
+            alert_sent: 是否发送告警
+            alert_blocked_reason: 告警被拦截原因
         """
         try:
             # 提取数据
@@ -1665,7 +1683,8 @@ class BSCWebSocketMonitor:
             else:
                 triggered_events_json = None
             
-            # SQL插入
+            # SQL插入（支持告警状态字段）
+            # 注意：不使用UNIQUE KEY，因为同一tx_hash+ca可能有多条记录
             sql = """
             INSERT INTO bsc_second_layer_filter_log (
                 tx_hash, ca, token_symbol, token_name, pair_address,
@@ -1673,8 +1692,10 @@ class BSCWebSocketMonitor:
                 pass_second_layer, filter_reason,
                 price_usd, market_cap, price_change, volume,
                 top10_holder_rate, holder_count,
-                triggered_events, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                triggered_events, 
+                alert_sent, alert_blocked_reason,
+                created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """
             
             params = (
@@ -1683,7 +1704,8 @@ class BSCWebSocketMonitor:
                 1 if pass_second_layer else 0, filter_reason,
                 price, market_cap, price_change, volume,
                 top10_holder_rate, holder_count,
-                triggered_events_json
+                triggered_events_json,
+                1 if alert_sent else 0, alert_blocked_reason
             )
             
             # 同步执行（不阻塞主流程）
@@ -1696,6 +1718,38 @@ class BSCWebSocketMonitor:
         except Exception as e:
             # 记录失败不影响主流程
             logger.warning(f"⚠️  记录第二层过滤结果失败: {e}")
+    
+    def _update_alert_status(self, tx_hash: str, ca: str, alert_sent: bool = False, alert_blocked_reason: str = None):
+        """
+        更新第二层过滤记录的告警状态（只更新最新的记录）
+        
+        Args:
+            tx_hash: 交易哈希
+            ca: 代币地址
+            alert_sent: 是否发送告警
+            alert_blocked_reason: 告警被拦截原因
+        
+        Note:
+            由于同一tx_hash+ca可能有多条记录（快速路径+兜底路径），
+            这里只更新id最大的那条（最新记录）
+        """
+        try:
+            sql = """
+            UPDATE bsc_second_layer_filter_log
+            SET alert_sent = %s, alert_blocked_reason = %s
+            WHERE tx_hash = %s AND ca = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """
+            
+            from src.solalert.core.database import get_db
+            db = get_db()
+            db.execute_update(sql, (1 if alert_sent else 0, alert_blocked_reason, tx_hash, ca))
+            
+            logger.debug(f"📝 更新告警状态: {ca[:10]} (发送={alert_sent}, 原因={alert_blocked_reason})")
+            
+        except Exception as e:
+            logger.warning(f"⚠️  更新告警状态失败: {e}")
     
     async def second_layer_filter(
         self,
@@ -2353,13 +2407,24 @@ class BSCWebSocketMonitor:
             )
             return
         
-        # 🔒 关键：原子化检查并设置冷却期（防止竞态条件）
-        # 使用 check_and_set 而不是 check_readonly，避免多线程同时通过检查
-        if not await self.check_and_set_alert_cooldown(base_token):
+        # 🔒 第一步：只读检查冷却期（快速过滤）
+        if not await self.check_alert_cooldown_readonly(base_token):
             self.alert_cooldown_blocked += 1
             if HAS_PROMETHEUS:
                 self.metrics_alert_cooldown_blocked.inc()
             logger.info(f"⏳ 冷却期内，跳过: {base_token}")
+            # 更新数据库记录：标记为冷却期拦截
+            self._update_alert_status(tx_hash, base_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
+            return
+        
+        # 🔒 第二步：原子操作设置冷却期（防止竞态条件导致重复发送）
+        if not await self.check_and_set_alert_cooldown(base_token):
+            self.alert_cooldown_blocked += 1
+            if HAS_PROMETHEUS:
+                self.metrics_alert_cooldown_blocked.inc()
+            logger.info(f"⏳ 冷却期内（竞态），跳过: {base_token}")
+            # 更新数据库记录：标记为冷却期拦截
+            self._update_alert_status(tx_hash, base_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
             return
         
         # 构建消息
@@ -2458,13 +2523,17 @@ class BSCWebSocketMonitor:
             self.alert_success_count += 1
             if HAS_PROMETHEUS:
                 self.metrics_alerts.labels(status='success').inc()
-            logger.info(f"✅ 告警发送成功: {base_token[:10]}...")
+            
+            # 更新数据库记录：标记为已发送告警
+            self._update_alert_status(tx_hash, base_token, alert_sent=True, alert_blocked_reason=None)
+            logger.info(f"✅✅✅ 告警已发送: {base_token} | 涨幅+{token_data.get('price_change', 0):.2f}% 交易量${token_data.get('volume', 0):,.0f}")
         else:
-            # ❌ 播报失败（但冷却期已设置，避免重复尝试）
+            # ❌ 播报失败 → 删除冷却期（解锁，允许下次重试）
             self.alert_fail_count += 1
             if HAS_PROMETHEUS:
                 self.metrics_alerts.labels(status='failure').inc()
-            logger.warning(f"⚠️  播报失败: {base_token[:10]}...")
+            await self.remove_alert_cooldown(base_token)
+            logger.warning(f"⚠️  播报失败，已解锁冷却期: {base_token[:10]}...")
         
         # 记录到数据库并推送WebSocket（无论通知是否成功）
         await asyncio.to_thread(
@@ -2630,12 +2699,14 @@ class BSCWebSocketMonitor:
                                         logger.debug(f"⏭️  [内盘快速] 未通过第二层过滤: {target_token[:10]}...")
                                         return
                                     
-                                    # 设置冷却期（原子操作）
+                                    # 🔒 第二步：原子操作设置冷却期（防止竞态条件导致重复发送）
                                     if not await self.check_and_set_alert_cooldown(target_token):
                                         self.alert_cooldown_blocked += 1
                                         if HAS_PROMETHEUS:
                                             self.metrics_alert_cooldown_blocked.inc()
                                         logger.info(f"⏳ [内盘快速] 冷却期内（竞态），跳过: {target_token[:10]}...")
+                                        # 更新数据库记录：标记为冷却期拦截
+                                        self._update_alert_status(tx_hash, target_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
                                         return
                                     
                                     # 构建并发送告警
@@ -2701,11 +2772,13 @@ class BSCWebSocketMonitor:
             if not transfers:
                 return
             
-            # 找出买入的 USDT/WBNB
+            # 找出买入的 USDT/WBNB/USDC
             usdt_in = sum(t["value"] for t in transfers 
                          if t["token"] == self.USDT and t["to"] in self.FOURMEME_PROXY)
             wbnb_in = sum(t["value"] for t in transfers 
                          if t["token"] == self.WBNB and t["to"] in self.FOURMEME_PROXY)
+            usdc_in = sum(t["value"] for t in transfers 
+                         if t["token"] == self.USDC and t["to"] in self.FOURMEME_PROXY)
             
             # 获取交易信息（BNB 买入，已从缓存获取）
             tx_value = 0
@@ -2724,6 +2797,10 @@ class BSCWebSocketMonitor:
                 quote_token = self.USDT
                 quote_amount = usdt_in
                 quote_symbol = "USDT"
+            elif usdc_in > 0:
+                quote_token = self.USDC
+                quote_amount = usdc_in
+                quote_symbol = "USDC"
             elif wbnb_in > 0:
                 quote_token = self.WBNB
                 quote_amount = wbnb_in
@@ -2739,7 +2816,7 @@ class BSCWebSocketMonitor:
             target_tokens = {}
             for t in transfers:
                 if (t["from"] in self.FOURMEME_PROXY and 
-                    t["token"] not in (self.USDT, self.WBNB)):
+                    t["token"] not in (self.USDT, self.WBNB, self.USDC)):
                     target_tokens[t["token"]] = target_tokens.get(t["token"], 0) + t["value"]
             
             if not target_tokens:
@@ -2823,13 +2900,24 @@ class BSCWebSocketMonitor:
                 except:
                     pass
             
-            # 🔒 关键：原子化检查并设置冷却期（防止竞态条件）
-            # 使用 check_and_set 而不是 check_readonly，避免多线程同时通过检查
-            if not await self.check_and_set_alert_cooldown(target_token):
+            # 🔒 第一步：只读检查冷却期（快速过滤）
+            if not await self.check_alert_cooldown_readonly(target_token):
                 self.alert_cooldown_blocked += 1
                 if HAS_PROMETHEUS:
                     self.metrics_alert_cooldown_blocked.inc()
                 logger.info(f"⏳ 冷却期内，跳过: {target_token}")
+                # 更新数据库记录：标记为冷却期拦截
+                self._update_alert_status(tx_hash, target_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
+                return
+            
+            # 🔒 第二步：原子操作设置冷却期（防止竞态条件导致重复发送）
+            if not await self.check_and_set_alert_cooldown(target_token):
+                self.alert_cooldown_blocked += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_alert_cooldown_blocked.inc()
+                logger.info(f"⏳ 冷却期内（竞态），跳过: {target_token}")
+                # 更新数据库记录：标记为冷却期拦截
+                self._update_alert_status(tx_hash, target_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
                 return
             
             # 构建消息
@@ -2929,13 +3017,16 @@ class BSCWebSocketMonitor:
                 self.alert_success_count += 1
                 if HAS_PROMETHEUS:
                     self.metrics_alerts.labels(status='success').inc()
-                logger.info(f"✅ 告警发送成功: {target_token[:10]}...")
+                # 更新数据库记录：标记为已发送告警
+                self._update_alert_status(tx_hash, target_token, alert_sent=True, alert_blocked_reason=None)
+                logger.info(f"✅✅✅ 告警已发送: {target_token} | 涨幅+{token_data.get('price_change', 0):.2f}% 交易量${token_data.get('volume', 0):,.0f}")
             else:
-                # ❌ 播报失败（但冷却期已设置，避免重复尝试）
+                # ❌ 播报失败 → 删除冷却期（解锁，允许下次重试）
                 self.alert_fail_count += 1
                 if HAS_PROMETHEUS:
                     self.metrics_alerts.labels(status='failure').inc()
-                logger.warning(f"⚠️  播报失败: {target_token[:10]}...")
+                await self.remove_alert_cooldown(target_token)
+                logger.warning(f"⚠️  播报失败，已解锁冷却期: {target_token[:10]}...")
             
             # 记录到数据库并推送WebSocket（无论通知是否成功）
             await asyncio.to_thread(
@@ -3037,6 +3128,15 @@ class BSCWebSocketMonitor:
             # 使用现有方法发送（会自动创建GMGN+Axiom按钮）
             send_success = await self.send_alert(message, target_token)
             
+            if send_success:
+                logger.info(f"✅✅✅ [内盘] 告警已发送: {symbol} | 涨幅+{price_change:.2f}% 交易量${volume:,.0f}")
+                # 更新数据库记录：标记为已发送告警
+                self._update_alert_status(tx_hash, target_token, alert_sent=True, alert_blocked_reason=None)
+            else:
+                # ❌ 播报失败 → 删除冷却期（解锁，允许下次重试）
+                await self.remove_alert_cooldown(target_token)
+                logger.warning(f"⚠️  [内盘] 播报失败，已解锁冷却期: {target_token[:10]}...")
+            
             # 记录到数据库（使用现有recorder）
             if hasattr(self, 'alert_recorder') and self.alert_recorder:
                 try:
@@ -3054,8 +3154,6 @@ class BSCWebSocketMonitor:
                     )
                 except Exception as e:
                     logger.debug(f"记录告警到数据库失败: {e}")
-            
-            logger.info(f"✅ [内盘] 告警已发送: {symbol} ${usd_value:.2f}")
             
         except Exception as e:
             logger.error(f"❌ 发送内盘告警失败: {e}")
