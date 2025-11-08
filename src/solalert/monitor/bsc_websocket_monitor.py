@@ -1616,6 +1616,87 @@ class BSCWebSocketMonitor:
             # API异常，结果不确定
             return (False, False, None)
     
+    def _save_second_layer_result(
+        self,
+        tx_hash: str,
+        ca: str,
+        pair_address: str,
+        pool_type: str,
+        is_internal: bool,
+        usd_value: float,
+        pass_second_layer: bool,
+        filter_reason: str = None,
+        token_data: dict = None
+    ):
+        """
+        保存第二层过滤结果到数据库（用于复盘分析）
+        
+        Args:
+            tx_hash: 交易哈希
+            ca: 代币地址
+            pair_address: 交易对地址
+            pool_type: 池类型（内盘/外盘）
+            is_internal: 是否内盘
+            usd_value: 交易金额
+            pass_second_layer: 是否通过第二层
+            filter_reason: 未通过原因
+            token_data: 代币数据（如果通过）
+        """
+        try:
+            # 提取数据
+            symbol = token_data.get('symbol') if token_data else None
+            name = token_data.get('name') if token_data else None
+            price = token_data.get('price') if token_data else 0
+            market_cap = token_data.get('market_cap') if token_data else 0
+            price_change = token_data.get('price_change') if token_data else 0
+            volume = token_data.get('volume') if token_data else 0
+            top10_holder_rate = token_data.get('top10_holder_rate', 0) * 100 if token_data and token_data.get('top10_holder_rate') else 0
+            holder_count = token_data.get('holder_count') if token_data else 0
+            
+            # 触发事件JSON化
+            triggered_events = token_data.get('triggered_events') if token_data else None
+            if triggered_events:
+                triggered_events_json = json.dumps([
+                    {
+                        'event': e.get('event') if isinstance(e, dict) else str(e),
+                        'description': e.get('description') if isinstance(e, dict) else str(e)
+                    } for e in triggered_events
+                ], ensure_ascii=False)
+            else:
+                triggered_events_json = None
+            
+            # SQL插入
+            sql = """
+            INSERT INTO bsc_second_layer_filter_log (
+                tx_hash, ca, token_symbol, token_name, pair_address,
+                pool_type, is_internal, usd_value,
+                pass_second_layer, filter_reason,
+                price_usd, market_cap, price_change, volume,
+                top10_holder_rate, holder_count,
+                triggered_events, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """
+            
+            params = (
+                tx_hash, ca, symbol, name, pair_address,
+                pool_type, 1 if is_internal else 0, usd_value,
+                1 if pass_second_layer else 0, filter_reason,
+                price, market_cap, price_change, volume,
+                top10_holder_rate, holder_count,
+                triggered_events_json
+            )
+            
+            # 同步执行（不阻塞主流程）
+            from src.solalert.core.database import get_db
+            db = get_db()
+            db.execute_update(sql, params)
+            
+            logger.debug(f"📝 已记录第二层过滤结果: {symbol or ca[:10]} (通过={pass_second_layer})")
+            
+        except Exception as e:
+            # 记录失败不影响主流程
+            logger.warning(f"⚠️  记录第二层过滤结果失败: {e}")
+    
     async def second_layer_filter(
         self,
         token_address: str,
@@ -1646,6 +1727,19 @@ class BSCWebSocketMonitor:
             
             if not raw_data:
                 logger.debug("第二层过滤-无DBotX数据", extra={"token": token_address[:10]})
+                # 记录失败结果
+                if hasattr(self.thread_local, 'current_tx_context'):
+                    ctx = self.thread_local.current_tx_context
+                    self._save_second_layer_result(
+                        tx_hash=ctx.get('tx_hash'),
+                        ca=token_address,
+                        pair_address=pair_address,
+                        pool_type="内盘" if is_internal else "外盘",
+                        is_internal=is_internal,
+                        usd_value=ctx.get('usd_value', 0),
+                        pass_second_layer=False,
+                        filter_reason="DBotX API无数据（代币未收录）"
+                    )
                 return None
             
             # 3. 判断内外盘
@@ -1661,6 +1755,19 @@ class BSCWebSocketMonitor:
             token_data = dbotx_api.parse_token_data(raw_data, time_interval)
             if not token_data:
                 logger.debug(f"⏭️  [第二层] 解析失败: {token_address}...")
+                # 记录失败结果
+                if hasattr(self.thread_local, 'current_tx_context'):
+                    ctx = self.thread_local.current_tx_context
+                    self._save_second_layer_result(
+                        tx_hash=ctx.get('tx_hash'),
+                        ca=token_address,
+                        pair_address=pair_address,
+                        pool_type=pool_type,
+                        is_internal=is_internal,
+                        usd_value=ctx.get('usd_value', 0),
+                        pass_second_layer=False,
+                        filter_reason="解析DBotX数据失败"
+                    )
                 return None
             
             # 6. Top持有者过滤（内盘和外盘都检查）
@@ -1678,6 +1785,20 @@ class BSCWebSocketMonitor:
                     if top10_holder_percent >= top_holders_threshold:
                         symbol = token_data.get('symbol', 'Unknown')
                         logger.info(f"⏭️  [第二层] Top10持有者比例过高: {symbol} ({top10_holder_percent:.1f}% >= {top_holders_threshold:.1f}%)")
+                        # 记录失败结果
+                        if hasattr(self.thread_local, 'current_tx_context'):
+                            ctx = self.thread_local.current_tx_context
+                            self._save_second_layer_result(
+                                tx_hash=ctx.get('tx_hash'),
+                                ca=token_address,
+                                pair_address=pair_address,
+                                pool_type=pool_type,
+                                is_internal=is_internal,
+                                usd_value=ctx.get('usd_value', 0),
+                                pass_second_layer=False,
+                                filter_reason=f"Top10持有者比例过高: {top10_holder_percent:.1f}% >= {top_holders_threshold:.1f}%",
+                                token_data=token_data
+                            )
                         return None
                 else:
                     top10_holder_check_passed = "N/A"  # API没返回数据，跳过检查
@@ -1780,6 +1901,25 @@ class BSCWebSocketMonitor:
             
             if not should_trigger:
                 logger.info(f"   ❌ 未达到触发条件")
+                # 记录失败结果 - 生成失败原因
+                logic_text = "all(需要所有指标)" if trigger_logic == "all" else "any(需要任一指标)"
+                price_threshold = events_config.get('priceChange', {}).get('risePercent', 0)
+                volume_threshold = events_config.get('volume', {}).get('threshold', 0)
+                filter_reason = f"未满足触发逻辑({logic_text}): 涨幅{price_change:+.2f}% < {price_threshold}% 且 交易量${volume:,.2f} < ${volume_threshold:,.2f}"
+                
+                if hasattr(self.thread_local, 'current_tx_context'):
+                    ctx = self.thread_local.current_tx_context
+                    self._save_second_layer_result(
+                        tx_hash=ctx.get('tx_hash'),
+                        ca=token_address,
+                        pair_address=pair_address,
+                        pool_type=pool_type,
+                        is_internal=is_internal,
+                        usd_value=ctx.get('usd_value', 0),
+                        pass_second_layer=False,
+                        filter_reason=filter_reason,
+                        token_data=token_data
+                    )
                 return None
             
             # 11. 通过筛选，返回数据
@@ -1800,6 +1940,21 @@ class BSCWebSocketMonitor:
             token_data['pool_emoji'] = pool_emoji
             token_data['triggered_events'] = triggered_events
             token_data['fallback_info'] = fallback_info  # 时间窗口退让信息
+            
+            # 记录成功结果
+            if hasattr(self.thread_local, 'current_tx_context'):
+                ctx = self.thread_local.current_tx_context
+                self._save_second_layer_result(
+                    tx_hash=ctx.get('tx_hash'),
+                    ca=token_address,
+                    pair_address=pair_address,
+                    pool_type=pool_type,
+                    is_internal=is_internal,
+                    usd_value=ctx.get('usd_value', 0),
+                    pass_second_layer=True,
+                    filter_reason=None,
+                    token_data=token_data
+                )
             
             return token_data
         
@@ -1985,6 +2140,12 @@ class BSCWebSocketMonitor:
         # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
         self._inc_credits_and_save(10)
         
+        # 设置上下文（用于数据库记录）
+        self.thread_local.current_tx_context = {
+            'tx_hash': tx_hash,
+            'usd_value': usd_value
+        }
+        
         # 检查API是否返回有效数据
         if pair_info_raw and pair_info_raw.get('mint') and pair_info_raw.get('baseMint'):
             # ============================================
@@ -2101,11 +2262,39 @@ class BSCWebSocketMonitor:
                 triggered_event_names = {e['event'] for e in triggered_events}
                 if not all(evt in triggered_event_names for evt in required_events):
                     logger.info(f"   ⏭️  未满足'all'触发逻辑（需要所有指标）")
+                    # 记录失败结果
+                    filter_reason = f"未满足'all'触发逻辑: 涨幅{price_change:+.2f}% < {min_price_change}% 且 交易量${volume:,.2f} < ${min_volume:,.2f}"
+                    self._save_second_layer_result(
+                        tx_hash=tx_hash,
+                        ca=base_token,
+                        pair_address=pair_address,
+                        pool_type="外盘",
+                        is_internal=False,
+                        usd_value=usd_value,
+                        pass_second_layer=False,
+                        filter_reason=filter_reason,
+                        token_data={'symbol': token_symbol, 'price': token_price_usd, 'market_cap': market_cap, 
+                                   'price_change': price_change, 'volume': volume}
+                    )
                     return
             elif trigger_logic == 'any':
                 # 只要有一个指标达标即可
                 if not triggered_events:
                     logger.info(f"   ⏭️  未满足'any'触发逻辑（至少一个指标）")
+                    # 记录失败结果
+                    filter_reason = f"未满足'any'触发逻辑: 涨幅{price_change:+.2f}% < {min_price_change}% 或 交易量${volume:,.2f} < ${min_volume:,.2f}"
+                    self._save_second_layer_result(
+                        tx_hash=tx_hash,
+                        ca=base_token,
+                        pair_address=pair_address,
+                        pool_type="外盘",
+                        is_internal=False,
+                        usd_value=usd_value,
+                        pass_second_layer=False,
+                        filter_reason=filter_reason,
+                        token_data={'symbol': token_symbol, 'price': token_price_usd, 'market_cap': market_cap,
+                                   'price_change': price_change, 'volume': volume}
+                    )
                     return
             
             logger.info(f"✅ 通过第二层: 触发事件={[e['event'] for e in triggered_events]}")
@@ -2135,9 +2324,33 @@ class BSCWebSocketMonitor:
                 'triggered_events': triggered_events,
                 'fallback_info': fallback_info  # 时间窗口退让信息
             }
+            
+            # 记录成功结果
+            self._save_second_layer_result(
+                tx_hash=tx_hash,
+                ca=base_token,
+                pair_address=pair_address,
+                pool_type="外盘",
+                is_internal=False,
+                usd_value=usd_value,
+                pass_second_layer=True,
+                filter_reason=None,
+                token_data=token_data
+            )
         else:
             # API未返回有效数据，跳过
             logger.warning(f"⚠️ DBotX API未返回有效数据: {base_token[:10]}...")
+            # 记录失败结果
+            self._save_second_layer_result(
+                tx_hash=tx_hash,
+                ca=base_token,
+                pair_address=pair_address,
+                pool_type="外盘",
+                is_internal=False,
+                usd_value=usd_value,
+                pass_second_layer=False,
+                filter_reason="DBotX API未返回有效数据"
+            )
             return
         
         # 🔒 关键：原子化检查并设置冷却期（防止竞态条件）
@@ -2405,6 +2618,12 @@ class BSCWebSocketMonitor:
                                         logger.debug(f"⚠️ [内盘快速] 无pair地址: {target_token[:10]}...")
                                         return
                                     
+                                    # 设置上下文（用于数据库记录）
+                                    self.thread_local.current_tx_context = {
+                                        'tx_hash': tx_hash,
+                                        'usd_value': usd_value
+                                    }
+                                    
                                     # 第二层过滤（获取市值等）
                                     token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True)
                                     if not token_data:
@@ -2582,6 +2801,12 @@ class BSCWebSocketMonitor:
                         "symbol": target_symbol
                     })
                     return
+            
+            # 设置上下文（用于数据库记录）
+            self.thread_local.current_tx_context = {
+                'tx_hash': tx_hash,
+                'usd_value': usd_value
+            }
             
             # 第二层过滤
             token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True)
@@ -2897,6 +3122,14 @@ class BSCWebSocketMonitor:
                 
                 logger.info(f"   eth_call缓存: {len(self.eth_call_cache)} 条 (命中 {self.eth_call_cache_hits} 次, 节省RPC)")
                 logger.info(f"   非fourmeme缓存: {self.cache_hit_count} 次（节省API调用）")
+                
+                # RPC限流统计
+                if self.rate_limit_429_count > 0:
+                    logger.info(f"   🚫 RPC限流统计:")
+                    logger.info(f"      ├─ 累计429次数: {self.rate_limit_429_count}")
+                    logger.info(f"      └─ 当前连续429: {self.rate_limit_consecutive_429}")
+                else:
+                    logger.info(f"   ✅ RPC限流: 无限流（累计0次）")
                 
                 # 第一层/第二层统计
                 total_first_layer = self.first_layer_pass_internal + self.first_layer_pass_external
