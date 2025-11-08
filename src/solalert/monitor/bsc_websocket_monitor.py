@@ -1430,8 +1430,9 @@ class BSCWebSocketMonitor:
                 return 1  -- 允许推送
             end
             
-            -- 解析JSON（简化：直接提取timestamp）
+            -- 解析JSON（简化：直接提取timestamp与上次的冷却秒数）
             local last_timestamp = tonumber(string.match(last_data, '"timestamp":(%d+)'))
+            local last_cooldown = tonumber(string.match(last_data, '"cooldown_seconds":(%d+)'))
             
             -- 无法解析，视为首次
             if not last_timestamp then
@@ -1440,8 +1441,13 @@ class BSCWebSocketMonitor:
                 return 1
             end
             
+            -- 复用上次存储的冷却时长，避免新的抖动值拉长冷却窗口
+            if not last_cooldown then
+                last_cooldown = cooldown
+            end
+            
             -- 检查冷却期
-            if now - last_timestamp < cooldown then
+            if now - last_timestamp < last_cooldown then
                 return 0  -- 冷却期内，拒绝
             end
             
