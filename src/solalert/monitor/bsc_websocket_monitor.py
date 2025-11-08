@@ -474,6 +474,11 @@ class BSCWebSocketMonitor:
         self.NON_FOURMEME_KEY = "bsc:non_fourmeme_tokens"
         self.NON_FOURMEME_TTL = 30 * 24 * 3600  # 30天
         
+        # fourmeme白名单缓存（避免重复API调用）
+        self.FOURMEME_KEY = "bsc:fourmeme_tokens"
+        self.FOURMEME_TTL = 30 * 24 * 3600  # 30天
+        self.fourmeme_cache_hit_count = 0  # fourmeme缓存命中计数
+        
         if self.redis_client:
             try:
                 cache_size = self.redis_client.scard(self.NON_FOURMEME_KEY)
@@ -2147,8 +2152,20 @@ class BSCWebSocketMonitor:
         # ============================================
         # 阶段3：fourmeme检查（先缓存，再API）
         # ============================================
-        # 先检查 Redis 缓存（非fourmeme token黑名单）
+        # 先检查fourmeme白名单缓存
+        is_cached_fourmeme = False
         if self.redis_client:
+            try:
+                is_cached_fourmeme = self.redis_client.sismember(self.FOURMEME_KEY, base_token)
+                if is_cached_fourmeme:
+                    self.fourmeme_cache_hit_count += 1
+                    logger.info(f"⚡ [外盘] fourmeme缓存命中 #{self.fourmeme_cache_hit_count}: {base_symbol} (${usd_value:.2f}) - {base_token[:10]}...")
+                    # 跳过后续API调用，直接进入第二层
+            except Exception as e:
+                logger.warning(f"⚠️  fourmeme缓存查询失败: {e}")
+        
+        # 再检查 Redis 缓存（非fourmeme token黑名单）
+        if not is_cached_fourmeme and self.redis_client:
             try:
                 is_cached_non_fourmeme = self.redis_client.sismember(self.NON_FOURMEME_KEY, base_token)
                 if is_cached_non_fourmeme:
@@ -2163,32 +2180,44 @@ class BSCWebSocketMonitor:
             except Exception as e:
                 logger.warning(f"⚠️  Redis缓存查询失败: {e}")
         
-        # 缓存未命中，调用API检查是否是fourmeme（会消耗10积分）
-        is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
-        
-        if not is_fourmeme:
-            if is_confirmed:
-                # 📊 Prometheus: API首次判断为非fourmeme
-                if HAS_PROMETHEUS:
-                    self.metrics_non_fourmeme.labels(source='api_first_check').inc()
-                
-                # 确认不是fourmeme → 加入Redis黑名单（30天过期）
-                if self.redis_client:
-                    try:
-                        self.redis_client.client.sadd(self.NON_FOURMEME_KEY, base_token)
-                        self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
-                        logger.debug(f"✅ 已加入黑名单: {base_symbol} - {base_token[:10]}...")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Redis缓存写入失败: {e}")
-                
-                logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
-            else:
-                # API 失败，不确定 → 不加黑名单
-                logger.info(f"⚠️  [外盘] fourmeme检查失败（API故障），跳过但不加黑名单: {base_symbol} - {base_token[:10]}...")
-            return
-        
-        # 是fourmeme，继续处理
-        logger.info(f"✅ [外盘] 是fourmeme: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
+        # 缓存都未命中，调用API检查是否是fourmeme（会消耗10积分）
+        if not is_cached_fourmeme:
+            is_fourmeme, is_confirmed, launchpad_info = await self.check_external_is_fourmeme(base_token)
+            
+            if not is_fourmeme:
+                if is_confirmed:
+                    # 📊 Prometheus: API首次判断为非fourmeme
+                    if HAS_PROMETHEUS:
+                        self.metrics_non_fourmeme.labels(source='api_first_check').inc()
+                    
+                    # 确认不是fourmeme → 加入Redis黑名单（30天过期）
+                    if self.redis_client:
+                        try:
+                            self.redis_client.client.sadd(self.NON_FOURMEME_KEY, base_token)
+                            self.redis_client.client.expire(self.NON_FOURMEME_KEY, self.NON_FOURMEME_TTL)
+                            logger.debug(f"✅ 已加入黑名单: {base_symbol} - {base_token[:10]}...")
+                        except Exception as e:
+                            logger.warning(f"⚠️  Redis缓存写入失败: {e}")
+                    
+                    logger.info(f"⏭️  [外盘] 非fourmeme，跳过: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
+                else:
+                    # API 失败，不确定 → 不加黑名单
+                    logger.info(f"⚠️  [外盘] fourmeme检查失败（API故障），跳过但不加黑名单: {base_symbol} - {base_token[:10]}...")
+                return
+            
+            # 是fourmeme，加入白名单缓存（避免重复API调用）
+            if self.redis_client and is_confirmed:
+                try:
+                    self.redis_client.client.sadd(self.FOURMEME_KEY, base_token)
+                    self.redis_client.client.expire(self.FOURMEME_KEY, self.FOURMEME_TTL)
+                    logger.debug(f"✅ 已加入fourmeme白名单: {base_symbol} - {base_token[:10]}...")
+                except Exception as e:
+                    logger.warning(f"⚠️  fourmeme缓存写入失败: {e}")
+            
+            logger.info(f"✅ [外盘] 是fourmeme: {base_symbol} (${usd_value:.2f}) | {base_token[:10]}...")
+        else:
+            # fourmeme缓存命中，已经在上面输出日志
+            launchpad_info = {'launchpad': 'fourmeme'}  # 设置基础信息
         
         # ============================================
         # 阶段4：调用DBotX API获取指标数据（仅fourmeme代币）
@@ -3226,6 +3255,7 @@ class BSCWebSocketMonitor:
                 
                 logger.info(f"   eth_call缓存: {len(self.eth_call_cache)} 条 (命中 {self.eth_call_cache_hits} 次, 节省RPC)")
                 logger.info(f"   非fourmeme缓存: {self.cache_hit_count} 次（节省API调用）")
+                logger.info(f"   fourmeme缓存: {self.fourmeme_cache_hit_count} 次（节省API调用）")
                 
                 # RPC限流统计
                 if self.rate_limit_429_count > 0:
