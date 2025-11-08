@@ -2462,53 +2462,55 @@ class BSCWebSocketMonitor:
             self._update_alert_status(tx_hash, base_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
             return
         
-        # 构建消息
-        quote_formatted = self.format_amount(quote_amount, quote_decimals)
-        base_formatted = self.format_amount(base_amount, base_decimals)
-        
-        pool_emoji = token_data['pool_emoji']
-        pool_type = token_data['pool_type']
-        is_internal = token_data.get('is_internal', False)
-        symbol = token_data.get('symbol', base_symbol)
-        price_change = token_data.get('price_change', 0)
-        volume = token_data.get('volume', 0)
-        market_cap = token_data.get('market_cap', 0)  # parse_token_data 已解析为 market_cap（下划线）
-        buy_tax = token_data.get('buy_tax', 0)
-        sell_tax = token_data.get('sell_tax', 0)
-        price = token_data.get('price', 0)
-        
-        # 获取时间间隔（用于日志显示）
-        time_interval = self.time_interval_internal if is_internal else self.time_interval_external
-        
-        volume_str = format_number(volume)
-        market_cap_str = format_number(market_cap)
-        
-        price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
-        
-        triggered_events = token_data.get('triggered_events', [])
-        fallback_info = token_data.get('fallback_info')  # 获取退让信息
-        
-        alert_reasons = []
-        for event in triggered_events:
-            if hasattr(event, 'description'):
-                alert_reasons.append(event.description)
-            elif isinstance(event, dict):
-                if event.get('event') == 'priceChange':
-                    alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
-                elif event.get('event') == 'volume':
-                    alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
-        
-        # 如果有退让信息，添加到告警原因
-        if fallback_info:
-            original = fallback_info['original']
-            fallback = fallback_info['fallback']
-            reason = fallback_info['reason']
-            alert_reasons.append(f"⚠️ {reason}，采用{fallback}数据")
-        
-        if not alert_reasons:
-            alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
-        
-        message = f"""<b>🟢 BSC 信号</b>
+        # 🛡️ 保护性try-except：如果构建消息或发送失败，自动解锁cooldown
+        try:
+            # 构建消息
+            quote_formatted = self.format_amount(quote_amount, quote_decimals)
+            base_formatted = self.format_amount(base_amount, base_decimals)
+            
+            pool_emoji = token_data['pool_emoji']
+            pool_type = token_data['pool_type']
+            is_internal = token_data.get('is_internal', False)
+            symbol = token_data.get('symbol', base_symbol)
+            price_change = token_data.get('price_change', 0)
+            volume = token_data.get('volume', 0)
+            market_cap = token_data.get('market_cap', 0)  # parse_token_data 已解析为 market_cap（下划线）
+            buy_tax = token_data.get('buy_tax', 0)
+            sell_tax = token_data.get('sell_tax', 0)
+            price = token_data.get('price', 0)
+            
+            # 获取时间间隔（用于日志显示）
+            time_interval = self.time_interval_internal if is_internal else self.time_interval_external
+            
+            volume_str = format_number(volume)
+            market_cap_str = format_number(market_cap)
+            
+            price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
+            
+            triggered_events = token_data.get('triggered_events', [])
+            fallback_info = token_data.get('fallback_info')  # 获取退让信息
+            
+            alert_reasons = []
+            for event in triggered_events:
+                if hasattr(event, 'description'):
+                    alert_reasons.append(event.description)
+                elif isinstance(event, dict):
+                    if event.get('event') == 'priceChange':
+                        alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
+                    elif event.get('event') == 'volume':
+                        alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
+            
+            # 如果有退让信息，添加到告警原因
+            if fallback_info:
+                original = fallback_info['original']
+                fallback = fallback_info['fallback']
+                reason = fallback_info['reason']
+                alert_reasons.append(f"⚠️ {reason}，采用{fallback}数据")
+            
+            if not alert_reasons:
+                alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
+            
+            message = f"""<b>🟢 BSC 信号</b>
 
 💰 代币: {symbol}
 📝 名称: {symbol}
@@ -2529,66 +2531,73 @@ class BSCWebSocketMonitor:
 
 ⏰ 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}
 """
-        
-        # 结构化日志输出（外盘）
-        logger.info("外盘交易触发", extra={
-            "pool_type": pool_type,
-            "symbol": symbol,
-            "token": base_token[:10],
-            "tx_hash": tx_hash[:10],
-            "quote_amount": f"{quote_formatted} {quote_symbol}",
-            "usd_value": f"${usd_value:.2f}",
-            "base_amount": f"{base_formatted} {symbol}",
-            "price_change": f"{price_change:+.2f}%",
-            "volume": f"${volume:,.0f}",
-            "market_cap": f"${market_cap:,.0f}",
-            "buy_tax": f"{buy_tax:.1f}%",
-            "sell_tax": f"{sell_tax:.1f}%"
-        })
-        
-        # 🚀 发送推送（冷却期已在前面设置，无论成败都不会重复发送）
-        alert_start = time.time()
-        send_success = await self.send_alert(message, base_token)
-        alert_time = time.time() - alert_start
-        if HAS_PROMETHEUS:
-            self.metrics_processing_time.labels(stage='alert').observe(alert_time)
-        
-        if send_success:
-            # ✅ 播报成功
-            self.alert_success_count += 1
-            if HAS_PROMETHEUS:
-                self.metrics_alerts.labels(status='success').inc()
             
-            # 更新数据库记录：标记为已发送告警
-            self._update_alert_status(tx_hash, base_token, alert_sent=True, alert_blocked_reason=None)
-            logger.info(f"✅✅✅ 告警已发送: {base_token} | 涨幅+{token_data.get('price_change', 0):.2f}% 交易量${token_data.get('volume', 0):,.0f}")
-        else:
-            # ❌ 播报失败 → 删除冷却期（解锁，允许下次重试）
+            # 结构化日志输出（外盘）
+            logger.info("外盘交易触发", extra={
+                "pool_type": pool_type,
+                "symbol": symbol,
+                "token": base_token[:10],
+                "tx_hash": tx_hash[:10],
+                "quote_amount": f"{quote_formatted} {quote_symbol}",
+                "usd_value": f"${usd_value:.2f}",
+                "base_amount": f"{base_formatted} {symbol}",
+                "price_change": f"{price_change:+.2f}%",
+                "volume": f"${volume:,.0f}",
+                "market_cap": f"${market_cap:,.0f}",
+                "buy_tax": f"{buy_tax:.1f}%",
+                "sell_tax": f"{sell_tax:.1f}%"
+            })
+            
+            # 🚀 发送推送（冷却期已在前面设置，无论成败都不会重复发送）
+            alert_start = time.time()
+            send_success = await self.send_alert(message, base_token)
+            alert_time = time.time() - alert_start
+            if HAS_PROMETHEUS:
+                self.metrics_processing_time.labels(stage='alert').observe(alert_time)
+            
+            if send_success:
+                # ✅ 播报成功
+                self.alert_success_count += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_alerts.labels(status='success').inc()
+                
+                # 更新数据库记录：标记为已发送告警
+                self._update_alert_status(tx_hash, base_token, alert_sent=True, alert_blocked_reason=None)
+                logger.info(f"✅✅✅ 告警已发送: {base_token} | 涨幅+{token_data.get('price_change', 0):.2f}% 交易量${token_data.get('volume', 0):,.0f}")
+            else:
+                # ❌ 播报失败 → 删除冷却期（解锁，允许下次重试）
+                self.alert_fail_count += 1
+                if HAS_PROMETHEUS:
+                    self.metrics_alerts.labels(status='failure').inc()
+                await self.remove_alert_cooldown(base_token)
+                logger.warning(f"⚠️  播报失败，已解锁冷却期: {base_token[:10]}...")
+            
+            # 记录到数据库并推送WebSocket（无论通知是否成功）
+            await asyncio.to_thread(
+                self.alert_recorder.write_bsc_alert,
+                ca=base_token,
+                token_name=symbol,
+                token_symbol=symbol,
+                single_max=usd_value,
+                total_sum=usd_value,
+                alert_reasons=alert_reasons,
+                block_number=0,  # WebSocket不关心区块号
+                price_usdt=price,
+                pair_address=pair_address,
+                market_cap=market_cap,
+                price_change=price_change,
+                volume_24h=volume,
+                holders=0,
+                logo="",
+                notify_error=None if send_success else "Telegram发送失败"
+            )
+        except Exception as e:
+            # 🚨 异常发生：解锁cooldown，避免token被永久锁死
+            logger.error(f"❌ 构建/发送消息异常，解锁cooldown: {base_token[:10]} | 错误: {e}", exc_info=True)
+            await self.remove_alert_cooldown(base_token)
             self.alert_fail_count += 1
             if HAS_PROMETHEUS:
                 self.metrics_alerts.labels(status='failure').inc()
-            await self.remove_alert_cooldown(base_token)
-            logger.warning(f"⚠️  播报失败，已解锁冷却期: {base_token[:10]}...")
-        
-        # 记录到数据库并推送WebSocket（无论通知是否成功）
-        await asyncio.to_thread(
-            self.alert_recorder.write_bsc_alert,
-            ca=base_token,
-            token_name=symbol,
-            token_symbol=symbol,
-            single_max=usd_value,
-            total_sum=usd_value,
-            alert_reasons=alert_reasons,
-            block_number=0,  # WebSocket不关心区块号
-            price_usdt=price,
-            pair_address=pair_address,
-            market_cap=market_cap,
-            price_change=price_change,
-            volume_24h=volume,
-            holders=0,
-            logo="",
-            notify_error=None if send_success else "Telegram发送失败"
-        )
     
     async def _handle_swap_with_receipt_fallback(self, tx_hash: str, pair_address: str):
         """外盘receipt兜底：从交易回执中提取Swap事件"""
@@ -3428,7 +3437,10 @@ class BSCWebSocketMonitor:
     
     def _run_async_in_thread(self, async_func, *args, **kwargs):
         """在线程池中运行异步函数（使用 asyncio.run 简化事件循环管理）"""
-        asyncio.run(async_func(*args, **kwargs))
+        try:
+            asyncio.run(async_func(*args, **kwargs))
+        except Exception as e:
+            logger.error(f"❌❌❌ 线程池任务执行失败: {async_func.__name__} | 错误: {e}", exc_info=True)
     
     def on_open(self, ws):
         """WebSocket 连接成功回调"""
