@@ -2439,7 +2439,8 @@ class BSCWebSocketMonitor:
             # 获取外盘配置（从 external_events_config 读取）
             external_config = self.external_events_config
             
-            # Prometheus: 外盘第二层检查计数
+            # 外盘第二层检查计数
+            self.second_layer_check_external += 1
             if HAS_PROMETHEUS:
                 self.metrics_second_layer_check.labels(type='external', path='api').inc()
             
