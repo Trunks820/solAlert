@@ -339,10 +339,7 @@ class SolAlertChecker:
         token_name = config.get('token_name', '')
         template_name = config.get('template_name', '')
         time_interval = config.get('time_interval', '1m')
-        
-        # 🚀 获取配置摘要
-        config_summary = self.format_config_summary(config)
-        
+
         # 🚀 提取触发逻辑和监控条件
         trigger_logic = config.get('trigger_logic') or config.get('triggerLogic', 'any')
         trigger_logic_cn = '任一条件' if trigger_logic == 'any' else '全部条件'
@@ -381,10 +378,8 @@ class SolAlertChecker:
         # 格式化市值和流动性
         market_cap_str = format_number(metrics['market_cap'], include_dollar=True)
         liquidity_str = format_number(metrics['liquidity'], include_dollar=True)
-        historical_high_cap_str = format_number(metrics.get('historical_high_cap', 0), include_dollar=True)
-        ath_ratio = metrics.get('ath_ratio', 0)
-        
-        message = f"""<b>🔔 SOL WebSocket 实时告警</b>
+
+        message = f"""<b>🔔 SOL实时告警</b>
 
 💰 Token: <b>{token_symbol}</b>
 📝 名称: {token_name}
@@ -399,10 +394,8 @@ class SolAlertChecker:
 
 💵 当前价格: <b>${metrics['price']:.10f}</b>
 💎 当前市值: <b>{market_cap_str}</b>
-🏆 历史最高: {historical_high_cap_str} ({ath_ratio:.1f}%)
 📈 价格变化: {metrics['price_change']:+.2f}%
 💧 流动性: {liquidity_str}
-👥 持有者: {metrics['holders']}
 📊 TOP10持仓: {metrics['top10_percent']:.2f}%
 
 ✨ 触发原因:
