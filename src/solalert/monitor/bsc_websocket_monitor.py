@@ -214,7 +214,7 @@ class BSCWebSocketMonitor:
         # 速率限制（防止429限流）
         self.rate_limit_lock = threading.Lock()
         self.last_rpc_time = 0
-        self.min_rpc_interval = 0.001  # 1ms 象征性间隔，Chainstack无限制
+        self.min_rpc_interval = 0.04  # 40ms间隔 = 25 RPS (保守策略，避免429)
         self.rate_limit_429_count = 0  # 429错误计数
         self.rate_limit_backoff_until = 0  # 退避截止时间（秒）
         self.rate_limit_consecutive_429 = 0  # 连续429次数
@@ -1557,6 +1557,141 @@ class BSCWebSocketMonitor:
         ]
         return InlineKeyboardMarkup(buttons)
     
+    async def _build_alert_message_and_send(
+        self,
+        tx_hash: str,
+        token_address: str,
+        token_symbol: str,
+        quote_amount: int,
+        quote_decimals: int,
+        quote_symbol: str,
+        base_amount: int = None,
+        base_decimals: int = None,
+        usd_value: float = 0,
+        token_data: dict = None,
+        is_internal: bool = False
+    ) -> bool:
+        """
+        统一的播报函数（内外盘通用）
+        
+        Args:
+            tx_hash: 交易哈希
+            token_address: 代币地址
+            token_symbol: 代币符号
+            quote_amount: 支付金额（raw）
+            quote_decimals: 支付币精度
+            quote_symbol: 支付币符号（USDT/USDC/WBNB等）
+            base_amount: 获得代币数量（raw，外盘必需）
+            base_decimals: 获得代币精度（外盘必需）
+            usd_value: USD价值
+            token_data: 代币数据（价格、市值、涨跌幅等）
+            is_internal: 是否内盘
+        
+        Returns:
+            bool: 是否发送成功
+        """
+        try:
+            # 格式化金额
+            quote_formatted = self.format_amount(quote_amount, quote_decimals)
+            base_formatted = None
+            if base_amount is not None and base_decimals is not None:
+                base_formatted = self.format_amount(base_amount, base_decimals)
+            
+            # 提取 token_data
+            pool_emoji = token_data.get('pool_emoji', '🟢')
+            pool_type = token_data.get('pool_type', 'unknown')
+            symbol = token_data.get('symbol', token_symbol)
+            price_change = token_data.get('price_change', 0)
+            volume = token_data.get('volume', 0)
+            market_cap = token_data.get('market_cap', 0)
+            price = token_data.get('price', 0)
+            
+            # 格式化数字
+            volume_str = format_number(volume)
+            market_cap_str = format_number(market_cap)
+            price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
+            
+            # 获取时间间隔
+            time_interval = self.time_interval_internal if is_internal else self.time_interval_external
+            
+            # 构建告警原因
+            triggered_events = token_data.get('triggered_events', [])
+            fallback_info = token_data.get('fallback_info')
+            
+            alert_reasons = []
+            for event in triggered_events:
+                if hasattr(event, 'description'):
+                    alert_reasons.append(event.description)
+                elif isinstance(event, dict):
+                    if event.get('event') == 'priceChange':
+                        alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
+                    elif event.get('event') == 'volume':
+                        alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
+            
+            # 如果有退让信息，添加到告警原因
+            if fallback_info:
+                original = fallback_info.get('original', '')
+                fallback = fallback_info.get('fallback', '')
+                reason = fallback_info.get('reason', '')
+                alert_reasons.append(f"⚠️ {reason}，采用{fallback}数据")
+            
+            if not alert_reasons:
+                alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
+            
+            # 构建消息（统一格式，根据is_internal调整）
+            message_parts = [
+                f"<b>{pool_emoji} BSC 信号</b>",
+                "",
+                f"💰 代币: {symbol}",
+                f"📝 名称: {symbol}",
+                f"🔗 合约: <code>{token_address}</code>"
+            ]
+            
+            # 外盘显示tx_hash
+            if not is_internal:
+                message_parts.append(f"🔗 交易哈希: <code>{tx_hash}</code>")
+            
+            message_parts.extend([
+                "",
+                "📊 <b>实时数据</b>",
+                f"💵 当前价格: {price_str}",
+                f"💎 市值: ${market_cap_str}",
+                f"🏊 状态: {pool_emoji} {pool_type}",
+                "",
+                "📉 <b>交易数据</b>",
+                f"💰 本次买入: {quote_formatted} {quote_symbol} (≈${usd_value:.2f})"
+            ])
+            
+            # 外盘显示获得代币
+            if not is_internal and base_formatted:
+                message_parts.append(f"🎁 获得代币: {base_formatted} {symbol}")
+            
+            # 内盘显示交易量和涨跌幅
+            if is_internal:
+                message_parts.append(f"📊 {time_interval}交易量: ${volume_str}")
+                message_parts.append(f"📈 {time_interval}涨跌幅: {price_change:+.2f}%")
+            
+            # 触发原因
+            reasons_title = "🔔 <b>触发原因</b>" if is_internal else "✨ <b>触发原因</b>"
+            message_parts.extend([
+                "",
+                reasons_title,
+                chr(10).join(('• ' + r if not is_internal else r) for r in alert_reasons),
+                "",
+                f"⏰ 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            ])
+            
+            message = chr(10).join(message_parts)
+            
+            # 发送告警
+            send_success = await self.send_alert(message, token_address)
+            
+            return send_success
+            
+        except Exception as e:
+            logger.error(f"❌ 构建并发送告警失败: {e}")
+            return False
+    
     async def send_alert(self, message: str, token_address: str) -> bool:
         """
         发送 Telegram 通知
@@ -1783,8 +1918,8 @@ class BSCWebSocketMonitor:
             if api_pair_address:
                 pair_address = api_pair_address
             
-            # 2. 调用 DBotX API 获取代币指标
-            raw_data = await dbotx_api.get_pair_info('bsc', pair_address)
+            # 2. 调用 DBotX API 获取代币指标（如果有pair_address）
+            raw_data = await dbotx_api.get_pair_info('bsc', pair_address) if pair_address else None
             
             # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
             # 注意：API返回None是正常业务逻辑（代币未收录），不算失败
@@ -2460,32 +2595,36 @@ class BSCWebSocketMonitor:
         
         # 🛡️ 保护性try-except：如果构建消息或发送失败，自动解锁cooldown
         try:
-            # 构建消息
-            quote_formatted = self.format_amount(quote_amount, quote_decimals)
-            base_formatted = self.format_amount(base_amount, base_decimals)
+            # 使用统一的播报函数（外盘）
+            alert_start = time.time()
+            send_success = await self._build_alert_message_and_send(
+                tx_hash=tx_hash,
+                token_address=base_token,
+                token_symbol=base_symbol,
+                quote_amount=quote_amount,
+                quote_decimals=quote_decimals,
+                quote_symbol=quote_symbol,
+                base_amount=base_amount,
+                base_decimals=base_decimals,
+                usd_value=usd_value,
+                token_data=token_data,
+                is_internal=False
+            )
+            alert_time = time.time() - alert_start
+            if HAS_PROMETHEUS:
+                self.metrics_processing_time.labels(stage='alert').observe(alert_time)
             
-            pool_emoji = token_data['pool_emoji']
-            pool_type = token_data['pool_type']
-            is_internal = token_data.get('is_internal', False)
+            # 提取数据用于日志和数据库
             symbol = token_data.get('symbol', base_symbol)
             price_change = token_data.get('price_change', 0)
             volume = token_data.get('volume', 0)
-            market_cap = token_data.get('market_cap', 0)  # parse_token_data 已解析为 market_cap（下划线）
-            buy_tax = token_data.get('buy_tax', 0)
-            sell_tax = token_data.get('sell_tax', 0)
+            market_cap = token_data.get('market_cap', 0)
             price = token_data.get('price', 0)
-            
-            # 获取时间间隔（用于日志显示）
-            time_interval = self.time_interval_internal if is_internal else self.time_interval_external
-            
-            volume_str = format_number(volume)
-            market_cap_str = format_number(market_cap)
-            
-            price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
-            
             triggered_events = token_data.get('triggered_events', [])
-            fallback_info = token_data.get('fallback_info')  # 获取退让信息
             
+            # 构建告警原因列表（用于数据库）
+            time_interval = self.time_interval_external
+            volume_str = format_number(volume)
             alert_reasons = []
             for event in triggered_events:
                 if hasattr(event, 'description'):
@@ -2495,61 +2634,8 @@ class BSCWebSocketMonitor:
                         alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
                     elif event.get('event') == 'volume':
                         alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
-            
-            # 如果有退让信息，添加到告警原因
-            if fallback_info:
-                original = fallback_info['original']
-                fallback = fallback_info['fallback']
-                reason = fallback_info['reason']
-                alert_reasons.append(f"⚠️ {reason}，采用{fallback}数据")
-            
             if not alert_reasons:
                 alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
-            
-            message = f"""<b>🟢 BSC 信号</b>
-
-💰 代币: {symbol}
-📝 名称: {symbol}
-🔗 合约: <code>{base_token}</code>
-🔗 交易哈希: <code>{tx_hash}</code>
-
-📊 <b>实时数据</b>
-💵 当前价格: {price_str}
-💎 市值: ${market_cap_str}
-🏊 状态: {pool_emoji} {pool_type}
-
-📉 <b>交易数据</b>
-💰 本次买入: {quote_formatted} {quote_symbol} (≈${usd_value:.2f})
-🎁 获得代币: {base_formatted} {symbol}
-
-✨ <b>触发原因</b>
-{chr(10).join('• ' + reason for reason in alert_reasons)}
-
-⏰ 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}
-"""
-            
-            # 结构化日志输出（外盘）
-            logger.info("外盘交易触发", extra={
-                "pool_type": pool_type,
-                "symbol": symbol,
-                "token": base_token[:10],
-                "tx_hash": tx_hash[:10],
-                "quote_amount": f"{quote_formatted} {quote_symbol}",
-                "usd_value": f"${usd_value:.2f}",
-                "base_amount": f"{base_formatted} {symbol}",
-                "price_change": f"{price_change:+.2f}%",
-                "volume": f"${volume:,.0f}",
-                "market_cap": f"${market_cap:,.0f}",
-                "buy_tax": f"{buy_tax:.1f}%",
-                "sell_tax": f"{sell_tax:.1f}%"
-            })
-            
-            # 🚀 发送推送（冷却期已在前面设置，无论成败都不会重复发送）
-            alert_start = time.time()
-            send_success = await self.send_alert(message, base_token)
-            alert_time = time.time() - alert_start
-            if HAS_PROMETHEUS:
-                self.metrics_processing_time.labels(stage='alert').observe(alert_time)
             
             if send_success:
                 # ✅ 播报成功
@@ -2559,7 +2645,7 @@ class BSCWebSocketMonitor:
                 
                 # 更新数据库记录：标记为已发送告警
                 self._update_alert_status(tx_hash, base_token, alert_sent=True, alert_blocked_reason=None)
-                logger.info(f"✅✅✅ 告警已发送: {base_token} | 涨幅+{token_data.get('price_change', 0):.2f}% 交易量${token_data.get('volume', 0):,.0f}")
+                logger.info(f"✅✅✅ 告警已发送: {base_token} | 涨幅+{price_change:.2f}% 交易量${volume:,.0f}")
             else:
                 # ❌ 播报失败 → 删除冷却期（解锁，允许下次重试）
                 self.alert_fail_count += 1
@@ -2623,6 +2709,52 @@ class BSCWebSocketMonitor:
         except Exception as e:
             logger.debug(f"❌ Receipt兜底失败: {e}")
     
+    # ============================================
+    # 内盘辅助函数
+    # ============================================
+    
+    ZERO = "0x0000000000000000000000000000000000000000"
+    
+    def _parse_fourmeme_custom_data_min(self, data: str):
+        """
+        最小必需字段解码：payToken/address、payAmount/uint256、getAmount/uint256
+        
+        只解析前3个固定槽位，不依赖完整ABI，避免事件签名变化导致字段错位
+        """
+        if not data or data == "0x":
+            return None, 0, 0
+        hex_ = data[2:] if data.startswith("0x") else data
+        if len(hex_) < 64*3:
+            return None, 0, 0
+        
+        # 第1槽 address 左填充，取右40位
+        pay_token  = "0x" + hex_[24:64]
+        pay_amount = int(hex_[64:128], 16)
+        get_amount = int(hex_[128:192], 16)
+        
+        return pay_token.lower(), pay_amount, get_amount
+    
+    def is_proxy(self, addr: str) -> bool:
+        """
+        判断地址是否为 Fourmeme Proxy（静态白名单 + Redis动态学习）
+        """
+        if not addr:
+            return False
+        a = addr.lower()
+        
+        # 静态白名单
+        if a in self.FOURMEME_PROXY:
+            return True
+        
+        # Redis动态白名单
+        try:
+            is_dynamic = bool(self.redis_client.client.sismember("bsc:fourmeme_proxies", a))
+            if is_dynamic:
+                logger.debug(f"💡 动态Proxy命中: {a[:10]}...")
+            return is_dynamic
+        except Exception:
+            return False
+    
     async def handle_proxy_event(self, log: Dict):
         """处理 Fourmeme Proxy 事件（内盘）"""
         tx_hash = log.get("transactionHash")
@@ -2636,13 +2768,24 @@ class BSCWebSocketMonitor:
             
             # ========== 快速路径：Custom Events（TokenPurchase/Sale）==========
             if topics and topics[0] in self.FOURMEME_CUSTOM_EVENTS:
+                # 🔥 动态学习：将合约地址加入Redis Proxy白名单
+                try:
+                    # 检查是否为新proxy（不在静态白名单）
+                    is_new_proxy = addr not in self.FOURMEME_PROXY
+                    added = self.redis_client.client.sadd("bsc:fourmeme_proxies", addr)
+                    if added > 0 and is_new_proxy:
+                        logger.info(f"🔥 发现新Proxy并加入白名单: {addr}")
+                    self.redis_client.client.expire("bsc:fourmeme_proxies", 30*24*3600)  # 30天
+                except Exception as e:
+                    logger.debug(f"⚠️ Proxy白名单更新失败: {e}")
+                
                 try:
                     # TokenPurchase/Sale 事件格式：
-                    # event TokenPurchase(address indexed token, address indexed buyer, uint256 cost, uint256 amount)
+                    # event TokenPurchase(address indexed token, address indexed buyer, ...)
                     # topics[0]: event signature
                     # topics[1]: token address (indexed)
                     # topics[2]: buyer address (indexed)  
-                    # data: cost (uint256) + amount (uint256)
+                    # data: payToken(address) + payAmount(uint256) + getAmount(uint256) + ...
                     
                     if len(topics) < 3:
                         logger.debug(f"⚠️ Custom Event topics不足: {len(topics)}")
@@ -2651,164 +2794,120 @@ class BSCWebSocketMonitor:
                         target_token = ("0x" + topics[1][-40:]).lower()
                         buyer = ("0x" + topics[2][-40:]).lower()
                         
-                        # 解码 data
-                        # TokenPurchase事件完整格式：8个非索引参数
-                        # (address indexed token, address indexed buyer, 
-                        #  address payToken, uint256 payAmount, uint256 getAmount, 
-                        #  uint256 curvePrice, uint256 protocolFee, uint256 subjectFee, 
-                        #  uint256 referralFee, uint256 supply)
-                        data = log.get("data", "0x")
-                        if data and len(data) >= 66:
-                            try:
-                                # 使用eth_abi解码（如果可用）
-                                pay_token = None
-                                cost = 0
-                                amount = 0
-                                
-                                if HAS_ETH_ABI:
-                                    try:
-                                        decoded = eth_abi_decode(['address', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256'], bytes.fromhex(data[2:]))
-                                        pay_token = decoded[0].lower() if isinstance(decoded[0], str) else ("0x" + decoded[0].hex())  # 支付代币地址
-                                        cost = decoded[1]  # 支付金额
-                                        amount = decoded[2]  # 获得代币数量
-                                    except Exception as e:
-                                        logger.debug(f"eth_abi解码失败: {e}")
-                                        # Fallback: 手动解析
-                                        try:
-                                            # 第1个字段：address (32字节，前12字节填充0)
-                                            pay_token = "0x" + data[26:66].lower() if len(data) >= 66 else None
-                                            # 第2个字段：payAmount (uint256)
-                                            cost = int(data[66:130], 16) if len(data) >= 130 else 0
-                                            # 第3个字段：getAmount (uint256)
-                                            amount = int(data[130:194], 16) if len(data) >= 194 else 0
-                                        except:
-                                            cost = 0
-                                            amount = 0
-                                else:
-                                    # Fallback: 手动解析
-                                    try:
-                                        # 第1个字段：address (32字节，前12字节填充0)
-                                        pay_token = "0x" + data[26:66].lower() if len(data) >= 66 else None
-                                        # 第2个字段：payAmount (uint256)
-                                        cost = int(data[66:130], 16) if len(data) >= 130 else 0
-                                        # 第3个字段：getAmount (uint256)
-                                        amount = int(data[130:194], 16) if len(data) >= 194 else 0
-                                    except:
-                                        cost = 0
-                                        amount = 0
-                                
-                                if cost > 0 and pay_token:
-                                    # 根据 pay_token 确定支付币种
-                                    quote_token = pay_token
-                                    quote_amount = cost
-                                    target_amount = amount
-                                    
-                                    # 识别支付代币类型
-                                    if quote_token == self.USDT:
-                                        quote_symbol = "USDT"
-                                    elif quote_token == self.USDC:
-                                        quote_symbol = "USDC"
-                                    elif quote_token == self.WBNB:
-                                        quote_symbol = "WBNB"
-                                    else:
-                                        # 未知的支付代币，跳过快速路径，走兜底逻辑
-                                        logger.debug(f"⚠️ [内盘快速] 未知支付代币: {quote_token}")
-                                        # 继续走兜底逻辑
-                                        raise ValueError("Unknown pay token")
-                                    
-                                    # 获取 token symbol 和 decimals
-                                    target_symbol = self.get_token_symbol(target_token)
-                                    quote_decimals = self.get_decimals(quote_token)
-                                    target_decimals = self.get_decimals(target_token)
-                                    
-                                    # 计算 USD 价值
-                                    quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
-                                    if quote_token == self.WBNB:
-                                        wbnb_price = self.get_wbnb_price()
-                                        usd_value = float(quote_value) * wbnb_price
-                                    else:
-                                        usd_value = float(quote_value)  # USDT/USDC ≈ $1
-                                    
-                                    # 调试日志：显示支付代币识别结果
-                                    logger.debug(f"[内盘快速] token={target_token[:10]}... "
-                                                f"pay_token={quote_token[:10]}... ({quote_symbol}) "
-                                                f"cost={cost} usd=${usd_value:.2f}")
-                                    
-                                    # 第一层过滤：金额检查
-                                    if not self.first_layer_filter(usd_value, is_internal=True):
-                                        logger.debug(f"⏭️  [内盘快速] 金额不足: {target_symbol} (${usd_value:.2f})")
-                                        return
-                                    
-                                    logger.info(f"✅ [内盘快速] {target_symbol} 买入 {quote_symbol} ${usd_value:.2f}")
-                                    
-                                    # 冷却期检查（只读）
-                                    if not await self.check_alert_cooldown_readonly(target_token):
-                                        self.alert_cooldown_blocked += 1
-                                        if HAS_PROMETHEUS:
-                                            self.metrics_alert_cooldown_blocked.inc()
-                                        logger.info(f"⏳ [内盘快速] 冷却期内，跳过: {target_token[:10]}...")
-                                        return
-                                    
-                                    # 获取 launchpad 信息（轻量 API 调用）
-                                    launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
-                                    
-                                    # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
-                                    self._inc_credits_and_save(10)
-                                    
-                                    if not launchpad_info:
-                                        # Fallback：构造基础信息
-                                        launchpad_info = {
-                                            'launchpad': 'fourmeme',
-                                            'pair_address': None
-                                        }
-                                    
-                                    pair_address = launchpad_info.get('pair_address')
-                                    if not pair_address:
-                                        logger.debug(f"⚠️ [内盘快速] 无pair地址: {target_token[:10]}...")
-                                        return
-                                    
-                                    # 设置上下文（用于数据库记录）
-                                    self.thread_local.current_tx_context = {
-                                        'tx_hash': tx_hash,
-                                        'usd_value': usd_value
-                                    }
-                                    
-                                    # 第二层过滤（获取市值等）
-                                    token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True)
-                                    if not token_data:
-                                        logger.debug(f"⏭️  [内盘快速] 未通过第二层过滤: {target_token[:10]}...")
-                                        return
-                                    
-                                    # 🔒 第二步：原子操作设置冷却期（防止竞态条件导致重复发送）
-                                    if not await self.check_and_set_alert_cooldown(target_token):
-                                        self.alert_cooldown_blocked += 1
-                                        if HAS_PROMETHEUS:
-                                            self.metrics_alert_cooldown_blocked.inc()
-                                        logger.info(f"⏳ [内盘快速] 冷却期内（竞态），跳过: {target_token[:10]}...")
-                                        # 更新数据库记录：标记为冷却期拦截
-                                        self._update_alert_status(tx_hash, target_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
-                                        return
-                                    
-                                    # 构建并发送告警
-                                    await self._send_internal_alert(
-                                        tx_hash=tx_hash,
-                                        target_token=target_token,
-                                        target_symbol=target_symbol,
-                                        target_amount=target_amount,
-                                        target_decimals=target_decimals,
-                                        quote_symbol=quote_symbol,
-                                        quote_amount=quote_amount,
-                                        quote_decimals=quote_decimals,
-                                        usd_value=usd_value,
-                                        token_data=token_data,
-                                        proxy_type=proxy_type
-                                    )
-                                    
-                                    logger.info(f"📤 [内盘快速] 告警已发送: {target_symbol} ${usd_value:.2f}")
-                                    return  # ⚡ 快速返回，不走 receipt 逻辑
-                            except Exception as e:
-                                logger.debug(f"Custom Event 解码失败: {e}")
-                                # 继续走兜底逻辑
+                        # 使用最小解码器（只解前3个字段，不依赖完整ABI）
+                        pay_token, cost, amount = self._parse_fourmeme_custom_data_min(log.get("data", "0x"))
+                        
+                        if not pay_token or cost <= 0:
+                            # 解码失败，走兜底逻辑
+                            logger.debug(f"⚠️ [内盘快速] 解码失败: pay_token={pay_token}, cost={cost}")
+                            raise ValueError("custom_event_decode_failed")
+                        
+                        # 识别支付代币类型
+                        if pay_token == self.USDT:
+                            quote_symbol = "USDT"
+                        elif pay_token == self.USDC:
+                            quote_symbol = "USDC"
+                        elif pay_token == self.WBNB:
+                            quote_symbol = "WBNB"
+                        else:
+                            # 未知支付代币，走兜底逻辑
+                            logger.debug(f"⚠️ [内盘快速] 未知支付代币: {pay_token}")
+                            raise ValueError("unknown_pay_token")
+                        
+                        # 设置变量
+                        target_amount = amount
+                        quote_token = pay_token
+                        quote_amount = cost
+                        
+                        # 获取 token symbol 和 decimals
+                        target_symbol = self.get_token_symbol(target_token)
+                        quote_decimals = self.get_decimals(quote_token)
+                        target_decimals = self.get_decimals(target_token)
+                        
+                        # 计算 USD 价值
+                        quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
+                        if quote_token == self.WBNB:
+                            wbnb_price = self.get_wbnb_price()
+                            usd_value = float(quote_value) * wbnb_price
+                        else:
+                            usd_value = float(quote_value)  # USDT/USDC ≈ $1
+                        
+                        # 调试日志：显示支付代币识别结果
+                        logger.debug(f"[内盘快速] token={target_token[:10]}... "
+                                    f"pay_token={quote_token[:10]}... ({quote_symbol}) "
+                                    f"cost={cost} usd=${usd_value:.2f}")
+                        
+                        # 第一层过滤：金额检查
+                        if not self.first_layer_filter(usd_value, is_internal=True):
+                            logger.debug(f"⏭️  [内盘快速] 金额不足: {target_symbol} (${usd_value:.2f})")
+                            return
+                        
+                        logger.info(f"✅ [内盘快速] {target_symbol} 买入 {quote_symbol} ${usd_value:.2f}")
+                        
+                        # 冷却期检查（只读）
+                        if not await self.check_alert_cooldown_readonly(target_token):
+                            self.alert_cooldown_blocked += 1
+                            if HAS_PROMETHEUS:
+                                self.metrics_alert_cooldown_blocked.inc()
+                            logger.info(f"⏳ [内盘快速] 冷却期内，跳过: {target_token[:10]}...")
+                            return
+                        
+                        # 获取 launchpad 信息（轻量 API 调用）
+                        launchpad_info = await dbotx_api.get_token_launchpad_info('bsc', target_token)
+                        
+                        # 📊 Prometheus: 记录DBotX API调用 + 积分消费（10分/次）+ 保存到Redis
+                        self._inc_credits_and_save(10)
+                        
+                        if not launchpad_info:
+                            # Fallback：构造基础信息
+                            launchpad_info = {
+                                'launchpad': 'fourmeme',
+                                'pair_address': None
+                            }
+                        
+                        # 无论有无pair，都走second_layer_filter；让它内部决定是否走体积兜底
+                        pair_address = launchpad_info.get('pair_address')
+                        
+                        # 设置上下文（用于数据库记录）
+                        self.thread_local.current_tx_context = {
+                            'tx_hash': tx_hash,
+                            'usd_value': usd_value
+                        }
+                        
+                        # 第二层过滤（获取市值等）
+                        token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True, path='fast')
+                        if not token_data:
+                            logger.debug(f"⏭️  [内盘快速] 未通过第二层过滤: {target_token[:10]}...")
+                            return
+                        
+                        # 🔒 第二步：原子操作设置冷却期（防止竞态条件导致重复发送）
+                        if not await self.check_and_set_alert_cooldown(target_token):
+                            self.alert_cooldown_blocked += 1
+                            if HAS_PROMETHEUS:
+                                self.metrics_alert_cooldown_blocked.inc()
+                            logger.info(f"⏳ [内盘快速] 冷却期内（竞态），跳过: {target_token[:10]}...")
+                            # 更新数据库记录：标记为冷却期拦截
+                            self._update_alert_status(tx_hash, target_token, alert_sent=False, alert_blocked_reason="冷却期拦截")
+                            return
+                        
+                        # 构建并发送告警
+                        await self._send_internal_alert(
+                            tx_hash=tx_hash,
+                            target_token=target_token,
+                            target_symbol=target_symbol,
+                            target_amount=target_amount,
+                            target_decimals=target_decimals,
+                            quote_symbol=quote_symbol,
+                            quote_amount=quote_amount,
+                            quote_decimals=quote_decimals,
+                            usd_value=usd_value,
+                            token_data=token_data,
+                            proxy_type=proxy_type
+                        )
+                        
+                        logger.info(f"📤 [内盘快速] 告警已发送: {target_symbol} ${usd_value:.2f}")
+                        return  # ⚡ 快速返回，不走 receipt 逻辑
+                        
                 except Exception as e:
                     logger.debug(f"Custom Event 快速路径失败: {e}")
                     # 继续走兜底逻辑
@@ -2852,51 +2951,73 @@ class BSCWebSocketMonitor:
             if not transfers:
                 return
             
-            # 找出买入的 USDT/WBNB/USDC
+            # 获取buyer地址（从custom event topics 或 tx.from）
+            buyer = None
+            try:
+                # 如果 custom 的 topics 有 buyer，用它；否则用 tx.from
+                if topics and len(topics) >= 3:
+                    buyer = ("0x" + topics[2][-40:]).lower()
+                else:
+                    buyer = (tx_info.get("from", "") or "").lower()
+            except:
+                buyer = (tx_info.get("from", "") or "").lower()
+            
+            # 稳定币集合
+            stable = {self.USDT, self.USDC, self.WBNB}
+            
+            # —— 付费腿：既看 "from==buyer" 的出账，也看 "to 在已知 Proxy集合" 的入账
             usdt_in = sum(t["value"] for t in transfers 
-                         if t["token"] == self.USDT and t["to"] in self.FOURMEME_PROXY)
-            wbnb_in = sum(t["value"] for t in transfers 
-                         if t["token"] == self.WBNB and t["to"] in self.FOURMEME_PROXY)
+                         if t["token"] == self.USDT and (t["from"] == buyer or self.is_proxy(t["to"])))
             usdc_in = sum(t["value"] for t in transfers 
-                         if t["token"] == self.USDC and t["to"] in self.FOURMEME_PROXY)
+                         if t["token"] == self.USDC and (t["from"] == buyer or self.is_proxy(t["to"])))
+            wbnb_in = sum(t["value"] for t in transfers 
+                         if t["token"] == self.WBNB and (t["from"] == buyer or self.is_proxy(t["to"])))
             
-            # 获取交易信息（BNB 买入，已从缓存获取）
+            # two-hop 容错：buyer -> X -> proxy（稳定币）
+            if not (usdt_in or usdc_in or wbnb_in) and buyer:
+                by_token_to_mid = {(t["token"], t["to"]): t["value"] 
+                                  for t in transfers 
+                                  if t["from"] == buyer and t["token"] in stable}
+                for (tk, mid), v in by_token_to_mid.items():
+                    # mid -> proxy
+                    v2 = sum(t["value"] for t in transfers 
+                            if t["token"] == tk and t["from"] == mid and self.is_proxy(t["to"]))
+                    if v2:
+                        if tk == self.USDT: 
+                            usdt_in += min(v, v2)
+                        elif tk == self.USDC: 
+                            usdc_in += min(v, v2)
+                        elif tk == self.WBNB: 
+                            wbnb_in += min(v, v2)
+            
+            # value-腿（BNB直接转账）
             tx_value = 0
-            if tx_info and tx_info.get("value"):
-                try:
+            try:
+                if tx_info and tx_info.get("value"): 
                     tx_value = int(tx_info["value"], 16)
-                except:
-                    pass
+            except:
+                pass
             
-            # 确定付出的基准币
-            quote_token = None
+            # —— 选确定的付费币种
+            quote_token = quote_symbol = None
             quote_amount = 0
-            quote_symbol = ""
-            
-            if usdt_in > 0:
-                quote_token = self.USDT
-                quote_amount = usdt_in
-                quote_symbol = "USDT"
-            elif usdc_in > 0:
-                quote_token = self.USDC
-                quote_amount = usdc_in
-                quote_symbol = "USDC"
-            elif wbnb_in > 0:
-                quote_token = self.WBNB
-                quote_amount = wbnb_in
-                quote_symbol = "WBNB"
-            elif tx_value > 0:
-                quote_token = self.WBNB
-                quote_amount = tx_value
-                quote_symbol = "BNB"
+            if usdt_in > 0: 
+                quote_token, quote_symbol, quote_amount = self.USDT, "USDT", usdt_in
+            elif usdc_in > 0: 
+                quote_token, quote_symbol, quote_amount = self.USDC, "USDC", usdc_in
+            elif wbnb_in > 0: 
+                quote_token, quote_symbol, quote_amount = self.WBNB, "WBNB", wbnb_in
+            elif tx_value > 0: 
+                quote_token, quote_symbol, quote_amount = self.WBNB, "BNB", tx_value
             else:
                 return
             
-            # 找出目标代币
+            # —— 主币腿：既看 proxy 转出，也把"零地址铸造"算进来
             target_tokens = {}
             for t in transfers:
-                if (t["from"] in self.FOURMEME_PROXY and 
-                    t["token"] not in (self.USDT, self.WBNB, self.USDC)):
+                if t["token"] in stable: 
+                    continue
+                if self.is_proxy(t["from"]) or t["from"] == self.ZERO:
                     target_tokens[t["token"]] = target_tokens.get(t["token"], 0) + t["value"]
             
             if not target_tokens:
@@ -2953,11 +3074,8 @@ class BSCWebSocketMonitor:
                     logger.info(f"✅ 从 receipt 提取到 pair: {pair_address}")
                     launchpad_info['pair_address'] = pair_address
                 else:
-                    logger.debug("内盘无交易对地址", extra={
-                        "token": target_token[:10],
-                        "symbol": target_symbol
-                    })
-                    return
+                    logger.debug(f"⚠️ [内盘兜底] 无pair地址，将使用体积兜底: {target_token[:10]}...")
+                    # 不return，让second_layer_filter内部决定是否使用体积兜底
             
             # 设置上下文（用于数据库记录）
             self.thread_local.current_tx_context = {
@@ -2965,8 +3083,8 @@ class BSCWebSocketMonitor:
                 'usd_value': usd_value
             }
             
-            # 第二层过滤
-            token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True)
+            # 第二层过滤（无论有无pair，都走second_layer_filter）
+            token_data = await self.second_layer_filter(target_token, pair_address, launchpad_info, is_internal=True, path='fallback')
             if not token_data:
                 return
             
@@ -3147,30 +3265,32 @@ class BSCWebSocketMonitor:
     ):
         """发送内盘告警（供快速路径和兜底路径共用）"""
         try:
-            # 格式化金额
-            quote_formatted = self.format_amount(quote_amount, quote_decimals)
-            target_formatted = self.format_amount(target_amount, target_decimals)
+            # 使用统一的播报函数（内盘）
+            send_success = await self._build_alert_message_and_send(
+                tx_hash=tx_hash,
+                token_address=target_token,
+                token_symbol=target_symbol,
+                quote_amount=quote_amount,
+                quote_decimals=quote_decimals,
+                quote_symbol=quote_symbol,
+                base_amount=None,  # 内盘不显示获得代币
+                base_decimals=None,
+                usd_value=usd_value,
+                token_data=token_data,
+                is_internal=True
+            )
             
-            # 提取 token_data
-            pool_emoji = token_data['pool_emoji']
-            pool_type = token_data['pool_type']
-            is_internal = token_data.get('is_internal', True)
+            # 提取数据用于日志和数据库
             symbol = token_data.get('symbol', target_symbol)
             price_change = token_data.get('price_change', 0)
             volume = token_data.get('volume', 0)
             market_cap = token_data.get('market_cap', 0)
-            price = token_data.get('price', 0)
-            
-            # 格式化数字（使用已导入的format_number）
-            volume_str = format_number(volume)
-            market_cap_str = format_number(market_cap)
-            price_str = f"${price:.5f} USDT" if price >= 0.01 else f"${price:.10f} USDT"
-            
-            # 获取时间间隔
-            time_interval = self.time_interval_internal if is_internal else self.time_interval_external
-            
-            # 构建告警原因
+            pool_type = token_data.get('pool_type', 'fourmeme')
             triggered_events = token_data.get('triggered_events', [])
+            
+            # 构建告警原因列表（用于数据库）
+            time_interval = self.time_interval_internal
+            volume_str = format_number(volume)
             alert_reasons = []
             for event in triggered_events:
                 if hasattr(event, 'description'):
@@ -3180,33 +3300,8 @@ class BSCWebSocketMonitor:
                         alert_reasons.append(f"📈 {time_interval}涨幅 {price_change:+.2f}%")
                     elif event.get('event') == 'volume':
                         alert_reasons.append(f"💹 {time_interval}交易量 ${volume_str}")
-            
             if not alert_reasons:
                 alert_reasons.append(f"💰 大额交易 ${usd_value:.2f}")
-            
-            # 构建消息
-            message = f"""<b>{pool_emoji} BSC 信号</b>
-
-💰 代币: {symbol}
-📝 名称: {symbol}
-🔗 合约: <code>{target_token}</code>
-
-📊 <b>实时数据</b>
-💵 当前价格: {price_str}
-💎 市值: ${market_cap_str}
-🏊 状态: {pool_emoji} {pool_type}
-
-📉 <b>交易数据</b>
-💰 本次买入: {quote_formatted} {quote_symbol} (≈${usd_value:.2f})
-📊 {time_interval}交易量: ${volume_str}
-📈 {time_interval}涨跌幅: {price_change:+.2f}%
-
-🔔 <b>触发原因</b>
-{chr(10).join(alert_reasons)}
-"""
-            
-            # 使用现有方法发送（会自动创建GMGN+Axiom按钮）
-            send_success = await self.send_alert(message, target_token)
             
             if send_success:
                 logger.info(f"✅✅✅ [内盘] 告警已发送: {symbol} | 涨幅+{price_change:.2f}% 交易量${volume:,.0f}")
