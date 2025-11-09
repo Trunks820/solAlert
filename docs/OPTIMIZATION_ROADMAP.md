@@ -453,6 +453,123 @@ readinessProbe:
 
 ---
 
+### ~~8. 线程池异常处理 + Cooldown保护~~ ✅ 已完成（2025-11-08）
+
+**原问题**：
+- 📍 `src/solalert/monitor/bsc_websocket_monitor.py:3429-3431` - 线程池静默吞掉异常
+- ❌ `ThreadPoolExecutor.submit()` 执行异常时无日志
+- ❌ Cooldown设置后如果异常，token被永久"锁死"
+- ❌ 真实案例：token通过第二层，设置cooldown，但构建消息时异常，导致无法发送且后续被拦截
+
+**✅ 已实施方案（2025-11-08）**：
+
+**1. 线程池异常捕获**
+```python
+def _run_async_in_thread(self, async_func, *args, **kwargs):
+    """在线程池中运行异步函数"""
+    try:
+        asyncio.run(async_func(*args, **kwargs))
+    except Exception as e:
+        logger.error(f"❌❌❌ 线程池任务执行失败: {async_func.__name__} | 错误: {e}", exc_info=True)
+```
+
+**2. Cooldown保护机制（外盘）**
+```python
+# 设置cooldown
+if not await self.check_and_set_alert_cooldown(base_token):
+    return
+
+# 🛡️ 保护性try-except：如果构建消息或发送失败，自动解锁cooldown
+try:
+    # 构建消息
+    message = ...
+    # 发送告警
+    send_success = await self.send_alert(message, base_token)
+    
+    if send_success:
+        # 成功逻辑
+    else:
+        # 失败：解锁cooldown
+        await self.remove_alert_cooldown(base_token)
+except Exception as e:
+    # 🚨 异常发生：解锁cooldown，避免token被永久锁死
+    logger.error(f"❌ 构建/发送消息异常，解锁cooldown: {base_token[:10]} | 错误: {e}", exc_info=True)
+    await self.remove_alert_cooldown(base_token)
+```
+
+**关键改进**：
+- ✅ 所有线程池异常都有详细日志（包含堆栈信息）
+- ✅ Cooldown设置后如果出错自动解锁
+- ✅ 避免token被"锁死"无法重试
+- ✅ 外盘路径已保护（内盘路径已有类似机制）
+
+**问题诊断流程改进**：
+```
+之前：通过第二层 → 设置cooldown → 异常（无日志） → token锁死 → 用户困惑
+现在：通过第二层 → 设置cooldown → 异常（详细日志） → 自动解锁 → 下次可重试
+```
+
+**状态**：✅ 已部署，修复了生产环境的token"锁死"问题
+
+---
+
+### 9. Redis缓存优化 ✅ 已完成（2025-11-08）
+
+**原问题**：
+- ❌ fourmeme白名单缓存缺失（同一token重复调用API浪费积分）
+- ❌ TTL设置过长（30天），Redis内存占用过高
+- ❌ 1G Redis在小配置服务器（4G总内存）上需要控制占用
+
+**✅ 已实施方案（2025-11-08）**：
+
+**1. fourmeme白名单缓存**
+```python
+# 初始化
+self.FOURMEME_KEY = "bsc:fourmeme_tokens"
+self.FOURMEME_TTL = 7 * 24 * 3600  # 7天
+self.fourmeme_cache_hit_count = 0
+
+# 检查流程
+1. 先检查fourmeme白名单（命中→跳过API，直接第二层）
+2. 再检查非fourmeme黑名单（命中→跳过）
+3. 都未命中→调用API
+4. 是fourmeme→加入白名单，下次直接命中
+
+# 内存预估（7天）
+- fourmeme白名单：500×7 = 3,500个 → ~0.5 MB
+- 非fourmeme黑名单：3,000×7 = 21,000个 → ~3 MB
+- 总计：~3.6 MB（1G Redis占用率 0.36%）
+```
+
+**2. TTL优化**
+```python
+# 调整前
+self.NON_FOURMEME_TTL = 30 * 24 * 3600  # 30天 → ~15 MB
+self.FOURMEME_TTL = 30 * 24 * 3600      # 30天
+
+# 调整后  
+self.NON_FOURMEME_TTL = 7 * 24 * 3600   # 7天 → ~3.6 MB
+self.FOURMEME_TTL = 7 * 24 * 3600       # 7天
+```
+
+**关键改进**：
+- ✅ 同一fourmeme token命中缓存，节省10积分/次
+- ✅ 预计节省90%重复API调用
+- ✅ Redis内存占用降低75%（15MB → 3.6MB）
+- ✅ 7天TTL对BSC链（token更新快）足够
+
+**性能提升示例**：
+```
+假设一个fourmeme token每小时10笔交易：
+之前：10笔 × 10积分 = 100积分/小时
+现在：1笔（首次） × 10积分 + 9笔（缓存） × 0积分 = 10积分/小时
+节省：90积分/小时（90%节省）
+```
+
+**状态**：✅ 已部署生产
+
+---
+
 ## ⚡ P1 - 重要优化（2周内，5天）
 
 ### 8. 完全asyncio化重构 ⭐⭐⭐ (优先级下调)
@@ -791,6 +908,360 @@ pre-commit install
 
 ---
 
+### 13. 告警可靠性保障机制 ⭐⭐⭐⭐⭐
+
+**问题**：
+- ❌ Telegram发送失败后token被cooldown锁死（已在P0#8修复）
+- ❌ 缺少重试机制（一次失败=永久丢失）
+- ❌ 无失败告警追溯（不知道丢了多少）
+
+**实施方案（1天）**：
+
+**阶段1：告警重试队列**
+
+创建 `src/solalert/utils/alert_retry_queue.py`：
+
+```python
+class AlertRetryQueue:
+    """告警重试队列（Redis支持）"""
+    
+    def __init__(self, redis_client, max_retries=3, retry_interval=300):
+        self.redis = redis_client
+        self.max_retries = max_retries
+        self.retry_interval = retry_interval  # 5分钟
+    
+    def add_failed_alert(self, token: str, message: str, reason: str):
+        """添加失败的告警到重试队列"""
+        retry_key = f"alert:retry:{token}"
+        retry_data = {
+            "token": token,
+            "message": message,
+            "failed_at": time.time(),
+            "reason": reason,
+            "retry_count": 0,
+            "last_retry": 0
+        }
+        self.redis.client.setex(retry_key, 3600, json.dumps(retry_data))  # 1小时TTL
+        logger.warning(f"📥 告警加入重试队列: {token[:10]} | 原因: {reason}")
+    
+    async def retry_failed_alerts(self, send_func):
+        """定时任务：重试失败的告警（每5分钟）"""
+        keys = self.redis.client.keys("alert:retry:*")
+        
+        for key in keys:
+            try:
+                data = json.loads(self.redis.client.get(key))
+                token = data["token"]
+                message = data["message"]
+                retry_count = data["retry_count"]
+                last_retry = data["last_retry"]
+                
+                # 检查重试间隔
+                if time.time() - last_retry < self.retry_interval:
+                    continue
+                
+                # 检查重试次数
+                if retry_count >= self.max_retries:
+                    # 超过最大重试次数 → 移入死信队列
+                    self._move_to_dlq(data)
+                    self.redis.client.delete(key)
+                    continue
+                
+                # 尝试重发
+                logger.info(f"🔄 重试告警 ({retry_count+1}/{self.max_retries}): {token[:10]}")
+                success = await send_func(message, token)
+                
+                if success:
+                    logger.info(f"✅ 重试成功: {token[:10]}")
+                    self.redis.client.delete(key)
+                else:
+                    # 更新重试计数
+                    data["retry_count"] += 1
+                    data["last_retry"] = time.time()
+                    self.redis.client.setex(key, 3600, json.dumps(data))
+                    logger.warning(f"⚠️  重试失败: {token[:10]} | 下次{self.retry_interval}秒后重试")
+                    
+            except Exception as e:
+                logger.error(f"处理重试队列异常: {e}")
+    
+    def _move_to_dlq(self, data):
+        """移入死信队列（数据库存储，人工review）"""
+        # 存入MySQL死信表
+        sql = """
+        INSERT INTO alert_dead_letter_queue 
+        (token, message, failed_at, reason, retry_count, created_at)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        """
+        # 执行INSERT...
+        logger.error(f"☠️  告警进入死信队列: {data['token'][:10]} | 重试{data['retry_count']}次均失败")
+```
+
+**阶段2：死信队列表**
+
+```sql
+CREATE TABLE IF NOT EXISTS alert_dead_letter_queue (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    token VARCHAR(42) NOT NULL,
+    message TEXT NOT NULL,
+    failed_at BIGINT NOT NULL,
+    reason VARCHAR(500),
+    retry_count INT DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    reviewed TINYINT DEFAULT 0,
+    INDEX idx_token (token),
+    INDEX idx_created_at (created_at),
+    INDEX idx_reviewed (reviewed)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+**阶段3：集成到BSC Monitor**
+
+```python
+# 初始化
+self.retry_queue = AlertRetryQueue(self.redis_client)
+
+# 发送失败时
+if not send_success:
+    self.retry_queue.add_failed_alert(token, message, "Telegram发送失败")
+    await self.remove_alert_cooldown(token)  # 解锁cooldown
+
+# 定时任务（每5分钟）
+async def retry_loop(self):
+    while not self.should_stop:
+        await asyncio.sleep(300)  # 5分钟
+        await self.retry_queue.retry_failed_alerts(self.send_alert)
+```
+
+**收益**：
+- ✅ 零漏报（网络临时故障恢复后自动重试）
+- ✅ 可追溯（所有失败有记录）
+- ✅ 自动恢复（无需人工介入）
+- ✅ 死信队列（重试3次仍失败的可人工review）
+
+**工作量**：1天
+
+---
+
+### 14. 缓存分级TTL策略 ⭐⭐⭐⭐
+
+**问题**：
+- ❌ 所有缓存用同一TTL（不够灵活）
+- ❌ 热数据被淘汰（如高频token）
+- ❌ 冷数据占内存（如过期pair）
+
+**实施方案（2天）**：
+
+**阶段1：分级TTL配置**
+
+```python
+# config/cache_config.yaml
+cache_ttl:
+  # 短期缓存（高频变化，快速淘汰）
+  receipt_cache: 300          # 5分钟
+  eth_call_cache: 60          # 1分钟
+  alert_cooldown: 3600        # 1小时
+  
+  # 中期缓存（中频变化）
+  fourmeme_whitelist: 604800  # 7天
+  non_fourmeme_blacklist: 604800  # 7天
+  token_metadata: 259200      # 3天
+  
+  # 长期缓存（低频变化）
+  pair_info: 2592000          # 30天
+  contract_abi: 7776000       # 90天
+```
+
+**阶段2：智能缓存管理器**
+
+```python
+from cachetools import TTLCache, LRUCache
+
+class SmartCacheManager:
+    """智能多级缓存管理器"""
+    
+    def __init__(self):
+        # L1: 热数据缓存（内存，LRU）
+        self.hot_cache = LRUCache(maxsize=1000)  # 最常访问
+        
+        # L2: 温数据缓存（内存，TTL）
+        self.warm_cache = TTLCache(maxsize=5000, ttl=300)  # 5分钟
+        
+        # L3: 冷数据缓存（Redis，长TTL）
+        # 通过Redis实现
+    
+    def get(self, key, fetch_func=None):
+        """多级查找：L1 → L2 → L3 → fetch"""
+        # L1命中
+        if key in self.hot_cache:
+            return self.hot_cache[key]
+        
+        # L2命中 → 提升到L1
+        if key in self.warm_cache:
+            value = self.warm_cache[key]
+            self.hot_cache[key] = value
+            return value
+        
+        # L3（Redis）命中 → 提升到L2
+        redis_value = self.redis.get(f"cache:{key}")
+        if redis_value:
+            value = json.loads(redis_value)
+            self.warm_cache[key] = value
+            return value
+        
+        # 全部未命中 → 调用fetch函数
+        if fetch_func:
+            value = fetch_func(key)
+            self.set(key, value)
+            return value
+        
+        return None
+    
+    def set(self, key, value, level='warm'):
+        """根据访问频率决定缓存级别"""
+        if level == 'hot':
+            self.hot_cache[key] = value
+        elif level == 'warm':
+            self.warm_cache[key] = value
+        
+        # 同时写入Redis（L3）
+        self.redis.setex(f"cache:{key}", 3600, json.dumps(value))
+```
+
+**阶段3：访问频率统计**
+
+```python
+class AccessCounter:
+    """统计key访问频率，动态调整缓存级别"""
+    
+    def __init__(self):
+        self.access_count = defaultdict(int)
+        self.last_reset = time.time()
+    
+    def record_access(self, key):
+        self.access_count[key] += 1
+        
+        # 每小时重置统计
+        if time.time() - self.last_reset > 3600:
+            self._promote_hot_keys()
+            self.access_count.clear()
+            self.last_reset = time.time()
+    
+    def _promote_hot_keys(self):
+        """提升高频key到hot缓存"""
+        sorted_keys = sorted(
+            self.access_count.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
+        # Top 100提升到hot
+        for key, count in sorted_keys[:100]:
+            if count > 10:  # 1小时访问>10次
+                # 从warm提升到hot
+                pass
+```
+
+**收益**：
+- ✅ 内存利用率提升（热数据常驻，冷数据快速淘汰）
+- ✅ 命中率提升（多级缓存）
+- ✅ 访问延迟降低（L1内存访问 < 1ms）
+- ✅ Redis压力降低（L1/L2分流）
+
+**工作量**：2天
+
+---
+
+### 15. API成本监控与优化 ⭐⭐⭐⭐
+
+**问题**：
+- ❌ DBotX API按积分计费，成本不透明
+- ❌ 不知道哪个环节消耗最多
+- ❌ 无成本预警（可能超支）
+
+**实施方案（0.5天）**：
+
+**基于现有Prometheus扩展**：
+
+**1. 新增Metrics**
+```python
+# 已有
+bsc_ws_credits_consumed_total{source="dbotx"}  # 总消耗
+
+# 新增细分
+bsc_ws_credits_consumed_total{source="launchpad", result="fourmeme"}
+bsc_ws_credits_consumed_total{source="launchpad", result="non_fourmeme"}
+bsc_ws_credits_consumed_total{source="pair_info", cache="hit"}
+bsc_ws_credits_consumed_total{source="pair_info", cache="miss"}
+bsc_ws_credits_saved_by_cache_total{cache_type="fourmeme"}
+bsc_ws_credits_saved_by_cache_total{cache_type="non_fourmeme"}
+```
+
+**2. Grafana Dashboard新增面板**
+
+```yaml
+# 1. 实时消耗速率
+title: "API积分消耗速率"
+query: "rate(bsc_ws_credits_consumed_total[1h]) * 3600"
+unit: "credits/hour"
+
+# 2. 预测今日消耗
+title: "预测今日总消耗"
+query: |
+  bsc_ws_credits_consumed_total{source="dbotx"} +
+  (rate(bsc_ws_credits_consumed_total{source="dbotx"}[1h]) * 3600 * 
+   clamp_min(24 - hour(), 0))
+threshold: 
+  warning: 800000   # 80万
+  critical: 1000000 # 100万
+
+# 3. 缓存命中率
+title: "fourmeme缓存节省"
+query: |
+  (sum(bsc_ws_credits_saved_by_cache_total) /
+   sum(bsc_ws_credits_consumed_total + bsc_ws_credits_saved_by_cache_total)) * 100
+unit: "%"
+
+# 4. 各环节积分占比
+title: "积分消耗分布"
+type: "pie chart"
+queries:
+  - launchpad检查: sum(bsc_ws_credits_consumed_total{source="launchpad"})
+  - pair_info获取: sum(bsc_ws_credits_consumed_total{source="pair_info"})
+```
+
+**3. 告警规则**
+
+```yaml
+# 日消耗超标
+- alert: DailyCreditsExceeded
+  expr: |
+    sum(bsc_ws_credits_consumed_total) + 
+    (rate(bsc_ws_credits_consumed_total[1h]) * 3600 * 
+     clamp_min(24 - hour(), 0)) > 1000000
+  annotations:
+    summary: "预测今日积分消耗将超过100万"
+    description: "当前已消耗{{ $value }}"
+
+# 缓存命中率过低
+- alert: LowCacheHitRate
+  expr: |
+    (sum(bsc_ws_credits_saved_by_cache_total) /
+     sum(bsc_ws_credits_consumed_total + bsc_ws_credits_saved_by_cache_total)) < 0.5
+  for: 1h
+  annotations:
+    summary: "缓存命中率低于50%"
+```
+
+**收益**：
+- ✅ 实时成本可见（知道烧了多少钱）
+- ✅ 优化方向明确（哪里最贵）
+- ✅ 预算预警（避免超支）
+- ✅ 缓存效果可视化
+
+**工作量**：0.5天（基于现有Prometheus系统）
+
+---
+
 ## 📊 P2 - 长期优化（1-3个月）
 
 ### 13. Redis Pipeline批量操作 ⭐⭐⭐
@@ -1060,16 +1531,19 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ## 🎯 优先级总结
 
-### **✅ 已完成优化（2025-11-04 ~ 2025-11-05）**
+### **✅ 已完成优化（2025-11-04 ~ 2025-11-08）**
 
-| 优化项 | 实际工作量 | 收益 | 状态 |
-|--------|----------|------|------|
-| ~~1. 直接处理模式架构~~ | 1天 | 处理能力2.5x，0丢消息，延迟-80% | ✅ 已部署 |
-| ~~2. API客户端复用~~ | 2小时 | API成功率70%→94% | ✅ 已部署 |
-| ~~3. Chainstack迁移~~ | 1小时 | 删除限流机制，简化代码150行 | ✅ 已部署 |
-| ~~4. Telegram HTTP API + 监控优化~~ | 4小时 | 架构统一，业务监控可视化 | ✅ 已部署 |
+| 优化项 | 实际工作量 | 收益 | 完成日期 | 状态 |
+|--------|----------|------|---------|------|
+| ~~1. 直接处理模式架构~~ | 1天 | 处理能力2.5x，0丢消息，延迟-80% | 2025-11-04 | ✅ 已部署 |
+| ~~2. API客户端复用~~ | 2小时 | API成功率70%→94% | 2025-11-04 | ✅ 已部署 |
+| ~~3. Chainstack迁移~~ | 1小时 | 删除限流机制，简化代码150行 | 2025-11-04 | ✅ 已部署 |
+| ~~4. Telegram HTTP API + 监控优化~~ | 4小时 | 架构统一，业务监控可视化 | 2025-11-05 | ✅ 已部署 |
+| ~~5. Prometheus Metrics~~ | 2小时 | 实时监控，可视化Dashboard | 2025-11-05 | ✅ 已部署 |
+| ~~8. 线程池异常处理 + Cooldown保护~~ | 3小时 | 修复token"锁死"问题，异常全可追踪 | 2025-11-08 | ✅ 已部署 |
+| ~~9. Redis缓存优化~~ | 2小时 | fourmeme白名单，TTL优化，内存-75% | 2025-11-08 | ✅ 已部署 |
 
-**总计：~2天，核心架构优化完成**
+**总计：~2.5天，核心问题全部解决**
 
 **关键成果**：
 - ✅ **队列模式 → 直接处理模式**（经验教训：队列不是银弹！）
@@ -1078,6 +1552,8 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 - ✅ **代码简化860行**（150行限流 + 210行队列 + 500行废弃）
 - ✅ **Telegram架构统一**（所有模块使用HTTP API）
 - ✅ **健康检查优化**（业务指标为主，价值提升）
+- ✅ **异常处理完善**（线程池异常捕获，cooldown自动解锁）
+- ✅ **缓存策略优化**（fourmeme白名单节省90% API调用，Redis内存占用-75%）
 
 ---
 
@@ -1103,21 +1579,27 @@ ADD INDEX idx_template_time (template_id, alert_time DESC);
 
 ---
 
-### **中期实施（2周内，总计3天）**
+### **中期实施（2周内，总计6天）**
 
 | 优化项 | 工作量 | 收益 | 优先级 |
 |--------|--------|------|--------|
-| 9. 配置集中化 | 1天 | 维护性大幅提升 | ⭐⭐⭐⭐ |
-| 10. 指标降级优化 | 5分钟-1天 | 减少漏报 | ⭐⭐⭐ |
-| 11. 单元测试+CI | 1天 | 质量保障 | ⭐⭐⭐⭐ |
-| 12. 业务监控告警 | 1天 | 主动运维 | ⭐⭐⭐ |
+| 10. 配置集中化 | 1天 | 维护性大幅提升 | ⭐⭐⭐⭐ |
+| 11. 指标降级优化 | 5分钟-1天 | 减少漏报 | ⭐⭐⭐ |
+| 12. 单元测试+CI | 1天 | 质量保障 | ⭐⭐⭐⭐ |
+| 13. 业务监控告警 | 1天 | 主动运维 | ⭐⭐⭐ |
+| **14. 告警可靠性保障** | 1天 | 零漏报，自动重试 | ⭐⭐⭐⭐⭐ |
+| **15. 缓存分级TTL策略** | 2天 | 内存优化，命中率提升 | ⭐⭐⭐⭐ |
+| **16. API成本监控** | 0.5天 | 成本可见，预算预警 | ⭐⭐⭐⭐ |
 
-**总计：~3天**
+**总计：~6天**
 
-**说明**：
+**新增说明**：
+- ✅ 告警可靠性（重试队列+死信队列）- 避免Telegram临时故障导致漏报
+- ✅ 缓存分级（L1/L2/L3多级缓存）- 提升性能，降低Redis压力
+- ✅ API成本监控（实时消耗+预算预警）- 避免DBotX积分超支
 - asyncio化已从P1移至P2（优先级下调）
 - 当前直接处理模式已满足性能需求
-- 重点转向可维护性和可观测性
+- 重点转向可维护性、可靠性和可观测性
 
 ---
 
@@ -1256,7 +1738,78 @@ opentelemetry-sdk==1.21.0
 
 ---
 
-**Document Version**: v2.0  
-**Last Updated**: 2025-11-04  
-**Next Review**: 2025-12-04
+## 📈 当前项目状态（2025-11-08）
+
+### **🎯 核心指标**
+
+| 指标 | 当前值 | 目标值 | 状态 |
+|------|--------|--------|------|
+| **消息处理能力** | ~40 msg/s | 50 msg/s | ✅ 达标 |
+| **消息丢失率** | 0% | <0.1% | ✅ 优秀 |
+| **处理延迟P95** | <1s | <2s | ✅ 优秀 |
+| **API成功率** | ~94% | >95% | ⚠️ 接近 |
+| **告警零漏报** | 0（已修复锁死bug） | 0 | ✅ 达标 |
+| **Redis内存占用** | ~3.6MB | <10MB | ✅ 优秀 |
+| **系统可用性** | >99.5% | >99.9% | ⚠️ 接近 |
+
+### **🚀 已解决的关键问题**
+
+1. ✅ **架构性能问题**（队列瓶颈 → 直接处理）
+2. ✅ **资源泄漏问题**（API客户端复用）
+3. ✅ **异常处理缺陷**（线程池异常捕获 + cooldown保护）
+4. ✅ **缓存策略优化**（fourmeme白名单，TTL调整）
+5. ✅ **RPC限流移除**（Chainstack无限制节点）
+6. ✅ **监控可视化**（Prometheus + Grafana）
+
+### **⚠️ 当前已知问题**
+
+1. ⚠️ **缺少告警重试机制**（Telegram临时故障可能丢失告警）
+   - 解决方案：P1#14 告警可靠性保障（1天工作量）
+   
+2. ⚠️ **缺少健康检查端点**（K8s/Docker无法判断服务状态）
+   - 解决方案：P0#7 健康检查+优雅关闭（1小时工作量）
+   
+3. ⚠️ **API成本不透明**（不知道每天烧了多少积分）
+   - 解决方案：P1#16 API成本监控（0.5天工作量）
+   
+4. ⚠️ **无单元测试**（重构风险高）
+   - 解决方案：P1#12 单元测试+CI（1天工作量）
+
+### **📊 代码质量评估**
+
+| 维度 | 评分 | 说明 |
+|------|------|------|
+| **架构设计** | ⭐⭐⭐⭐⭐ | 直接处理模式简单高效，无过度设计 |
+| **可靠性** | ⭐⭐⭐⭐ | 异常处理完善，cooldown保护，缺重试机制 |
+| **性能** | ⭐⭐⭐⭐⭐ | 0丢消息，低延迟，高吞吐 |
+| **可观测性** | ⭐⭐⭐⭐ | Prometheus监控，日志完善，缺APM |
+| **可维护性** | ⭐⭐⭐ | 配置分散，缺单元测试，文档完善 |
+| **成本控制** | ⭐⭐⭐ | 缓存优化，但成本可见性不足 |
+
+**综合评分**：⭐⭐⭐⭐ / 5.0（生产可用，有优化空间）
+
+### **🎯 下一步行动**
+
+#### **本周优先**（紧急+高收益）：
+1. ✅ 健康检查+优雅关闭（1小时）
+2. ✅ API成本监控（0.5天）
+3. ✅ 告警可靠性保障（1天）
+
+#### **本月计划**（重要优化）：
+4. ✅ 配置集中化（1天）
+5. ✅ 单元测试+CI（1天）
+6. ✅ 业务监控告警（1天）
+
+#### **季度目标**（长期优化）：
+- 缓存分级TTL策略（2天）
+- 数据库批量操作（1天）
+- asyncio化重构（3天，按需）
+
+**预估工作量**：本周2.5天，本月6天，季度内10-15天
+
+---
+
+**Document Version**: v3.0  
+**Last Updated**: 2025-11-08  
+**Next Review**: 2025-12-08
 

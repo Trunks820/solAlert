@@ -2061,27 +2061,19 @@ class BSCWebSocketMonitor:
         # ============================================
         # 阶段1：RPC获取基础信息（免费，快速过滤）
         # ============================================
-        mint = None
-        base_mint = None
-        base_symbol = None
-        token_symbol = None
-        pair_info_rpc = None
-        
-        # 使用 RPC 获取 token0/token1
         pair_info_rpc = self.get_pair_full_info(pair_address)
         if not pair_info_rpc:
             logger.debug(f"⏭️  RPC获取pair信息失败，跳过: {pair_address}")
             return
         
-        mint = pair_info_rpc['token0'].lower()  # token0 = mint
-        base_mint = pair_info_rpc['token1'].lower()  # token1 = baseMint
-        token_symbol = pair_info_rpc.get('symbol0', '???')
-        base_symbol = pair_info_rpc.get('symbol1', '???')
-        base_decimals = pair_info_rpc.get('decimals0', 18)
+        t0 = pair_info_rpc['token0'].lower()
+        t1 = pair_info_rpc['token1'].lower()
+        sym0 = pair_info_rpc.get('symbol0', '???')
+        sym1 = pair_info_rpc.get('symbol1', '???')
+        dec0 = pair_info_rpc.get('decimals0', 18)
+        dec1 = pair_info_rpc.get('decimals1', 18)
         
-        # 快速过滤：检查基础货币是否是我们关注的稳定币
-        if base_mint not in (self.USDT, self.USDC, self.WBNB):
-            return
+        stable = {self.USDT, self.USDC, self.WBNB}
         
         # ============================================
         # 阶段2：解析交易金额并计算USD价值
@@ -2091,39 +2083,43 @@ class BSCWebSocketMonitor:
         amount0_out = swap_data["amount0Out"]
         amount1_out = swap_data["amount1Out"]
         
-        # 判断是否是买入行为（稳定币输入 → 主代币输出）
-        # 根据测试结果：mint=token0, baseMint=token1 (100%匹配)
-        quote_token = None
-        base_token = None
-        quote_amount = 0
-        base_amount = 0
-        quote_decimals = 18  # 稳定币精度默认18
-        quote_symbol = base_symbol
-        base_symbol = token_symbol
-        
-        if amount0_in > 0 and amount1_out > 0:
-            # token0输入 → token1输出
-            # 这种情况通常不是买入（token0是主代币，token1是稳定币）
-            # 但我们仍需检查
-            if mint == base_mint:  # 特殊情况：稳定币对
-                return
-            logger.debug(f"⏭️  可能是卖出：token0输入 → token1输出")
-            return
-            
-        elif amount1_in > 0 and amount0_out > 0:
-            # token1输入 → token0输出
-            # 根据测试：token1=baseMint（稳定币），token0=mint（主代币）
-            # 这是标准的买入行为 ✓
-            quote_token = base_mint  # 稳定币
-            base_token = mint  # 主代币
-            quote_amount = amount1_in
-            base_amount = amount0_out
+        # 根据哪一侧是稳定币，决定"买单形态"和数量取值
+        if t0 in stable:
+            # 稳定币在 token0：买入 = 付 token0，得 token1
+            is_buy = (amount0_in > 0 and amount1_out > 0)
+            quote_token   = t0
+            quote_symbol  = sym0
+            quote_decimals = dec0
+            base_token    = t1
+            base_symbol   = sym1
+            base_decimals  = dec1
+            quote_amount  = amount0_in
+            base_amount   = amount1_out
+        elif t1 in stable:
+            # 稳定币在 token1：买入 = 付 token1，得 token0
+            is_buy = (amount1_in > 0 and amount0_out > 0)
+            quote_token   = t1
+            quote_symbol  = sym1
+            quote_decimals = dec1
+            base_token    = t0
+            base_symbol   = sym0
+            base_decimals  = dec0
+            quote_amount  = amount1_in
+            base_amount   = amount0_out
         else:
-            # 其他情况：可能是复杂交易
+            # 既不是 USDT/USDC/WBNB 对，直接跳过
             return
         
-        if not quote_token or not base_token:
+        if not is_buy:
+            # 只做买入告警的话，这里跳过即可
             return
+        
+        # 调试日志：查看交易方向判断
+        logger.debug(f"[外盘] pair={pair_address[:10]}... "
+                    f"stable={'t0' if t0 in stable else 't1'} "
+                    f"is_buy={is_buy} quote={quote_symbol} base={base_symbol} "
+                    f"a0In={amount0_in} a1In={amount1_in} "
+                    f"a0Out={amount0_out} a1Out={amount1_out}")
         
         quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
         if quote_token == self.WBNB:
@@ -2362,7 +2358,7 @@ class BSCWebSocketMonitor:
                         usd_value=usd_value,
                         pass_second_layer=False,
                         filter_reason=filter_reason,
-                        token_data={'symbol': token_symbol, 'price': token_price_usd, 'market_cap': market_cap, 
+                        token_data={'symbol': base_symbol, 'price': token_price_usd, 'market_cap': market_cap, 
                                    'price_change': price_change, 'volume': volume}
                     )
                     return
@@ -2381,7 +2377,7 @@ class BSCWebSocketMonitor:
                         usd_value=usd_value,
                         pass_second_layer=False,
                         filter_reason=filter_reason,
-                        token_data={'symbol': token_symbol, 'price': token_price_usd, 'market_cap': market_cap,
+                        token_data={'symbol': base_symbol, 'price': token_price_usd, 'market_cap': market_cap,
                                    'price_change': price_change, 'volume': volume}
                     )
                     return
@@ -2400,7 +2396,7 @@ class BSCWebSocketMonitor:
             
             # 构建 token_data（兼容原有格式）
             token_data = {
-                'symbol': token_symbol,
+                'symbol': base_symbol,
                 'price': token_price_usd,
                 'price_change': price_change,
                 'volume': volume,
@@ -2665,45 +2661,85 @@ class BSCWebSocketMonitor:
                         if data and len(data) >= 66:
                             try:
                                 # 使用eth_abi解码（如果可用）
+                                pay_token = None
+                                cost = 0
+                                amount = 0
+                                
                                 if HAS_ETH_ABI:
                                     try:
                                         decoded = eth_abi_decode(['address', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256'], bytes.fromhex(data[2:]))
-                                        pay_token = decoded[0]  # 支付代币地址
+                                        pay_token = decoded[0].lower() if isinstance(decoded[0], str) else ("0x" + decoded[0].hex())  # 支付代币地址
                                         cost = decoded[1]  # 支付金额
                                         amount = decoded[2]  # 获得代币数量
-                                    except:
-                                        # Fallback: 手动解析前2个uint256
-                                        cost = int(data[2:66], 16) if len(data) >= 66 else 0
-                                        amount = int(data[66:130], 16) if len(data) >= 130 else 0
+                                    except Exception as e:
+                                        logger.debug(f"eth_abi解码失败: {e}")
+                                        # Fallback: 手动解析
+                                        try:
+                                            # 第1个字段：address (32字节，前12字节填充0)
+                                            pay_token = "0x" + data[26:66].lower() if len(data) >= 66 else None
+                                            # 第2个字段：payAmount (uint256)
+                                            cost = int(data[66:130], 16) if len(data) >= 130 else 0
+                                            # 第3个字段：getAmount (uint256)
+                                            amount = int(data[130:194], 16) if len(data) >= 194 else 0
+                                        except:
+                                            cost = 0
+                                            amount = 0
                                 else:
                                     # Fallback: 手动解析
-                                    # 跳过第一个address(32字节)，取第2、3个uint256
-                                    cost = int(data[66:130], 16) if len(data) >= 130 else 0
-                                    amount = int(data[130:194], 16) if len(data) >= 194 else 0
+                                    try:
+                                        # 第1个字段：address (32字节，前12字节填充0)
+                                        pay_token = "0x" + data[26:66].lower() if len(data) >= 66 else None
+                                        # 第2个字段：payAmount (uint256)
+                                        cost = int(data[66:130], 16) if len(data) >= 130 else 0
+                                        # 第3个字段：getAmount (uint256)
+                                        amount = int(data[130:194], 16) if len(data) >= 194 else 0
+                                    except:
+                                        cost = 0
+                                        amount = 0
                                 
-                                if cost > 0:
-                                    # 直接处理（跳过 receipt！）
-                                    # 假设 cost 是 USDT（18 decimals），如果是 WBNB 需要进一步判断
-                                    quote_token = self.USDT  # 默认 USDT，可以根据实际情况调整
+                                if cost > 0 and pay_token:
+                                    # 根据 pay_token 确定支付币种
+                                    quote_token = pay_token
                                     quote_amount = cost
-                                    quote_symbol = "USDT"
                                     target_amount = amount
+                                    
+                                    # 识别支付代币类型
+                                    if quote_token == self.USDT:
+                                        quote_symbol = "USDT"
+                                    elif quote_token == self.USDC:
+                                        quote_symbol = "USDC"
+                                    elif quote_token == self.WBNB:
+                                        quote_symbol = "WBNB"
+                                    else:
+                                        # 未知的支付代币，跳过快速路径，走兜底逻辑
+                                        logger.debug(f"⚠️ [内盘快速] 未知支付代币: {quote_token}")
+                                        # 继续走兜底逻辑
+                                        raise ValueError("Unknown pay token")
                                     
                                     # 获取 token symbol 和 decimals
                                     target_symbol = self.get_token_symbol(target_token)
                                     quote_decimals = self.get_decimals(quote_token)
                                     target_decimals = self.get_decimals(target_token)
                                     
-                                    # 计算 USD 价值（cost 就是支付的 USDT）
+                                    # 计算 USD 价值
                                     quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
-                                    usd_value = float(quote_value)  # USDT ≈ $1
+                                    if quote_token == self.WBNB:
+                                        wbnb_price = self.get_wbnb_price()
+                                        usd_value = float(quote_value) * wbnb_price
+                                    else:
+                                        usd_value = float(quote_value)  # USDT/USDC ≈ $1
+                                    
+                                    # 调试日志：显示支付代币识别结果
+                                    logger.debug(f"[内盘快速] token={target_token[:10]}... "
+                                                f"pay_token={quote_token[:10]}... ({quote_symbol}) "
+                                                f"cost={cost} usd=${usd_value:.2f}")
                                     
                                     # 第一层过滤：金额检查
                                     if not self.first_layer_filter(usd_value, is_internal=True):
                                         logger.debug(f"⏭️  [内盘快速] 金额不足: {target_symbol} (${usd_value:.2f})")
                                         return
                                     
-                                    logger.info(f"✅ [内盘快速] {target_symbol} 买入 ${usd_value:.2f}")
+                                    logger.info(f"✅ [内盘快速] {target_symbol} 买入 {quote_symbol} ${usd_value:.2f}")
                                     
                                     # 冷却期检查（只读）
                                     if not await self.check_alert_cooldown_readonly(target_token):
