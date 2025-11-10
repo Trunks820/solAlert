@@ -382,29 +382,52 @@ class SolWebSocketConnection:
             telegram_error = None
             wechat_error = None
             
-            # Telegram推送（使用token_monitor.py中的频道ID，带按钮）
+            # Telegram推送（多群组通知）
             try:
                 # 直接使用telegram client推送到指定频道
                 from ..notifiers.telegram import TelegramNotifier
+                from ..core.config import TELEGRAM_CONFIG
+                
                 telegram = TelegramNotifier()
                 
                 # 创建按钮（传入pair地址用于AXIOM）
                 buttons = self.alert_checker.create_sol_buttons(ca, pair_address)
                 
-                # 使用send方法（异步），target参数传入频道ID
-                result = await telegram.send(
-                    target=-1003291885712,  # token_monitor.py中的频道ID
-                    message=message,
-                    parse_mode=None,  # 纯文本
-                    reply_markup=buttons  # 添加按钮
-                )
-                telegram_success = result
-                telegram_msg_id = "sent" if result else None
+                # 获取多群组ID列表
+                alert_group_ids = TELEGRAM_CONFIG.get('alert_group_ids', [-1003291885712])
                 
-                if result:
-                    logger.info(f"✅ Telegram推送成功（含按钮）")
+                # 发送到所有配置的群组
+                success_count = 0
+                fail_count = 0
+                
+                for group_id in alert_group_ids:
+                    try:
+                        result = await telegram.send(
+                            target=str(group_id),
+                            message=message,
+                            parse_mode=None,  # 纯文本
+                            reply_markup=buttons  # 添加按钮
+                        )
+                        
+                        if result:
+                            logger.info(f"✅ Telegram推送成功（含按钮）-> 群组{group_id}")
+                            success_count += 1
+                        else:
+                            logger.warning(f"⚠️ Telegram推送失败 -> 群组{group_id}")
+                            fail_count += 1
+                            
+                    except Exception as e:
+                        logger.error(f"❌ 发送到群组{group_id}异常: {e}")
+                        fail_count += 1
+                
+                # 统计结果
+                telegram_success = success_count > 0
+                telegram_msg_id = "sent" if telegram_success else None
+                
+                if success_count > 0:
+                    logger.info(f"✅ Telegram批量推送完成 | 成功{success_count}/{len(alert_group_ids)}")
                 else:
-                    logger.warning(f"⚠️ Telegram推送失败")
+                    logger.warning(f"⚠️ Telegram批量推送全部失败 | {fail_count}个群组")
                 
             except Exception as e:
                 logger.error(f"❌ Telegram推送异常: {e}", exc_info=True)

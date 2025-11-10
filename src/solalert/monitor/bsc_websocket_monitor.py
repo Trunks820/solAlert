@@ -120,7 +120,8 @@ class BSCWebSocketMonitor:
         self.MULTICALL2_TRY_AGGREGATE_SELECTOR = "bce38bd7"  # 不带0x前缀
         
         # Telegram 配置
-        self.bsc_channel_id = str(TELEGRAM_CONFIG.get('bsc_channel_id'))
+        self.bsc_channel_id = str(TELEGRAM_CONFIG.get('bsc_channel_id'))  # 主频道ID（用于日志显示）
+        self.alert_group_ids = TELEGRAM_CONFIG.get('alert_group_ids', [self.bsc_channel_id])  # 多群组ID列表
         self.telegram_notifier = TelegramNotifier(enabled=self.enable_telegram)
         
         # 冷却期配置
@@ -1730,25 +1731,43 @@ class BSCWebSocketMonitor:
             return False
         
         try:
-            # 详细日志：准备发送
-            logger.info(f"📤 准备发送告警: {token_address} -> 频道{self.bsc_channel_id}")
+            # 详细日志：准备发送到多个群组
+            logger.info(f"📤 准备发送告警: {token_address} -> {len(self.alert_group_ids)}个群组")
             
             reply_markup = self.create_token_buttons(token_address)
             
-            result = await self.telegram_notifier.send(
-                target=self.bsc_channel_id,
-                message=message,
-                parse_mode="HTML",
-                reply_markup=reply_markup
-            )
+            # 发送到所有配置的群组
+            success_count = 0
+            fail_count = 0
             
-            if result:
-                logger.info(f"✅ Telegram通知已发送 - {token_address[:10]}...")
-                self.alert_success_count += 1  # 发送成功计数
+            for group_id in self.alert_group_ids:
+                try:
+                    result = await self.telegram_notifier.send(
+                        target=str(group_id),
+                        message=message,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+                    
+                    if result:
+                        logger.info(f"✅ Telegram通知已发送 - {token_address[:10]}... -> 群组{group_id}")
+                        success_count += 1
+                    else:
+                        logger.error(f"❌ Telegram发送失败 - {token_address} | 群组{group_id} | telegram_notifier.send返回False")
+                        fail_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"❌ 发送到群组{group_id}异常: {token_address} | 错误: {e}")
+                    fail_count += 1
+            
+            # 统计结果
+            if success_count > 0:
+                logger.info(f"✅ Telegram批量发送完成 - {token_address[:10]}... | 成功{success_count}/{len(self.alert_group_ids)}")
+                self.alert_success_count += 1  # 只要有一个成功就算成功
                 return True
             else:
-                logger.error(f"❌❌❌ Telegram发送失败 - {token_address} | 频道{self.bsc_channel_id} | telegram_notifier.send返回False")
-                self.alert_fail_count += 1  # 发送失败计数
+                logger.error(f"❌❌❌ Telegram批量发送全部失败 - {token_address} | {fail_count}个群组")
+                self.alert_fail_count += 1
                 return False
         
         except Exception as e:
