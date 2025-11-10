@@ -98,7 +98,8 @@ class BSCWebSocketMonitor:
         self.USDT = "0x55d398326f99059ff775485246999027b3197955"
         self.WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
         self.USDC = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
-        # 只监听主Proxy（Try Buy已废弃，2025年无活动）
+        # Fourmeme 合约地址
+        self.FOURMEME_ROUTER = "0x1de460f363af910f51726def188f9004276bf4bc".lower()  # Router（发出关键Custom Event）
         self.FOURMEME_PROXY = [
             "0x5c952063c7fc8610ffdb798152d69f0b9550762b".lower()  # 主Proxy
         ]
@@ -106,8 +107,9 @@ class BSCWebSocketMonitor:
         
         # Fourmeme 自定义事件（可捕获内部调用）
         self.FOURMEME_CUSTOM_EVENTS = [
-            "0x7db52723a3b2cdd6164364b3b766e65e540d7be48ffa89582956d8eaebe62942",  # 事件1
-            "0x48063b1239b68b5d50123408787a6df1f644d9160f0e5f702fefddb9a855954d"   # 事件2
+            "0x205442d60b70af1203d43cab62352c3b69b94f091be32fe683198057282b5c92",  # Router Custom Event（包含buyer信息）
+            "0x7db52723a3b2cdd6164364b3b766e65e540d7be48ffa89582956d8eaebe62942",  # Proxy Event 1
+            "0x48063b1239b68b5d50123408787a6df1f644d9160f0e5f702fefddb9a855954d"   # Proxy Event 2
         ]
         
         # Multicall2 配置（BSC）
@@ -2757,12 +2759,18 @@ class BSCWebSocketMonitor:
             return False
     
     async def handle_proxy_event(self, log: Dict):
-        """处理 Fourmeme Proxy 事件（内盘）"""
+        """处理 Fourmeme Router/Proxy 事件（内盘）"""
         tx_hash = log.get("transactionHash")
         addr = log.get("address", "").lower()
         topics = log.get("topics", [])
         
-        proxy_type = "主Proxy" if addr == self.FOURMEME_PROXY[0] else "Try Buy"
+        # 判断事件来源
+        if addr == self.FOURMEME_ROUTER:
+            proxy_type = "Router"
+        elif addr == self.FOURMEME_PROXY[0]:
+            proxy_type = "Proxy"
+        else:
+            proxy_type = "Unknown"
         
         try:
             dbotx_api = self.get_thread_dbotx_api()
@@ -3604,20 +3612,23 @@ class BSCWebSocketMonitor:
             
             # ========== 直接处理模式（禁用队列，线程池直接处理）==========
             
-            # 1️⃣ Fourmeme Proxy 的所有事件（内盘交易）
-            if addr == self.FOURMEME_PROXY[0].lower():
+            # 1️⃣ Fourmeme Router 或 Proxy 的所有事件（内盘交易）
+            if addr == self.FOURMEME_ROUTER or addr == self.FOURMEME_PROXY[0].lower():
                 # 直接用线程池处理（无缓冲，低延迟）
+                logger.debug(f"📨 路由到handle_proxy_event: addr={addr[:10]}... topic0={topic0[:10]}...")
                 self.executor.submit(self._run_async_in_thread, self.handle_proxy_event, result)
                 return
             
             # 2️⃣ Swap 事件（外盘：PancakeSwap V2）
             elif topic0 == self.TOPIC_V2_SWAP:
                 # 直接用线程池处理（无缓冲，低延迟）
+                logger.debug(f"📨 路由到handle_swap_event: topic0={topic0[:10]}...")
                 self.executor.submit(self._run_async_in_thread, self.handle_swap_event, result)
                 return
             
             # 其他事件：忽略
             else:
+                logger.debug(f"⏭️  忽略事件: addr={addr[:10]}... topic0={topic0[:10]}...")
                 return
         
         except Exception as e:
@@ -3650,30 +3661,44 @@ class BSCWebSocketMonitor:
         
         # ========== 优化后的订阅策略 ==========
         
-        # 1️⃣ 订阅 Fourmeme Proxy 的所有事件（捕获内盘交易）
-        # 注意：Transfer事件是Token合约发出的，不是Proxy发出的
-        # 所以需要订阅Proxy的所有事件，然后在handle_proxy_event中过滤
+        # 1️⃣ 订阅 Fourmeme Router 所有事件（捕获内盘关键Custom Event）
         ws.send(json.dumps({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_subscribe",
             "params": ["logs", {
-                "address": [self.FOURMEME_PROXY[0]]  # 只订阅主Proxy（TryBuy已废弃）
-                # 不限制topics - 捕获所有事件（TokenPurchase/TokenSale等）
+                "address": [self.FOURMEME_ROUTER]  # Router地址
+                # 不限制topics - 捕获所有事件
             }]
-            }))
-        logger.info(f"✓ 订阅 Fourmeme Proxy 所有事件（内盘）")
-        # 2️⃣ 订阅 PancakeSwap V2 Swap 事件（外盘交易）
+        }))
+        logger.info(f"✓ 订阅 Fourmeme Router 所有事件（内盘）")
+        
+        # 2️⃣ 订阅 Fourmeme Proxy 的所有事件（捕获内盘交易）
+        # 注意：Transfer事件是Token合约发出的，不是Proxy发出的
+        # 所以需要订阅Proxy的所有事件，然后在handle_proxy_event中过滤
         ws.send(json.dumps({
             "jsonrpc": "2.0",
             "id": 2,
+            "method": "eth_subscribe",
+            "params": ["logs", {
+                "address": [self.FOURMEME_PROXY[0]]  # 只订阅主Proxy（TryBuy已废弃）
+                # 不限制topics - 捕获所有事件（TokenPurchase/TokenSale等）
+            }]
+        }))
+        logger.info(f"✓ 订阅 Fourmeme Proxy 所有事件（内盘）")
+        
+        # 3️⃣ 订阅 PancakeSwap V2 Swap 事件（外盘交易）
+        ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": 3,
             "method": "eth_subscribe",
             "params": ["logs", {"topics": [self.TOPIC_V2_SWAP]}]
         }))
         logger.info(f"✓ 订阅 PancakeV2 Swap 事件（外盘）")
         
         logger.info("✅ 订阅完成")
-        logger.info(f"   内盘: Proxy所有事件 (TokenPurchase/Sale等) → {self.FOURMEME_PROXY[0][:10]}...")
+        logger.info(f"   内盘: Router所有事件 → {self.FOURMEME_ROUTER[:10]}...")
+        logger.info(f"   内盘: Proxy所有事件 → {self.FOURMEME_PROXY[0][:10]}...")
         logger.info(f"   外盘: 全链Swap事件 → PancakeSwap V2")
         logger.info(f"📱 Telegram 频道: {self.bsc_channel_id}")
         logger.info(f"⏳ 等待链上交易...")
