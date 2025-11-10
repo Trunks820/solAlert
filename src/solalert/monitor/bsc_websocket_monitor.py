@@ -823,6 +823,12 @@ class BSCWebSocketMonitor:
         2. 429检测：检测限流错误并指数退避
         3. 退避机制：连续429时延长退避时间（最高16s）
         4. 统计监控：记录429次数和慢调用
+        
+        Returns:
+            RPC结果，或None（失败/429）
+        
+        Note:
+            这是阻塞调用，建议在async函数中使用 await asyncio.to_thread(self.rpc_call, method, params)
         """
         self.rpc_id += 1
         
@@ -871,7 +877,11 @@ class BSCWebSocketMonitor:
                     f"退避 {backoff_time}s, method={method}"
                 )
                 
-                # 返回None，让上层缓存为failed状态
+                # 📊 Prometheus: 记录429错误
+                if HAS_PROMETHEUS:
+                    self.metrics_api_calls.labels(api_type='rpc', status='rate_limited').inc()
+                
+                # 返回None（上层应当处理，比如使用缓存或跳过）
                 return None
             
             # === 阶段4: 成功响应，重置连续429计数 ===
@@ -1086,7 +1096,10 @@ class BSCWebSocketMonitor:
         return None
     
     def get_wbnb_price(self) -> float:
-        """动态获取 WBNB 价格（带缓存）"""
+        """
+        动态获取 WBNB 价格（带缓存）
+        注意：这是阻塞调用，建议在async函数中使用 await asyncio.to_thread(self.get_wbnb_price)
+        """
         now = time.time()
         if now - self.wbnb_price_timestamp < self.price_cache_ttl:
             return self.wbnb_price
@@ -1095,23 +1108,34 @@ class BSCWebSocketMonitor:
             # 禁用 SSL 警告
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             
-            # 使用长连接（Session）
+            # 使用长连接（Session），设置较短超时避免阻塞过久
             resp = self.session.get(
                 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BNB_USDT',
-                timeout=5,
+                timeout=3,  # 缩短超时时间（从5秒到3秒）
                 verify=False  # 禁用 SSL 证书验证
             )
+            resp.raise_for_status()  # 检查HTTP状态码
             data = resp.json()
             
             if data and isinstance(data, list) and len(data) > 0:
                 price = float(data[0].get('last', self.wbnb_price))
-                self.wbnb_price = price
-                self.wbnb_price_timestamp = now
-                logger.info(f"✅ 更新 WBNB 价格: ${price}")
-                return price
+                if price > 0:  # 验证价格有效性
+                    self.wbnb_price = price
+                    self.wbnb_price_timestamp = now
+                    logger.info(f"✅ 更新 WBNB 价格: ${price:.2f}")
+                    return price
+                else:
+                    logger.warning(f"⚠️ WBNB 价格无效: {price}")
+        except requests.exceptions.Timeout:
+            logger.warning(f"⚠️ 获取 WBNB 价格超时（3秒），使用缓存价格")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"⚠️ 获取 WBNB 价格网络错误: {e}")
+        except (ValueError, KeyError, IndexError) as e:
+            logger.warning(f"⚠️ 解析 WBNB 价格失败: {e}")
         except Exception as e:
-            logger.warning(f"⚠️ 获取 WBNB 价格失败: {e}")
+            logger.warning(f"⚠️ 获取 WBNB 价格未知错误: {e}")
         
+        # 返回缓存价格（如果从未成功过，则返回初始值600）
         return self.wbnb_price
     
     @lru_cache(maxsize=10000)
@@ -2260,7 +2284,7 @@ class BSCWebSocketMonitor:
         
         quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
         if quote_token == self.WBNB:
-            wbnb_price = self.get_wbnb_price()
+            wbnb_price = await asyncio.to_thread(self.get_wbnb_price)
             usd_value = float(quote_value) * wbnb_price
         else:
             usd_value = float(quote_value)
@@ -2687,8 +2711,8 @@ class BSCWebSocketMonitor:
     async def _handle_swap_with_receipt_fallback(self, tx_hash: str, pair_address: str):
         """外盘receipt兜底：从交易回执中提取Swap事件"""
         try:
-            # 获取交易回执（使用缓存）
-            receipt, _ = self.get_receipt_cached(tx_hash)
+            # 获取交易回执（使用缓存）- 使用线程池避免阻塞事件循环
+            receipt, _ = await asyncio.to_thread(self.get_receipt_cached, tx_hash)
             if not receipt:
                 logger.debug(f"⚠️ 获取receipt失败: {tx_hash}")
                 return
@@ -2762,7 +2786,7 @@ class BSCWebSocketMonitor:
         """处理 Fourmeme Router/Proxy 事件（内盘）"""
         tx_hash = log.get("transactionHash")
         addr = log.get("address", "").lower()
-        topics = log.get("topics", [])
+        custom_event_topics = log.get("topics", [])  # 保存原始Custom Event的topics，避免后续被覆盖
         
         # 判断事件来源
         if addr == self.FOURMEME_ROUTER:
@@ -2776,7 +2800,7 @@ class BSCWebSocketMonitor:
             dbotx_api = self.get_thread_dbotx_api()
             
             # ========== 快速路径：Custom Events（TokenPurchase/Sale）==========
-            if topics and topics[0] in self.FOURMEME_CUSTOM_EVENTS:
+            if custom_event_topics and custom_event_topics[0] in self.FOURMEME_CUSTOM_EVENTS:
                 # 🔥 动态学习：将合约地址加入Redis Proxy白名单
                 try:
                     # 检查是否为新proxy（不在静态白名单）
@@ -2796,12 +2820,12 @@ class BSCWebSocketMonitor:
                     # topics[2]: buyer address (indexed)  
                     # data: payToken(address) + payAmount(uint256) + getAmount(uint256) + ...
                     
-                    if len(topics) < 3:
-                        logger.debug(f"⚠️ Custom Event topics不足: {len(topics)}")
+                    if len(custom_event_topics) < 3:
+                        logger.debug(f"⚠️ Custom Event topics不足: {len(custom_event_topics)}")
                         # 继续走兜底逻辑
                     else:
-                        target_token = ("0x" + topics[1][-40:]).lower()
-                        buyer = ("0x" + topics[2][-40:]).lower()
+                        target_token = ("0x" + custom_event_topics[1][-40:]).lower()
+                        buyer = ("0x" + custom_event_topics[2][-40:]).lower()
                         
                         # 使用最小解码器（只解前3个字段，不依赖完整ABI）
                         pay_token, cost, amount = self._parse_fourmeme_custom_data_min(log.get("data", "0x"))
@@ -2836,7 +2860,7 @@ class BSCWebSocketMonitor:
                         # 计算 USD 价值
                         quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
                         if quote_token == self.WBNB:
-                            wbnb_price = self.get_wbnb_price()
+                            wbnb_price = await asyncio.to_thread(self.get_wbnb_price)
                             usd_value = float(quote_value) * wbnb_price
                         else:
                             usd_value = float(quote_value)  # USDT/USDC ≈ $1
@@ -2922,8 +2946,8 @@ class BSCWebSocketMonitor:
                     # 继续走兜底逻辑
             
             # ========== 兜底路径：从 Receipt 解析 Transfer ==========
-            # 获取交易回执（使用缓存）
-            receipt, tx_info = self.get_receipt_cached(tx_hash)
+            # 获取交易回执（使用缓存）- 使用线程池避免阻塞事件循环
+            receipt, tx_info = await asyncio.to_thread(self.get_receipt_cached, tx_hash)
             if not receipt:
                 return
             
@@ -3007,8 +3031,8 @@ class BSCWebSocketMonitor:
             buyer = None
             try:
                 # 如果 custom 的 topics 有 buyer，用它；否则用 tx.from
-                if topics and len(topics) >= 3:
-                    buyer = ("0x" + topics[2][-40:]).lower()
+                if custom_event_topics and len(custom_event_topics) >= 3:
+                    buyer = ("0x" + custom_event_topics[2][-40:]).lower()
                 else:
                     buyer = (tx_info.get("from", "") or "").lower()
             except:
@@ -3075,17 +3099,30 @@ class BSCWebSocketMonitor:
                 
                 is_from_proxy = self.is_proxy(t["from"])
                 is_from_zero = (t["from"] == self.ZERO)
+                is_from_router = (t["from"] == self.FOURMEME_ROUTER)  # Router也可能转出代币
+                is_to_buyer = (t["to"] == buyer)  # 流向买家的代币
                 
-                logger.debug(f"  [检查] token={t['token'][:10]}... from={t['from'][:10]}... "
-                           f"is_proxy={is_from_proxy} is_zero={is_from_zero} value={t['value']}")
+                logger.debug(f"  [检查] token={t['token'][:10]}... from={t['from'][:10]}... to={t['to'][:10]}... "
+                           f"is_proxy={is_from_proxy} is_zero={is_from_zero} is_router={is_from_router} "
+                           f"is_to_buyer={is_to_buyer} value={t['value']}")
                 
-                if is_from_proxy or is_from_zero:
+                # 优先：从Proxy/Router/零地址转出的代币
+                if is_from_proxy or is_from_zero or is_from_router:
                     target_tokens[t["token"]] = target_tokens.get(t["token"], 0) + t["value"]
-                    logger.debug(f"    ✓ 加入target_tokens")
+                    logger.debug(f"    ✓ 加入target_tokens (from Proxy/Router/Zero)")
+                # 兜底：流向买家的非稳定币代币（排除自己转自己的情况）
+                elif is_to_buyer and t["from"] != buyer:
+                    target_tokens[t["token"]] = target_tokens.get(t["token"], 0) + t["value"]
+                    logger.debug(f"    ✓ 加入target_tokens (to buyer)")
             
             if not target_tokens:
                 logger.warning(f"⚠️ [内盘兜底] 未找到目标代币: tx={tx_hash}, "
                              f"transfers={len(transfers)}, buyer={buyer[:10]}...")
+                # 打印所有transfer用于调试
+                logger.warning(f"   所有Transfer详情:")
+                for i, t in enumerate(transfers):
+                    logger.warning(f"   [{i}] token={t['token'][:10]}... from={t['from'][:10]}... "
+                                 f"to={t['to'][:10]}... value={t['value']}")
                 return
             
             target_token = max(target_tokens.items(), key=lambda x: x[1])[0]
@@ -3098,7 +3135,7 @@ class BSCWebSocketMonitor:
             # 计算 USD 价值
             quote_value = Decimal(quote_amount) / (Decimal(10) ** Decimal(quote_decimals))
             if quote_token == self.WBNB:
-                wbnb_price = self.get_wbnb_price()
+                wbnb_price = await asyncio.to_thread(self.get_wbnb_price)
                 usd_value = float(quote_value) * wbnb_price
             else:
                 usd_value = float(quote_value)
