@@ -2927,19 +2927,56 @@ class BSCWebSocketMonitor:
             
             for log in logs:
                 topics = log.get("topics", [])
-                if not topics or topics[0] != transfer_topic:
+                if not topics:
+                    continue
+                
+                # 标准化topic0比较（支持HexBytes和字符串）
+                topic0 = topics[0]
+                if hasattr(topic0, 'hex'):
+                    topic0 = topic0.hex()
+                if isinstance(topic0, bytes):
+                    topic0 = '0x' + topic0.hex()
+                if not isinstance(topic0, str):
+                    topic0 = str(topic0)
+                if not topic0.startswith('0x'):
+                    topic0 = '0x' + topic0
+                
+                if topic0.lower() != transfer_topic:
                     continue
                 
                 token_addr = log.get("address", "").lower()
                 data = log.get("data", "0x")
                 
                 if len(topics) >= 3:
-                    from_addr = "0x" + topics[1][-40:]
-                    to_addr = "0x" + topics[2][-40:]
+                    # 标准化from/to地址提取（支持HexBytes）
+                    topic1 = topics[1]
+                    topic2 = topics[2]
+                    
+                    if hasattr(topic1, 'hex'):
+                        topic1 = topic1.hex()
+                    if isinstance(topic1, bytes):
+                        topic1 = topic1.hex()
+                    if isinstance(topic1, str) and topic1.startswith('0x'):
+                        topic1 = topic1[2:]
+                    
+                    if hasattr(topic2, 'hex'):
+                        topic2 = topic2.hex()
+                    if isinstance(topic2, bytes):
+                        topic2 = topic2.hex()
+                    if isinstance(topic2, str) and topic2.startswith('0x'):
+                        topic2 = topic2[2:]
+                    
+                    from_addr = "0x" + str(topic1)[-40:]
+                    to_addr = "0x" + str(topic2)[-40:]
                     
                     try:
+                        if hasattr(data, 'hex'):
+                            data = data.hex()
+                        if isinstance(data, bytes):
+                            data = '0x' + data.hex()
                         value = int(data, 16) if data and data != "0x" else 0
-                    except:
+                    except Exception as e:
+                        logger.debug(f"⚠️ [内盘兜底] Transfer value解析失败: {e}")
                         value = 0
                     
                     transfers.append({
@@ -2950,7 +2987,13 @@ class BSCWebSocketMonitor:
                     })
             
             if not transfers:
+                logger.debug(f"⚠️ [内盘兜底] 未找到Transfer事件: tx={tx_hash}")
                 return
+            
+            logger.debug(f"[内盘兜底] 找到 {len(transfers)} 个Transfer事件")
+            for i, t in enumerate(transfers):
+                logger.debug(f"  Transfer #{i}: token={t['token'][:10]}... "
+                           f"from={t['from'][:10]}... to={t['to'][:10]}... value={t['value']}")
             
             # 获取buyer地址（从custom event topics 或 tx.from）
             buyer = None
@@ -3015,13 +3058,26 @@ class BSCWebSocketMonitor:
             
             # —— 主币腿：既看 proxy 转出，也把"零地址铸造"算进来
             target_tokens = {}
+            logger.debug(f"[内盘兜底] 解析 {len(transfers)} 个Transfer，寻找目标代币...")
+            
             for t in transfers:
-                if t["token"] in stable: 
+                if t["token"] in stable:
+                    logger.debug(f"  [跳过] {t['token'][:10]}... 是稳定币")
                     continue
-                if self.is_proxy(t["from"]) or t["from"] == self.ZERO:
+                
+                is_from_proxy = self.is_proxy(t["from"])
+                is_from_zero = (t["from"] == self.ZERO)
+                
+                logger.debug(f"  [检查] token={t['token'][:10]}... from={t['from'][:10]}... "
+                           f"is_proxy={is_from_proxy} is_zero={is_from_zero} value={t['value']}")
+                
+                if is_from_proxy or is_from_zero:
                     target_tokens[t["token"]] = target_tokens.get(t["token"], 0) + t["value"]
+                    logger.debug(f"    ✓ 加入target_tokens")
             
             if not target_tokens:
+                logger.warning(f"⚠️ [内盘兜底] 未找到目标代币: tx={tx_hash}, "
+                             f"transfers={len(transfers)}, buyer={buyer[:10]}...")
                 return
             
             target_token = max(target_tokens.items(), key=lambda x: x[1])[0]
