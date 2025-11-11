@@ -7,6 +7,7 @@ import asyncio
 import logging
 import sys
 import os
+import threading
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +20,14 @@ try:
     HAS_PROMETHEUS = True
 except ImportError:
     HAS_PROMETHEUS = False
+
+# Health Check Service
+try:
+    from src.solalert.monitoring.health import get_health_service
+    HAS_HEALTH_CHECK = True
+except ImportError:
+    HAS_HEALTH_CHECK = False
+    get_health_service = None
 
 # 配置日志
 logging.basicConfig(
@@ -61,6 +70,29 @@ async def main():
             logger.warning(f"⚠️ Prometheus Server 启动失败: {e}")
     else:
         logger.warning("⚠️ Prometheus未安装，Metrics功能不可用")
+    
+    # 启动 Health Check Service（独立线程）
+    if HAS_HEALTH_CHECK:
+        try:
+            health_service = get_health_service()
+            health_port = int(os.getenv('HEALTH_CHECK_PORT', '8080'))
+            
+            # 在独立线程中启动健康检查服务（不阻塞主线程）
+            health_thread = threading.Thread(
+                target=health_service.run,
+                kwargs={'host': '0.0.0.0', 'port': health_port},
+                daemon=True,  # 守护线程，主程序退出时自动退出
+                name='HealthCheckService'
+            )
+            health_thread.start()
+            logger.info(f"🏥 Health Check Service: http://0.0.0.0:{health_port}")
+            logger.info(f"   ├─ Liveness:  http://0.0.0.0:{health_port}/health")
+            logger.info(f"   ├─ Readiness: http://0.0.0.0:{health_port}/ready")
+            logger.info(f"   └─ Metrics:   http://0.0.0.0:{health_port}/metrics/health")
+        except Exception as e:
+            logger.warning(f"⚠️ Health Check Service 启动失败: {e}")
+    else:
+        logger.warning("⚠️ Health Check 模块未安装")
     
     logger.info("="*80)
     

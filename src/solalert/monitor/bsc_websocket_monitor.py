@@ -33,6 +33,14 @@ from ..notifiers.alert_recorder import get_alert_recorder
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Health Check
+try:
+    from ..monitoring.health import update_health_status
+    HAS_HEALTH_CHECK = True
+except ImportError:
+    HAS_HEALTH_CHECK = False
+    update_health_status = lambda *args, **kwargs: None
+
 # Prometheus Metrics
 try:
     from prometheus_client import Counter, Gauge, Histogram, start_http_server, REGISTRY
@@ -370,6 +378,33 @@ class BSCWebSocketMonitor:
                 # 注意：不修改 HAS_PROMETHEUS，因为它是模块级全局常量
         else:
             logger.warning("⚠️ Prometheus Metrics 未安装")
+        
+        # ========== 健康状态初始化 ==========
+        if HAS_HEALTH_CHECK:
+            # 初始化所有组件状态为 unknown
+            update_health_status('websocket', 'unknown', 'Initializing...')
+            update_health_status('api', 'unknown', 'Initializing...')
+            
+            # 测试 Redis 连接
+            try:
+                self.redis_client.client.ping()
+                update_health_status('redis', 'ok', 'Connected')
+                logger.info("✅ Health Check: Redis 连接正常")
+            except Exception as e:
+                update_health_status('redis', 'error', str(e))
+                logger.error(f"❌ Health Check: Redis 连接失败: {e}")
+            
+            # 测试数据库连接
+            try:
+                # alert_recorder 已包含数据库连接
+                if self.alert_recorder and self.alert_recorder.db_manager:
+                    update_health_status('database', 'ok', 'Connected')
+                    logger.info("✅ Health Check: Database 连接正常")
+                else:
+                    update_health_status('database', 'unknown', 'Not configured')
+            except Exception as e:
+                update_health_status('database', 'error', str(e))
+                logger.error(f"❌ Health Check: Database 连接失败: {e}")
         
     async def load_config_from_redis(self):
         """从 Redis 加载配置"""
@@ -3715,6 +3750,11 @@ class BSCWebSocketMonitor:
         if HAS_PROMETHEUS:
             self.metrics_connections.set(1)  # 1 = 已连接
         
+        # 更新健康状态
+        if HAS_HEALTH_CHECK:
+            update_health_status('websocket', 'ok', 'Connected and subscribed')
+            update_health_status('api', 'ok', 'Ready')
+        
         # ========== 优化后的订阅策略 ==========
         
         # 1️⃣ 订阅 Fourmeme Router 所有事件（捕获内盘关键Custom Event）
@@ -3763,12 +3803,21 @@ class BSCWebSocketMonitor:
         """WebSocket 错误回调"""
         logger.error(f"❌ WebSocket 错误: {error}")
         logger.error(f"错误堆栈: {traceback.format_exc()}")
+        
+        # 更新健康状态
+        if HAS_HEALTH_CHECK:
+            update_health_status('websocket', 'error', f'Error: {str(error)[:100]}')
     
     def on_close(self, ws, close_status_code, close_msg):
         """WebSocket 关闭回调"""
         # 更新连接状态 Metric
         if HAS_PROMETHEUS:
             self.metrics_connections.set(0)  # 0 = 已断开
+        
+        # 更新健康状态
+        if HAS_HEALTH_CHECK:
+            status_msg = f'Closed: code={close_status_code}, msg={close_msg}'
+            update_health_status('websocket', 'error', status_msg[:100])
         
         if self.should_stop:
             logger.info(f"✅ WebSocket 连接已关闭")
