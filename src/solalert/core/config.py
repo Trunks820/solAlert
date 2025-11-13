@@ -70,6 +70,10 @@ TELEGRAM_CONFIG = {
         -1002569554228,  # BSC主频道
         -1003394657356,  # 新增群组
     ],
+    'SOL_WS_CHANNEL_IDS' :[
+        -1003291885712,
+        -1003394657356
+    ],
     # 代理配置（默认禁用，本地开发时可以设置 TG_PROXY_ENABLED=true 启用）
     'proxy': {
         'enabled': os.getenv('TG_PROXY_ENABLED', 'false').lower() == 'true',  # 默认禁用

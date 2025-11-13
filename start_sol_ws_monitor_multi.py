@@ -20,74 +20,26 @@ SOL WebSocket 监控 - 21条连接版本
 """
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-
 import asyncio
 import websockets
 import json
 import logging
 from datetime import datetime
 from typing import List, Dict
+from telegram import InlineKeyboardMarkup
 from solalert.core.database import DatabaseManager
 from solalert.core.redis_client import RedisClient
 from solalert.core.config import REDIS_CONFIG
 from solalert.monitor.sol_alert_checker import SolAlertChecker
 from solalert.notifiers.telegram import TelegramNotifier
 from solalert.notifiers.wechat import WeChatNotifier
+from solalert.core.config import TELEGRAM_CONFIG
 
-# 🎯 Prometheus 监控
-try:
-    from prometheus_client import Counter, Gauge, Histogram, start_http_server
-    HAS_PROMETHEUS = True
-except ImportError:
-    HAS_PROMETHEUS = False
-    print("⚠️  prometheus_client 未安装，监控功能已禁用")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 # WebSocket配置
 WS_URL = "wss://api-data-v1.dbotx.com/data/ws/"
 API_KEY = "i1o3elfavv59ds02fggj9rsd0eg8w657"
-PROMETHEUS_PORT = 8002  # SOL链监控端口（BSC是8001）
-
-# 🎯 初始化Prometheus指标
-if HAS_PROMETHEUS:
-    # Counter - 累计计数
-    metrics_ws_messages = Counter(
-        'sol_ws_messages_total',
-        'WebSocket收到的消息总数'
-    )
-    metrics_ws_data = Counter(
-        'sol_ws_data_total',
-        'pairsInfo数据推送总数'
-    )
-    metrics_alerts = Counter(
-        'sol_ws_alerts_total',
-        '告警发送统计',
-        ['status']  # success/failure
-    )
-    metrics_reconnects = Counter(
-        'sol_ws_reconnects_total',
-        'WebSocket重连次数',
-        ['batch_id']
-    )
-    
-    # Gauge - 实时状态
-    metrics_connections = Gauge(
-        'sol_ws_connections',
-        'WebSocket连接数',
-        ['status', 'batch_id']  # status: subscribed/connected/reconnecting/failed
-    )
-    metrics_active_pairs = Gauge(
-        'sol_ws_active_pairs',
-        '活跃pair数量',
-        ['batch_id']
-    )
-    
-    # Histogram - 延迟分布
-    metrics_alert_processing_time = Histogram(
-        'sol_ws_alert_processing_seconds',
-        '告警处理耗时',
-        buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
-    )
 
 
 def to_float(value, default=0.0):
@@ -294,10 +246,6 @@ async def batch_ws_handler(
                 logger.info(f"✅ [{conn_name}] 已连接")
                 stats[batch_id]['status'] = 'connected'
                 
-                # 📊 Prometheus: 连接状态
-                if HAS_PROMETHEUS:
-                    metrics_connections.labels(status='connected', batch_id=batch_id).set(1)
-                
                 # 订阅
                 subscribe_msg = {
                     "method": "subscribe",
@@ -320,10 +268,6 @@ async def batch_ws_handler(
                         message_count += 1
                         stats[batch_id]['messages'] = message_count
                         
-                        # 📊 Prometheus: 消息计数
-                        if HAS_PROMETHEUS:
-                            metrics_ws_messages.inc()
-                        
                         data = json.loads(message)
                         msg_type = data.get('type')
                         
@@ -339,12 +283,6 @@ async def batch_ws_handler(
                         if data.get('method') == 'subscribeResponse':
                             logger.info(f"📨 [{conn_name}] 订阅确认")
                             stats[batch_id]['status'] = 'subscribed'
-                            
-                            # 📊 Prometheus: 订阅状态
-                            if HAS_PROMETHEUS:
-                                metrics_connections.labels(status='connected', batch_id=batch_id).set(0)
-                                metrics_connections.labels(status='subscribed', batch_id=batch_id).set(1)
-                            
                             continue
                         
                         # 心跳
@@ -373,10 +311,6 @@ async def batch_ws_handler(
                             data_count += 1
                             stats[batch_id]['data'] = data_count
                             
-                            # 📊 Prometheus: 数据推送计数
-                            if HAS_PROMETHEUS:
-                                metrics_ws_data.inc()
-                            
                             for item in results:
                                 pair = item.get('p')
                                 if not pair:
@@ -384,10 +318,6 @@ async def batch_ws_handler(
                                 
                                 received_pairs.add(pair)
                                 stats[batch_id]['active_pairs'] = len(received_pairs)
-                                
-                                # 📊 Prometheus: 活跃pair数量
-                                if HAS_PROMETHEUS:
-                                    metrics_active_pairs.labels(batch_id=batch_id).set(len(received_pairs))
                                 
                                 # 🚀 优化：直接从内存获取完整配置，无需查库
                                 full_config = pair_to_full_config.get(pair)
@@ -474,22 +404,35 @@ async def batch_ws_handler(
                                     )
                                     buttons = alert_checker.create_sol_buttons(ca, pair)
                                     
-                                    # 并发发送
-                                    tg_task = telegram.send(
-                                        target=-1003291885712,
+                                    # 🚀 从配置读取群组ID列表
+                                    alert_group_ids = TELEGRAM_CONFIG.get('SOL_WS_CHANNEL_IDS', [-1003291885712, -1003394657356])
+                                    
+                                    # 批量发送到所有群组（参考BSC实现）
+                                    tg_result = await send_to_all_channels(
+                                        telegram=telegram,
                                         message=msg_text,
-                                        parse_mode="HTML",  # 🚀 使用HTML格式，支持CA蓝色链接
-                                        reply_markup=buttons
+                                        reply_markup=buttons,
+                                        token_address=ca,
+                                        alert_group_ids=alert_group_ids
                                     )
+                                    
+                                    tg_success = tg_result['overall_success']
+                                    tg_success_count = tg_result['success_count']
+                                    tg_fail_count = tg_result['fail_count']
+                                    tg_message_ids = tg_result['message_ids']
+                                    tg_errors = tg_result['errors']
+                                    
+                                    # 微信发送（异步）
                                     wechat_task = wechat.send(
                                         target="default",
                                         message=msg_text
                                     )
                                     
-                                    tg_result, wechat_result = await asyncio.gather(
-                                        tg_task, wechat_task,
-                                        return_exceptions=True
-                                    )
+                                    try:
+                                        wechat_result = await wechat_task
+                                    except Exception as wechat_err:
+                                        logger.warning(f"   ⚠️ WeChat发送异常: {wechat_err}")
+                                        wechat_result = False
                                     
                                     # ✅ 健壮判断：兼容布尔值、字典、状态码
                                     def is_send_success(result) -> bool:
@@ -502,7 +445,6 @@ async def batch_ws_handler(
                                         # 对于其他类型（如状态码），非None/0视为成功
                                         return bool(result)
                                     
-                                    tg_success = is_send_success(tg_result)
                                     wechat_success = is_send_success(wechat_result)
                                     
                                     if tg_success or wechat_success:
@@ -510,22 +452,31 @@ async def batch_ws_handler(
                                         stats[batch_id]['alerts'] = alert_count
                                         alert_checker.set_cooldown(ca)
                                         
-                                        # 📊 Prometheus: 告警成功
-                                        if HAS_PROMETHEUS:
-                                            metrics_alerts.labels(status='success').inc()
-                                        
                                         # 📝 保存到数据库
                                         try:
                                             # 准备数据库记录
                                             alert_time = datetime.now()
                                             
-                                            # 提取 telegram message_id
-                                            tg_msg_id = None
-                                            tg_error = None
-                                            if tg_success and isinstance(tg_result, dict):
-                                                tg_msg_id = str(tg_result.get('result', {}).get('message_id', ''))
-                                            elif isinstance(tg_result, Exception):
-                                                tg_error = str(tg_result)
+                                            # 提取 telegram message_id（批量发送，保存详细信息）
+                                            # 参考BSC：将所有群组的message_id和错误信息保存为JSON
+                                            if tg_success:
+                                                # 保存成功发送的群组和message_id
+                                                tg_msg_id = json.dumps({
+                                                    'success_count': tg_success_count,
+                                                    'total_count': len(alert_group_ids),
+                                                    'message_ids': tg_message_ids
+                                                }, ensure_ascii=False)
+                                            else:
+                                                tg_msg_id = None
+                                            
+                                            # 保存失败信息
+                                            if tg_errors:
+                                                tg_error = json.dumps({
+                                                    'fail_count': tg_fail_count,
+                                                    'errors': tg_errors
+                                                }, ensure_ascii=False)
+                                            else:
+                                                tg_error = None
                                             
                                             # 提取 wechat message_id
                                             wechat_msg_id = None
@@ -590,15 +541,13 @@ async def batch_ws_handler(
                                         except Exception as db_err:
                                             logger.error(f"   ❌ 保存数据库失败: {db_err}")
                                         
-                                        if isinstance(tg_result, Exception):
-                                            logger.warning(f"   ⚠️ TG发送失败: {tg_result}")
+                                        # 日志总结
+                                        if tg_fail_count > 0:
+                                            logger.warning(f"   ⚠️ 部分群组发送失败: {tg_fail_count}/{len(alert_group_ids)}")
                                         if isinstance(wechat_result, Exception):
                                             logger.warning(f"   ⚠️ WeChat发送失败: {wechat_result}")
                                     else:
                                         logger.error(f"   ❌ 所有通知渠道发送失败")
-                                        # 📊 Prometheus: 告警失败
-                                        if HAS_PROMETHEUS:
-                                            metrics_alerts.labels(status='failure').inc()
                     
                     except asyncio.TimeoutError:
                         continue
@@ -619,12 +568,6 @@ async def batch_ws_handler(
         # 🚀 重连：指数退避 + 抖动
         reconnect_count += 1
         stats[batch_id]['reconnects'] = reconnect_count
-        
-        # 📊 Prometheus: 重连次数
-        if HAS_PROMETHEUS:
-            metrics_reconnects.labels(batch_id=batch_id).inc()
-            metrics_connections.labels(status='subscribed', batch_id=batch_id).set(0)
-            metrics_connections.labels(status='reconnecting', batch_id=batch_id).set(1)
         
         if reconnect_count < max_reconnects:
             # 指数退避：1s → 2s → 4s → 8s → ... → 60s（上限）
@@ -783,17 +726,83 @@ async def print_stats_periodically(stats: dict, interval: int = 300, telegram=No
         
         logger.info("=" * 80 + "\n")
 
+async def send_to_all_channels(
+    telegram: TelegramNotifier,
+    message: str,
+    reply_markup: InlineKeyboardMarkup,
+    token_address: str,
+    alert_group_ids: List[int]
+) -> Dict:
+    """
+    发送消息到所有配置的Telegram群组（参考BSC实现）
+    
+    Args:
+        telegram: Telegram通知器实例
+        message: 消息内容
+        reply_markup: 按钮markup
+        token_address: Token地址（用于日志）
+        alert_group_ids: 目标群组ID列表
+    
+    Returns:
+        {
+            'success_count': int,      # 成功发送的群组数
+            'fail_count': int,         # 失败的群组数
+            'message_ids': dict,       # {group_id: message_id} 映射
+            'errors': dict,            # {group_id: error_msg} 映射
+            'overall_success': bool    # 至少一个群组成功即为True
+        }
+    """
+    success_count = 0
+    fail_count = 0
+    message_ids = {}
+    errors = {}
+    
+    logger.info(f"📤 准备发送告警: {token_address} -> {len(alert_group_ids)}个群组")
+    
+    for group_id in alert_group_ids:
+        try:
+            result = await telegram.send(
+                target=str(group_id),
+                message=message,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+
+            if result:
+                # 提取 message_id（如果返回是字典）
+                if isinstance(result, dict):
+                    msg_id = result.get('result', {}).get('message_id')
+                    if msg_id:
+                        message_ids[str(group_id)] = msg_id
+                
+                logger.info(f"✅ Telegram通知已发送 - {token_address[:10]}... -> 群组{group_id}")
+                success_count += 1
+            else:
+                logger.error(f"❌ Telegram发送失败 - {token_address} | 群组{group_id} | telegram_notifier.send返回False")
+                errors[str(group_id)] = "send returned False"
+                fail_count += 1
+
+        except Exception as e:
+            logger.error(f"❌ 发送到群组{group_id}异常: {token_address} | 错误: {e}")
+            errors[str(group_id)] = str(e)
+            fail_count += 1
+    
+    # 统计结果
+    if success_count > 0:
+        logger.info(f"✅ Telegram批量发送完成 - {token_address[:10]}... | 成功{success_count}/{len(alert_group_ids)}")
+    else:
+        logger.error(f"❌❌❌ Telegram批量发送全部失败 - {token_address} | {fail_count}个群组")
+    
+    return {
+        'success_count': success_count,
+        'fail_count': fail_count,
+        'message_ids': message_ids,
+        'errors': errors,
+        'overall_success': success_count > 0
+    }
 
 async def main():
     """主函数：分组启动 21 条 WebSocket 连接"""
-    # 🎯 启动Prometheus HTTP服务器
-    if HAS_PROMETHEUS:
-        try:
-            start_http_server(PROMETHEUS_PORT)
-            logger.info(f"📊 Prometheus metrics 服务已启动: http://0.0.0.0:{PROMETHEUS_PORT}")
-        except Exception as e:
-            logger.warning(f"⚠️  Prometheus启动失败: {e}")
-    
     logger.info("=" * 80)
     logger.info("🚀 SOL WebSocket 监控 - 21条连接版本")
     logger.info("   每个批次一条独立的 WebSocket 连接")
@@ -907,7 +916,6 @@ async def main():
     finally:
         redis_client.close()
         logger.info("👋 监控已停止")
-
 
 if __name__ == "__main__":
     # 确保日志目录存在

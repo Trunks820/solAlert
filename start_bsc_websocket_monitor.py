@@ -14,13 +14,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.solalert.monitor.bsc_websocket_monitor import BSCWebSocketMonitor
 
-# Prometheus Metrics Server
-try:
-    from prometheus_client import start_http_server as prometheus_start_http_server
-    HAS_PROMETHEUS = True
-except ImportError:
-    HAS_PROMETHEUS = False
-
 # Health Check Service
 try:
     from src.solalert.monitoring.health import get_health_service
@@ -60,16 +53,6 @@ async def main():
     logger.info("="*80)
     logger.info(f"📡 WebSocket: {WS_URL[:50]}...")
     logger.info(f"🔗 RPC: {RPC_URL[:50]}...")
-    
-    # 启动 Prometheus Metrics Server
-    if HAS_PROMETHEUS:
-        try:
-            prometheus_start_http_server(8001)
-            logger.info(f"📊 Prometheus Metrics: http://0.0.0.0:8001/metrics")
-        except Exception as e:
-            logger.warning(f"⚠️ Prometheus Server 启动失败: {e}")
-    else:
-        logger.warning("⚠️ Prometheus未安装，Metrics功能不可用")
     
     # 启动 Health Check Service（独立线程）
     if HAS_HEALTH_CHECK:

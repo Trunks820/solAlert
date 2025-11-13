@@ -71,10 +71,15 @@ class SolAlertChecker:
         trigger_logic = config.get('trigger_logic') or config.get('triggerLogic', 'any')
         ca = config.get('ca', '')
         
-        # 解析events_config
+        # 解析events_config（兼容字符串和字典）
         try:
-            events_config = json.loads(events_config_str)
-        except json.JSONDecodeError:
+            if isinstance(events_config_str, str):
+                events_config = json.loads(events_config_str)
+            elif isinstance(events_config_str, dict):
+                events_config = events_config_str
+            else:
+                events_config = {}
+        except (json.JSONDecodeError, TypeError):
             logger.error(f"解析events_config失败: {events_config_str}")
             return False, [], {}
         
@@ -278,12 +283,17 @@ class SolAlertChecker:
         time_interval = config.get('time_interval', '1m')
         trigger_logic = config.get('trigger_logic') or config.get('triggerLogic', 'any')
         trigger_logic_cn = 'any' if trigger_logic == 'any' else '全部'
-        events_config_str = config.get('events_config', '{}')
+        events_config_raw = config.get('events_config', '{}')
         
-        # 解析监控条件
+        # 解析监控条件（兼容字符串和字典）
         try:
-            events_config = json.loads(events_config_str)
-        except json.JSONDecodeError:
+            if isinstance(events_config_raw, str):
+                events_config = json.loads(events_config_raw)
+            elif isinstance(events_config_raw, dict):
+                events_config = events_config_raw
+            else:
+                events_config = {}
+        except (json.JSONDecodeError, TypeError):
             return f"时间:{time_interval} | 触发:{trigger_logic_cn}"
         
         conditions = []
@@ -345,10 +355,15 @@ class SolAlertChecker:
         trigger_logic_cn = '任一条件' if trigger_logic == 'any' else '全部条件'
         events_config_str = config.get('events_config', '{}')
         
-        # 解析events_config以显示详细配置
+        # 解析events_config以显示详细配置（兼容字符串和字典）
         try:
-            events_config = json.loads(events_config_str)
-        except json.JSONDecodeError:
+            if isinstance(events_config_str, str):
+                events_config = json.loads(events_config_str)
+            elif isinstance(events_config_str, dict):
+                events_config = events_config_str
+            else:
+                events_config = {}
+        except (json.JSONDecodeError, TypeError):
             events_config = {}
         
         monitor_conditions = []
