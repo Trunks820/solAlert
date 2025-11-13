@@ -535,9 +535,7 @@ async def batch_ws_handler_v2(
                                             return bool(result)
                                         
                                         wechat_success = is_send_success(wechat_result)
-                                        
-                                        # TODO: 数据库记录（后续实现）
-                            
+
                         except asyncio.TimeoutError:
                             # 超时（正常），继续循环
                             # 检查无数据超时
